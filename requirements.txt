@@ -1,0 +1,34 @@
+# Modern requirements for Neural Structural Optimization
+# Compatible with TensorFlow 2.15.0 and Python 3.11
+
+# Core ML framework
+tensorflow>=2.15.0,<3.0.0
+
+# Scientific computing
+numpy>=1.23.5,<2.0.0
+scipy>=1.10.0
+autograd>=1.8.0
+
+# Image processing
+scikit-image>=0.20.0
+pillow>=9.0.0
+
+# Data handling
+xarray>=2023.1.0
+pandas>=1.5.0
+
+# Visualization
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# Optimization
+nlopt>=2.7.0
+
+# Distributed computing (optional)
+apache-beam>=2.40.0
+
+# Utilities
+absl-py>=1.0.0
+
+# Optional: For faster sparse matrix operations
+# scikit-sparse>=0.4.0  # Uncomment if available for your platform 

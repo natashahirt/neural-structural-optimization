@@ -36,12 +36,14 @@ layers = tf.keras.layers
 
 
 def batched_topo_loss(params, envs):
+  """Compute topology optimization loss for batched parameters."""
   losses = [env.objective(params[i], volume_contraint=True)
             for i, env in enumerate(envs)]
   return np.stack(losses)
 
 
 def convert_autograd_to_tensorflow(func):
+  """Convert autograd function to TensorFlow custom gradient."""
   @tf.custom_gradient
   def wrapper(x):
     vjp, ans = autograd.core.make_vjp(func, x.numpy())
@@ -50,20 +52,30 @@ def convert_autograd_to_tensorflow(func):
 
 
 def set_random_seed(seed):
+  """Set random seeds for both NumPy and TensorFlow."""
   if seed is not None:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
 
 class Model(tf.keras.Model):
+  """Base model class for neural structural optimization."""
 
   def __init__(self, seed=None, args=None):
     super().__init__()
     set_random_seed(seed)
     self.seed = seed
-    self.env = topo_api.Environment(args)
+    
+    # Handle both Problem objects and dictionary arguments
+    if hasattr(args, 'normals'):  # It's a Problem object
+      self.args = topo_api.specified_task(args)
+    else:  # It's already a dictionary
+      self.args = args
+    
+    self.env = topo_api.Environment(self.args)
 
   def loss(self, logits):
+    """Compute the topology optimization loss."""
     # for our neural network, we use float32, but we use float64 for the physics
     # to avoid any chance of overflow.
     # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
@@ -74,11 +86,12 @@ class Model(tf.keras.Model):
 
 
 class PixelModel(Model):
+  """Direct pixel-based optimization model."""
 
   def __init__(self, seed=None, args=None):
     super().__init__(seed, args)
     shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    z_init = np.broadcast_to(args['volfrac'] * args['mask'], shape)
+    z_init = np.broadcast_to(self.args['volfrac'] * self.args['mask'], shape)
     self.z = tf.Variable(z_init, trainable=True)
 
   def call(self, inputs=None):
@@ -86,6 +99,7 @@ class PixelModel(Model):
 
 
 def global_normalization(inputs, epsilon=1e-6):
+  """Apply global normalization to inputs."""
   mean, variance = tf.nn.moments(inputs, axes=list(range(len(inputs.shape))))
   net = inputs
   net -= mean
@@ -94,14 +108,17 @@ def global_normalization(inputs, epsilon=1e-6):
 
 
 def UpSampling2D(factor):
+  """Create upsampling layer with bilinear interpolation."""
   return layers.UpSampling2D((factor, factor), interpolation='bilinear')
 
 
 def Conv2D(filters, kernel_size, **kwargs):
+  """Create 2D convolution layer with same padding."""
   return layers.Conv2D(filters, kernel_size, padding='same', **kwargs)
 
 
 class AddOffset(layers.Layer):
+  """Custom layer that adds a learnable offset to inputs."""
 
   def __init__(self, scale=1):
     super().__init__()
@@ -116,6 +133,7 @@ class AddOffset(layers.Layer):
 
 
 class CNNModel(Model):
+  """Convolutional neural network model for design generation."""
 
   def __init__(
       self,
