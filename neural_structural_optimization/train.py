@@ -15,6 +15,14 @@
 
 # pylint: disable=missing-docstring
 # pylint: disable=superfluous-parens
+
+"""
+overview: 
+- multiple optimization algorithms, with both tensorflow and autograd-based optimization
+- training loops, gradient computation, results storage
+- batch training for multiple models
+"""
+
 import functools
 
 from absl import logging

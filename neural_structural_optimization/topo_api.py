@@ -15,6 +15,14 @@
 
 # pylint: disable=missing-docstring
 
+"""
+overview:
+- clean interface between physics engine and neural networks
+- problem parameter setup (boundary conditions, forces, constraints)
+- environment class wraps physics calcs
+- converts between different coordinate systems and data formats
+"""
+
 import autograd.numpy as np
 from neural_structural_optimization import topo_physics
 

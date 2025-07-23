@@ -12,7 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NumPy friendly caching utilities."""
+
+"""
+Overview:
+- NumPy friendly caching utilities
+- wraps NumPy arrays to make them hashable for caching 
+"""
 
 import functools
 

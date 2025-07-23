@@ -12,7 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pipeline utilties."""
+
+"""
+overview
+- helper functions for image generation and visualization
+- design rendering and problem-specific display logic
+- dynamic depth calculation for CNN architectures
+- converts optimization results to visual formats
+"""
+
 import math
 from typing import Any, Dict
 

@@ -12,7 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Launch a beam pipeline that trains all models."""
+
+"""
+overview:
+- launches Apache Beam pipeline that trains all models/distributed optimization across multiple problems
+- experiment management, result storage, batch processing
+- supports different optimization methods + model configurations
+- experiment logging and result aggregation
+"""
 
 import ast
 import re

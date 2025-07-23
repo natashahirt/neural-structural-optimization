@@ -17,6 +17,14 @@
 # pylint: disable=unused-argument
 # pylint: disable=g-import-not-at-top
 
+"""
+overview:
+- autograd + custom primitives for topopt
+- specialized operations like cone filtering and sparse matrix solving
+- efficient gradient computation for structural analysis
+- caching mechanisms for performance optimization
+"""
+
 import warnings
 
 import autograd

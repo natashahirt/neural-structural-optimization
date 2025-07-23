@@ -12,6 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""
+overview:
+- core topopt physics using autograd
+- fea for structural compliance minimization
+- stiffness matrices, displacement calculation, compliance computation
+- filtering operations (cone filter, sigmoid constraints)
+"""
+
 """Autograd implementation of topology optimization for compliance minimization.
 
 Exactly reproduces the result of "Efficient topology optimization in MATLAB

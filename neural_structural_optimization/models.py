@@ -16,6 +16,14 @@
 # pylint: disable=missing-docstring
 # pylint: disable=invalid-name
 
+"""
+overview:
+- PixelModel = discrete pixel-based optimization
+- CNNModel = CNN for generating designs
+- tensorflow models integrated with autograd physics
+- custom gradients and loss functions
+"""
+
 import autograd
 import autograd.core
 import autograd.numpy as np
