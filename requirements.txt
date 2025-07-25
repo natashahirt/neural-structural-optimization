@@ -30,5 +30,13 @@ apache-beam>=2.40.0
 # Utilities
 absl-py>=1.0.0
 
+# CLIP integration dependencies (optional)
+# Uncomment the following lines to enable CLIP functionality:
+torch>=1.9.0
+torchvision>=0.10.0
+ftfy>=6.0.0
+regex>=2021.0.0
+git+https://github.com/openai/CLIP.git
+
 # Optional: For faster sparse matrix operations
 # scikit-sparse>=0.4.0  # Uncomment if available for your platform 

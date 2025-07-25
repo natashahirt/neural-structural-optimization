@@ -31,16 +31,31 @@ INSTALL_REQUIRES = [
     'pandas>=1.5.0',  # Required by xarray
 ]
 
-# Optional dependencies for enhanced performance
+# Optional dependencies for enhanced performance and CLIP integration
 EXTRAS_REQUIRE = {
     'fast': [
         'scikit-sparse>=0.4.0',  # For faster sparse matrix operations
+    ],
+    'clip': [
+        'torch>=1.9.0',
+        'torchvision>=0.10.0',
+        'ftfy>=6.0.0',
+        'regex>=2021.0.0',
+        'clip @ git+https://github.com/openai/CLIP.git',
     ],
     'dev': [
         'pytest>=7.0.0',
         'pytest-cov>=4.0.0',
         'black>=22.0.0',
         'flake8>=5.0.0',
+    ],
+    'all': [
+        'scikit-sparse>=0.4.0',
+        'torch>=1.9.0',
+        'torchvision>=0.10.0',
+        'ftfy>=6.0.0',
+        'regex>=2021.0.0',
+        'clip @ git+https://github.com/openai/CLIP.git',
     ],
 }
 
@@ -54,7 +69,7 @@ setuptools.setup(
     license='Apache 2.0',
     author='Google LLC',
     author_email='noreply@google.com',
-    description='Neural reparameterization for structural optimization with modern TensorFlow support',
+    description='Neural reparameterization for structural optimization with modern TensorFlow support and CLIP integration',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
     install_requires=INSTALL_REQUIRES,
@@ -75,5 +90,5 @@ setuptools.setup(
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
         'Topic :: Scientific/Engineering :: Physics',
     ],
-    keywords='topology optimization, structural optimization, neural networks, tensorflow',
+    keywords='topology optimization, structural optimization, neural networks, tensorflow, clip, text-guided optimization',
 )

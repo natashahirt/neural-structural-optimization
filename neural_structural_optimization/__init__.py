@@ -12,3 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Core modules
+from . import models
+from . import train
+from . import problems
+from . import topo_physics
+from . import autograd_lib
+from . import pipeline
+from . import pipeline_utils
+from . import caching
+from . import topo_api
+
+# CLIP integration (optional - only if CLIP is available)
+try:
+    from . import clip_loss
+    from . import clip_config
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
+
+__version__ = "0.1.0"

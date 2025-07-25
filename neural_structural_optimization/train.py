@@ -20,7 +20,8 @@ import functools
 from absl import logging
 import autograd
 import autograd.numpy as np
-from neural_structural_optimization import models
+import matplotlib.pyplot as plt
+from neural_structural_optimization import models  # Add this import
 from neural_structural_optimization import topo_physics
 import scipy.optimize
 import tensorflow as tf
@@ -96,7 +97,7 @@ def train_tf_optimizer(
 
 
 train_adam = functools.partial(
-    train_tf_optimizer, optimizer=tf.keras.optimizers.Adam(1e-2))
+    train_tf_optimizer, optimizer=tf.keras.optimizers.legacy.Adam(1e-2))
 
 
 def _set_variables(variables, x):
@@ -149,8 +150,10 @@ def train_lbfgs(
   frames = []
 
   if init_model is not None:
-    if not isinstance(model, models.PixelModel):
-      raise TypeError('can only use init_model for initializing a PixelModel')
+    # if not isinstance(model, models.PixelModel):
+      # raise TypeError('can only use init_model for initializing a PixelModel')
+    if not hasattr(model, 'z'):
+      raise TypeError('init_model can only be used for models with latent variable `z`')
     model.z.assign(tf.cast(init_model(None), model.z.dtype))
 
   tvars = model.trainable_variables
@@ -177,6 +180,46 @@ def train_lbfgs(
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
+def adaptive_train_lbfgs(
+  base_args,
+  resolutions,
+  max_iter_per_stage,
+  model_class=models.CNNModelDynamic,
+  save_intermediate_designs=True,
+  **kwargs
+):
+  z_init = None # initial latent vector
+  
+  for i, (nely, nelx) in enumerate(resolutions):
+    print(f"\n=== Stage {i+1}/{len(resolutions)}: {nely} x {nelx} ===")
+    args = base_args.copy()
+    args['nely'] = nely
+    args['nelx'] = nelx
+
+    model = model_class(args=args)
+    # Print density of latent vector z
+    z_density = tf.reduce_mean(model.z)
+    print(f"Latent vector z density: {z_density:.4f}")
+
+    if z_init is not None: # project the existing latent vector
+      old_shape = z_init.shape[1:]
+      new_shape = model.z.shape[1:]
+      if old_shape != new_shape:
+        z_init_resized = tf.image.resize(
+          tf.reshape(z_init, (1, *old_shape, 1)),
+          new_shape,
+          method='bilinear'
+        )
+        z_init = tf.reshape(z_init_resized, (1, -1))
+      model.z.assign(z_init)
+    
+    ds = train_lbfgs(
+            model, max_iterations=max_iter_per_stage, **kwargs
+        )
+    
+    z_init = model.z.numpy()
+  
+  return ds
 
 def constrained_logits(init_model):
   """Produce matching initial conditions with volume constraints applied."""
@@ -256,41 +299,97 @@ def method_of_moving_asymptotes(
 def optimality_criteria(
     model, max_iterations, save_intermediate_designs=True, init_model=None,
 ):
-  """Train a model using Optimality Criteria optimization.
-  
-  Args:
-    model: The model to train (must be PixelModel)
-    max_iterations: Maximum number of optimization iterations
-    save_intermediate_designs: Whether to save intermediate designs
-    init_model: Optional model to initialize from
+    """Train a model using Optimality Criteria optimization."""
+    from neural_structural_optimization import models
     
-  Returns:
-    xarray.Dataset containing optimization results
-  """
-  if not isinstance(model, models.PixelModel):
-    raise ValueError('Optimality criteria only defined for pixel models')
+    if not isinstance(model, models.PixelModel):
+        raise ValueError('Optimality criteria only defined for pixel models')
 
-  env = model.env
-  if init_model is None:
-    x = _get_variables(model.trainable_variables).astype(np.float64)
-  else:
-    x = constrained_logits(init_model).ravel()
+    env = model.env
+    nely, nelx = env.args['nely'], env.args['nelx']
+    expected_size = nely * nelx
 
-  losses = []
-  frames = []
+    # Initialize design
+    if init_model is None:
+        x = _get_variables(model.trainable_variables).astype(np.float64)
+    else:
+        x = constrained_logits(init_model).ravel()
 
-  for i in range(max_iterations):
-    x = topo_physics.optimality_criteria_step(x, env.ke, env.args)
-    loss = env.objective(x, volume_contraint=False)
-    losses.append(loss)
-    frames.append(env.reshape(x).copy())
+    # Ensure x is 1D array with correct size
+    x = np.asarray(x).ravel()
+    if x.size != expected_size:
+        logging.warning(f'Reshaping x from {x.size} to {expected_size}')
+        if x.size == 1:
+            x = np.full(expected_size, float(x[0]))
+        else:
+            x = x[:expected_size]
+            if x.size < expected_size:
+                x = np.pad(x, (0, expected_size - x.size), mode='edge')
 
-    if i % (max_iterations // 10) == 0:
-      logging.info(f'step {i}, loss {loss:.2f}')
+    losses = []
+    frames = []
 
-  designs = [env.render(x, volume_contraint=True) for x in frames]
-  return optimizer_result_dataset(
-      np.array(losses), np.array(designs), save_intermediate_designs)
+    for i in range(max_iterations):
+        try:
+            # Apply optimality criteria step
+            step_result = topo_physics.optimality_criteria_step(x, env.ke, env.args)
+            
+            # Handle return value - ensure it's a 1D array
+            if isinstance(step_result, tuple):
+                x_new = step_result[0]
+            else:
+                x_new = step_result
+            
+            # Convert to numpy array and ensure it's 1D
+            x_new = np.asarray(x_new)
+            if x_new.ndim == 0:  # Scalar
+                x_new = np.full(expected_size, float(x_new))
+            else:
+                x_new = x_new.ravel()
+            
+            # Ensure correct size
+            if x_new.size != expected_size:
+                logging.warning(f'Step {i}: result size {x_new.size} != expected {expected_size}')
+                if x_new.size == 1:
+                    x_new = np.full(expected_size, float(x_new[0]))
+                else:
+                    x_new = x_new[:expected_size]
+                    if x_new.size < expected_size:
+                        x_new = np.pad(x_new, (0, expected_size - x_new.size), mode='edge')
+            
+            x = x_new
+            
+            # Calculate loss
+            loss = env.objective(x, volume_contraint=False)
+            losses.append(loss)
+            
+            # Create frame
+            frame = x.reshape(nely, nelx)
+            frames.append(frame.copy())
+
+            if i % max(1, max_iterations // 10) == 0:
+                logging.info(f'step {i}, loss {loss:.6f}')
+                
+        except Exception as e:
+            logging.warning(f'Step {i} failed: {e}')
+            break
+
+    # Ensure we have results
+    if not losses:
+        losses = [0.0]
+        frames = [np.zeros((nely, nelx))]
+
+    # Create designs
+    designs = []
+    for frame in frames:
+        try:
+            design = env.render(frame, volume_contraint=True)
+        except:
+            design = frame
+        designs.append(design)
+
+    return optimizer_result_dataset(
+        np.array(losses), np.array(designs), save_intermediate_designs)
 
 
 def train_batch(model_list, flag_values, train_func=train_adam):

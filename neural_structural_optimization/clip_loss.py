@@ -2,7 +2,7 @@ import torch
 import clip
 import numpy as np
 import tensorflow as tf
-from PIL import image
+from PIL import Image
 import io
 
 class CLIPLoss:
@@ -20,12 +20,17 @@ class CLIPLoss:
 
         # convert to numpy
         design_np = design.numpy() # convert to numpy array
-        design_np = (design_np - design_np.min()) / (design_np.max() - design_np.min()) * 255 # normalize to range 0-255
+        # Handle edge case where min == max to avoid division by zero
+        design_range = design_np.max() - design_np.min()
+        if design_range == 0:
+            design_np = np.zeros_like(design_np)
+        else:
+            design_np = (design_np - design_np.min()) / design_range * 255  # normalize to range 0-255
         design_np = design_np.astype(np.uint8)
 
         # convert to PIL image
         image = Image.fromarray(design_np, mode='L') # greyscale
-        image = Image.resize(size, Image.LANCZOS)
+        image = image.resize(size, Image.LANCZOS)
 
         # convert to rgb for CLIP
         rgb_image = Image.new('RGB', size)
@@ -33,10 +38,10 @@ class CLIPLoss:
 
         return rgb_image
     
-    def get_text_loss(self, design, text_prompt, temp=1.0):
+    def get_text_loss(self, design, target_text_prompt, temp=1.0):
         """
         design: tensorflow tensor of structural design
-        text_prompt: text description of desired image
+        target_text_prompt: text description of desired image
         temp: temp for clip similarity comparison
 
         returns tensorflow tensor representing clip loss
@@ -46,7 +51,7 @@ class CLIPLoss:
 
         # preprocess for clip
         design_input = self.preprocess(design_image).unsqueeze(0).to(self.device)
-        target_input = clip.tokenize([text_prompt]).to(self.device)
+        target_input = clip.tokenize([target_text_prompt]).to(self.device)
 
         # get clip features
         with torch.no_grad():
@@ -62,18 +67,18 @@ class CLIPLoss:
 
         similarity = similarity / temp # higher temp = softer predictions, lower temp = more decisive
         loss = 1.0 - similarity.item() # higher similarity = lower loss
-        return tf.constant(loss, dtype=tf.float32)
+        return tf.constant(loss, dtype=tf.float64)
 
-    def get_image_loss(self, design, image_path, temp=1.0):
+    def get_image_loss(self, design, target_image_path, temp=1.0):
         """
         design: tensorflow tensor of structural design
-        image_path: path to the reference image
+        target_image_path: path to the reference image
         temp: temp for clip similarity comparison
 
         returns tensorflow tensor representing clip loss
         """
 
-        target_image = Image.open(image_path).convert('RGB')
+        target_image = Image.open(target_image_path).convert('RGB')
         target_image = target_image.resize((224,224), Image.LANCZOS)
 
         design_image = self.design_to_image(design)

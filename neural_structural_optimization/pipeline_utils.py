@@ -30,6 +30,7 @@ from neural_structural_optimization import problems
 import numpy as np
 from PIL import Image
 import xarray
+from typing import Tuple, List
 
 
 def image_from_array(
@@ -68,3 +69,28 @@ def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
       conv_filters=conv_filters,
       dense_channels=conv_filters[0] // 2,
   )
+
+def compute_resizes(
+    target_h: int,
+    target_w: int,
+    max_resizes: int,
+    min_base_size: int = 5
+) -> Tuple[Tuple[int, int], List[int]]:
+    
+    base_h = target_h
+    base_w = target_w
+    resizes = []
+
+    for i in range(max_resizes):
+        if base_h <= min_base_size or base_w <= min_base_size:
+            break
+        if base_h % 2 != 0 or base_w % 2 != 0:
+            break
+        base_h //= 2
+        base_w //= 2
+        resizes.append(2)
+
+    # Add dummy no-op resizes at beginning and end for symmetry
+    full_resizes = [1] + resizes + [1]
+
+    return (base_h, base_w), full_resizes

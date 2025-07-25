@@ -89,7 +89,9 @@ def mbb_beam(width=60, height=20, density=0.5):
   forces = np.zeros((width + 1, height + 1, 2))
   forces[0, 0, Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"mbb_beam_{width}x{height}"
+  return problem
 
 
 def cantilever_beam_full(
@@ -102,7 +104,9 @@ def cantilever_beam_full(
   forces = np.zeros((width + 1, height + 1, 2))
   forces[-1, round((1 - force_position)*height), Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"cantilever_beam_full_{width}x{height}"
+  return problem
 
 
 def cantilever_beam_two_point(
@@ -117,7 +121,9 @@ def cantilever_beam_two_point(
   forces = np.zeros((width + 1, height + 1, 2))
   forces[-1, round((1 - force_position)*height), Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"cantilever_beam_two_point_{width}x{height}"
+  return problem
 
 
 def pure_bending_moment(
@@ -135,7 +141,9 @@ def pure_bending_moment(
   forces[0, round(height*(1-support_position)), X] = 1
   forces[0, round(height*support_position), X] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"pure_bending_moment_{width}x{height}"
+  return problem
 
 
 def michell_centered_both(width=32, height=32, density=0.5, position=0.05):
@@ -148,7 +156,9 @@ def michell_centered_both(width=32, height=32, density=0.5, position=0.05):
   forces = np.zeros((width + 1, height + 1, 2))
   forces[-1, round(height/2), Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"michell_centered_both_{width}x{height}"
+  return problem
 
 
 def michell_centered_below(width=32, height=32, density=0.5, position=0.25):
@@ -161,7 +171,9 @@ def michell_centered_below(width=32, height=32, density=0.5, position=0.25):
   forces = np.zeros((width + 1, height + 1, 2))
   forces[-1, 0, Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"michell_centered_below_{width}x{height}"
+  return problem
 
 
 def ground_structure(width=32, height=32, density=0.5, force_position=0.5):
@@ -174,7 +186,9 @@ def ground_structure(width=32, height=32, density=0.5, force_position=0.5):
   forces = np.zeros((width + 1, height + 1, 2))
   forces[round(force_position*height), -1, Y] = -1
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"ground_structure_{width}x{height}"
+  return problem
 
 
 def l_shape(width=32, height=32, density=0.5, aspect=0.4, force_position=0.5):
@@ -189,7 +203,9 @@ def l_shape(width=32, height=32, density=0.5, aspect=0.4, force_position=0.5):
   mask = np.ones((width, height))
   mask[round(height*aspect):, :round(width*(1-aspect))] = 0
 
-  return Problem(normals, forces, density, mask.T)
+  problem = Problem(normals, forces, density, mask.T)
+  problem.name = f"l_shape_{width}x{height}"
+  return problem
 
 
 def crane(width=32, height=32, density=0.3, aspect=0.5, force_position=0.9):
@@ -205,7 +221,9 @@ def crane(width=32, height=32, density=0.3, aspect=0.5, force_position=0.9):
   # be designed; otherwise we get outrageously high values for the compliance.
   mask[round(aspect*width):, round(height*aspect)+2:] = 0
 
-  return Problem(normals, forces, density, mask.T)
+  problem = Problem(normals, forces, density, mask.T)
+  problem.name = f"crane_{width}x{height}"
+  return problem
 
 
 def tower(width=32, height=32, density=0.5):
@@ -216,7 +234,10 @@ def tower(width=32, height=32, density=0.5):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[0, 0, Y] = -1
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"tower_{width}x{height}"
+  return problem
 
 
 def center_support(width=32, height=32, density=0.3):
@@ -227,7 +248,10 @@ def center_support(width=32, height=32, density=0.3):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, 0, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"center_support_{width}x{height}"
+  return problem
 
 
 def column(width=32, height=32, density=0.3):
@@ -238,7 +262,10 @@ def column(width=32, height=32, density=0.3):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, 0, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"column_{width}x{height}"
+  return problem
 
 
 def roof(width=32, height=32, density=0.5):
@@ -250,7 +277,10 @@ def roof(width=32, height=32, density=0.5):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, 0, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"roof_{width}x{height}"
+  return problem
 
 
 def causeway_bridge(width=60, height=20, density=0.3, deck_level=1):
@@ -262,7 +292,10 @@ def causeway_bridge(width=60, height=20, density=0.3, deck_level=1):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, round(height * (1 - deck_level)), Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"causeway_bridge_{width}x{height}"
+  return problem
 
 
 def two_level_bridge(width=32, height=32, density=0.3, deck_height=0.2):
@@ -275,7 +308,10 @@ def two_level_bridge(width=32, height=32, density=0.3, deck_height=0.2):
   forces = np.zeros((width + 1, width + 1, 2))
   forces[:, round(height * (1 - deck_height) / 2), :] = -1 / (2 * width)
   forces[:, round(height * (1 + deck_height) / 2), :] = -1 / (2 * width)
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"two_level_bridge_{width}x{height}"
+  return problem
 
 
 def suspended_bridge(width=60, height=20, density=0.3, span_position=0.2,
@@ -289,7 +325,10 @@ def suspended_bridge(width=60, height=20, density=0.3, span_position=0.2,
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, -1, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"suspended_bridge_{width}x{height}"
+  return problem
 
 
 def canyon_bridge(width=60, height=20, density=0.3, deck_level=1):
@@ -302,7 +341,10 @@ def canyon_bridge(width=60, height=20, density=0.3, deck_level=1):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, deck_height, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"canyon_bridge_{width}x{height}"
+  return problem
 
 
 def thin_support_bridge(
@@ -319,7 +361,9 @@ def thin_support_bridge(
   mask = np.ones((width, height))
   mask[-round(width*(1-design_width)):, :round(height*(1-design_width))] = 0
 
-  return Problem(normals, forces, density, mask)
+  problem = Problem(normals, forces, density, mask)
+  problem.name = f"thin_support_bridge_{width}x{height}"
+  return problem
 
 
 def drawbridge(width=32, height=32, density=0.25):
@@ -330,7 +374,9 @@ def drawbridge(width=32, height=32, density=0.25):
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, -1, Y] = -1 / width
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"drawbridge_{width}x{height}"
+  return problem
 
 
 def hoop(width=32, height=32, density=0.25):
@@ -348,7 +394,9 @@ def hoop(width=32, height=32, density=0.25):
   )
   forces[i, j, Y] = -value / (2 * np.pi * width)
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"hoop_{width}x{height}"
+  return problem
 
 
 def multipoint_circle(
@@ -376,7 +424,9 @@ def multipoint_circle(
     forces[i, j, X] = + c1 * y + c2 * x + c3 * y + c4 * x + c_x0
     forces[i, j, Y] = - c1 * x + c2 * y + c3 * x - c4 * y + c_y0
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"multipoint_circle_{width}x{height}"
+  return problem
 
 
 def dam(width=32, height=32, density=0.5):
@@ -387,12 +437,17 @@ def dam(width=32, height=32, density=0.5):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[0, :, X] = 2 * np.arange(1, height+2) / height ** 2
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"dam_{width}x{height}"
+  return problem
 
 
 def ramp(width=32, height=32, density=0.25):
   """Support downward forces on a ramp."""
-  return staircase(width, height, density, num_stories=1)
+  problem = staircase(width, height, density, num_stories=1)
+  problem.name = f"ramp_{width}x{height}"
+  return problem
 
 
 def staircase(width=32, height=32, density=0.25, num_stories=2):
@@ -410,7 +465,9 @@ def staircase(width=32, height=32, density=0.25, num_stories=2):
         forces[i, j, Y], -value / (width * num_stories)
     )
 
-  return Problem(normals, forces, density)
+  problem = Problem(normals, forces, density)
+  problem.name = f"staircase_{width}x{height}"
+  return problem
 
 
 def staggered_points(width=32, height=32, density=0.3, interval=16,
@@ -426,7 +483,10 @@ def staggered_points(width=32, height=32, density=0.3, interval=16,
   # intentionally break horizontal symmetry?
   forces[interval//2+int(break_symmetry)::interval, ::interval, Y] = -f
   forces[int(break_symmetry)::interval, interval//2::interval, Y] = -f
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"staggered_points_{width}x{height}"
+  return problem
 
 
 def multistory_building(width=32, height=32, density=0.3, interval=16):
@@ -437,7 +497,10 @@ def multistory_building(width=32, height=32, density=0.3, interval=16):
 
   forces = np.zeros((width + 1, height + 1, 2))
   forces[:, ::interval, Y] = -1 / width
-  return Problem(normals, forces, density)
+
+  problem = Problem(normals, forces, density)
+  problem.name = f"multistory_building_{width}x{height}"
+  return problem
 
 
 # pylint: disable=line-too-long

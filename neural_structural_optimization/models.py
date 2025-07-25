@@ -16,18 +16,10 @@
 # pylint: disable=missing-docstring
 # pylint: disable=invalid-name
 
-"""
-overview:
-- PixelModel = discrete pixel-based optimization
-- CNNModel = CNN for generating designs
-- tensorflow models integrated with autograd physics
-- custom gradients and loss functions
-"""
-
 import autograd
 import autograd.core
 import autograd.numpy as np
-from neural_structural_optimization import topo_api
+from neural_structural_optimization import topo_api, pipeline_utils
 import tensorflow as tf
 
 # requires tensorflow 2.0
@@ -36,14 +28,12 @@ layers = tf.keras.layers
 
 
 def batched_topo_loss(params, envs):
-  """Compute topology optimization loss for batched parameters."""
   losses = [env.objective(params[i], volume_contraint=True)
             for i, env in enumerate(envs)]
   return np.stack(losses)
 
 
 def convert_autograd_to_tensorflow(func):
-  """Convert autograd function to TensorFlow custom gradient."""
   @tf.custom_gradient
   def wrapper(x):
     vjp, ans = autograd.core.make_vjp(func, x.numpy())
@@ -52,30 +42,20 @@ def convert_autograd_to_tensorflow(func):
 
 
 def set_random_seed(seed):
-  """Set random seeds for both NumPy and TensorFlow."""
   if seed is not None:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
 
 class Model(tf.keras.Model):
-  """Base model class for neural structural optimization."""
 
   def __init__(self, seed=None, args=None):
     super().__init__()
     set_random_seed(seed)
     self.seed = seed
-    
-    # Handle both Problem objects and dictionary arguments
-    if hasattr(args, 'normals'):  # It's a Problem object
-      self.args = topo_api.specified_task(args)
-    else:  # It's already a dictionary
-      self.args = args
-    
-    self.env = topo_api.Environment(self.args)
+    self.env = topo_api.Environment(args)
 
   def loss(self, logits):
-    """Compute the topology optimization loss."""
     # for our neural network, we use float32, but we use float64 for the physics
     # to avoid any chance of overflow.
     # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
@@ -86,12 +66,11 @@ class Model(tf.keras.Model):
 
 
 class PixelModel(Model):
-  """Direct pixel-based optimization model."""
 
   def __init__(self, seed=None, args=None):
     super().__init__(seed, args)
     shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    z_init = np.broadcast_to(self.args['volfrac'] * self.args['mask'], shape)
+    z_init = np.broadcast_to(args['volfrac'] * args['mask'], shape)
     self.z = tf.Variable(z_init, trainable=True)
 
   def call(self, inputs=None):
@@ -99,7 +78,6 @@ class PixelModel(Model):
 
 
 def global_normalization(inputs, epsilon=1e-6):
-  """Apply global normalization to inputs."""
   mean, variance = tf.nn.moments(inputs, axes=list(range(len(inputs.shape))))
   net = inputs
   net -= mean
@@ -108,17 +86,14 @@ def global_normalization(inputs, epsilon=1e-6):
 
 
 def UpSampling2D(factor):
-  """Create upsampling layer with bilinear interpolation."""
   return layers.UpSampling2D((factor, factor), interpolation='bilinear')
 
 
 def Conv2D(filters, kernel_size, **kwargs):
-  """Create 2D convolution layer with same padding."""
   return layers.Conv2D(filters, kernel_size, padding='same', **kwargs)
 
 
 class AddOffset(layers.Layer):
-  """Custom layer that adds a learnable offset to inputs."""
 
   def __init__(self, scale=1):
     super().__init__()
@@ -131,9 +106,7 @@ class AddOffset(layers.Layer):
   def call(self, inputs):
     return inputs + self.scale * self.bias
 
-
 class CNNModel(Model):
-  """Convolutional neural network model for design generation."""
 
   def __init__(
       self,
@@ -183,6 +156,83 @@ class CNNModel(Model):
     self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
     latent_initializer = tf.initializers.RandomNormal(stddev=latent_scale)
+    self.z = self.add_weight(
+        shape=inputs.shape, initializer=latent_initializer, name='z')
+
+  def call(self, inputs=None):
+    return self.core_model(self.z)
+
+class CNNModelDynamic(Model):
+
+  def __init__(
+      self,
+      seed=0,
+      args=None,
+      max_resizes=4,
+      min_base_size=5,
+      conv_filter_template=(512, 256, 128, 64, 32, 16, 8, 1),
+      offset_scale=10,
+      kernel_size=(5, 5),
+      latent_scale=1.0,
+      dense_init_scale=1.0,
+      activation=tf.nn.tanh,
+      conv_initializer=tf.initializers.VarianceScaling,
+      normalization=global_normalization,
+  ):
+    super().__init__(seed, args)
+
+    base_shape, resizes = pipeline_utils.compute_resizes(
+        target_h=args['nely'],
+        target_w=args['nelx'],
+        max_resizes=max_resizes,
+        min_base_size=min_base_size
+    )
+
+    conv_filters = conv_filter_template[-len(resizes):]
+    dense_channels = conv_filters[0] // 2
+
+    # Now store these as instance variables or pass into build()
+    self.resizes = resizes
+    self.base_shape = base_shape
+    self.conv_filters = conv_filters
+    self.dense_channels = dense_channels
+    self.activation = activation
+    self.kernel_size = kernel_size
+    self.latent_scale = latent_scale
+    self.dense_init_scale = dense_init_scale
+    self.normalization = normalization
+    self.offset_scale = offset_scale
+
+    activation = layers.Activation(activation)
+
+    h, w = self.base_shape
+    dense_channels = conv_filters[0] // 2
+    latent_size = h * w * dense_channels
+
+    net = inputs = layers.Input((latent_size,), batch_size=1)
+    filters = h * w * dense_channels
+    dense_initializer = tf.initializers.orthogonal(
+        dense_init_scale * np.sqrt(max(filters / latent_size, 1)))
+    net = layers.Dense(filters, kernel_initializer=dense_initializer)(net)
+    net = layers.Reshape([h, w, dense_channels])(net)
+
+    for resize, filters in zip(resizes, conv_filters):
+      net = activation(net)
+      net = UpSampling2D(resize)(net)
+      net = normalization(net)
+      net = Conv2D(
+          filters, kernel_size, kernel_initializer=conv_initializer)(net)
+      if offset_scale != 0:
+        net = AddOffset(offset_scale)(net)
+
+    outputs = tf.squeeze(net, axis=[-1])
+    # epsilon = 1e-3
+    # outputs = tf.clip_by_value(tf.squeeze(net, axis=[-1]), epsilon, 1.0)
+
+    self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+    latent_initializer = tf.initializers.RandomNormal(stddev=latent_scale)
+
     self.z = self.add_weight(
         shape=inputs.shape, initializer=latent_initializer, name='z')
 
