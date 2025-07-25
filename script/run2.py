@@ -77,7 +77,7 @@ def main():
         # model = models.CNNModelDynamic(args=args)
         # ds = train.train_lbfgs(model, max_iterations)
 
-        ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(10,20),(20,60)], max_iterations)
+        ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(20,60),(40,120)], max_iterations)
         if not isinstance(ds_history, list):
             ds_history = [ds_history]
             

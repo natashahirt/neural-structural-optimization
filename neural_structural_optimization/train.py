@@ -204,17 +204,22 @@ def adaptive_train_lbfgs(
     z_density = tf.reduce_mean(model.z)
     print(f"Latent vector z density: {z_density:.4f}")
 
-    # if z_init is not None: # project the existing latent vector
-    #   old_shape = z_init.shape[1:]
-    #   new_shape = model.z.shape[1:]
-    #   if old_shape != new_shape:
-    #     z_init_resized = tf.image.resize(
-    #       tf.reshape(z_init, (1, *old_shape, 1)),
-    #       new_shape,
-    #       method='bilinear'
-    #     )
-    #     z_init = tf.reshape(z_init_resized, (1, -1))
-    #   model.z.assign(z_init)
+    if z_init is not None: # project the existing latent vector
+      old_x, old_y = resolutions[i-1]
+      new_x, new_y = resolutions[i]
+
+      old_c = z_init.shape[1] // (old_x * old_y)
+      new_c = model.z.shape[1] // (new_x * new_y)
+
+      if (old_x, old_y) != (new_x, new_y):
+        z_spatial = tf.reshape(z_init, [1, old_y, old_x, old_c])
+        z_resized = tf.image.resize(z_spatial, size=(new_y, new_x), method='bilinear')
+        if old_c != new_c:
+          # Use a 1x1 conv to project channels if needed
+          conv = tf.keras.layers.Conv2D(new_c, kernel_size=1, use_bias=False)
+          z_resized = conv(z_resized)
+        z_init = tf.reshape(z_resized, [1, new_y * new_x * new_c])
+      model.z.assign(z_init)
     
     ds = train_lbfgs(model, max_iter_per_stage)
     ds_history.append(ds)
