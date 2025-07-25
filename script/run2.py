@@ -63,7 +63,7 @@ def main():
     
     try:
         # Create problem
-        problem = problems.multistory_building(width=20, height=60, interval=16)
+        problem = problems.multistory_building(width=5, height=15, interval=3)
         max_iterations = 200
         
         print(f"Problem: {problem.name}")
@@ -73,46 +73,49 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
-        args = topo_api.specified_task(problem)
-        model = models.CNNModelDynamic(args=args)
-        ds = train.train_lbfgs(model, max_iterations)
-        ds = ds.rename({'step': 'iteration'})
+        # args = topo_api.specified_task(problem)
+        # model = models.CNNModelDynamic(args=args)
+        # ds = train.train_lbfgs(model, max_iterations)
 
+        ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(10,20),(20,60)], max_iterations)
+        if not isinstance(ds_history, list):
+            ds_history = [ds_history]
+            
         print(f"\nOptimization completed!")
-        print(f"Dataset shape: {ds.dims}")
-        print(f"Available variables: {list(ds.data_vars.keys())}")
+        print(f"Number of stages: {len(ds_history)}")
 
-        # Create loss comparison plot with adaptive limits
-        loss_df = ds.loss.to_pandas().T           # shape: (iteration, model), ready for plotting
-
+        # Create loss comparison plot
         print("\nCreating loss comparison plot...")
         plt.figure(figsize=(10, 6))
-        loss_df.cummin().plot(ax=plt.gca(), linewidth=2)    
+        for i, ds in enumerate(ds_history):
+            ds = ds.rename({'step': 'iteration'})
+            loss_df = ds.loss.to_pandas().T
+            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.dims['y']}x{ds.dims['x']}")
         plt.ylabel("Loss")
         plt.xlabel("Optimization Step")
-        plt.title(f"Loss Comparison: {problem.name}")
+        plt.title("Loss Comparison Across Stages")
         plt.grid(True)
-        plt.legend(title="Model")
+        plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
         seaborn.despine()
         plt.tight_layout()
-        plt.savefig('optimization_comparison_loss.png', dpi=150)
+        plt.savefig('optimization_comparison_loss.png', dpi=150, bbox_inches='tight')
         plt.show()
 
         # Create final designs comparison plot
-        print("\nCreating final design plot...")
-        fig, ax = plt.subplots(figsize=(4, 6))
-        fig.suptitle(f'Final Design: {problem.name}', fontsize=16)
+        print("\nCreating final designs plot...")
+        fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
+        fig.suptitle(f'Final Designs: {problem.name}', fontsize=16)
 
-        # Get final design for CNN-LBFGS method
-        final_design = ds.design.isel(iteration=ds.loss.argmin())
-
-        im = ax.imshow(final_design, cmap='gray', vmin=0, vmax=1)
-        ax.set_title('CNN-LBFGS')
-        ax.axis('off')
+        for i, (ax, ds) in enumerate(zip(axes, ds_history)):
+            ds = ds.rename({'step': 'iteration'})
+            final_design = ds.design.isel(iteration=ds.loss.argmin())
+            im = ax.imshow(final_design, cmap='gray', vmin=0, vmax=1)
+            ax.set_title(f'Stage {i+1}: {ds.dims["y"]}x{ds.dims["x"]}')
+            ax.axis('off')
 
         plt.tight_layout()
         plt.savefig(f'results_{problem.name}.png', dpi=150, bbox_inches='tight')
-        print(f"Final design plot saved to 'results_{problem.name}.png'")
+        print(f"Final designs plot saved to 'results_{problem.name}.png'")
         plt.show()
 
         print("\n" + "=" * 60)

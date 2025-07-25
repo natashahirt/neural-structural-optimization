@@ -79,6 +79,51 @@ class Problem:
         self.normals[-1, :, X].all() and not self.normals[-1, :, Y].all()
     )
 
+  def copy(self, width=None, height=None, density=None, name=None):
+    new_width = width if width is not None else self.width
+    new_height = height if height is not None else self.height
+    new_density = density if density is not None else self.density
+    new_name = name if name is not None else self.name
+
+    new_normals = np.zeros((new_width + 1, new_height + 1, 2))
+    new_forces = np.zeros((new_width + 1, new_height + 1, 2))
+
+     # Scale the boundary conditions and forces
+    for i in range(new_width + 1):
+      for j in range(new_height + 1):
+        # Map new coordinates to original coordinates
+        orig_i = int(round(i * self.width / new_width))
+        orig_j = int(round(j * self.height / new_height))
+        
+        # Clamp to original bounds
+        orig_i = max(0, min(orig_i, self.width))
+        orig_j = max(0, min(orig_j, self.height))
+        
+        # Copy boundary conditions (normals)
+        new_normals[i, j, :] = self.normals[orig_i, orig_j, :]
+        
+        # Scale forces by area ratio to maintain total force
+        area_ratio = (self.width * self.height) / (new_width * new_height)
+        new_forces[i, j, :] = self.forces[orig_i, orig_j, :] * area_ratio
+    
+    # Handle the mask - scale it appropriately
+    if isinstance(self.mask, np.ndarray):
+      new_mask = np.ones((new_height, new_width))
+      for i in range(new_width):
+        for j in range(new_height):
+          orig_i = int(round(i * self.width / new_width))
+          orig_j = int(round(j * self.height / new_height))
+          orig_i = max(0, min(orig_i, self.width - 1))
+          orig_j = max(0, min(orig_j, self.height - 1))
+          new_mask[j, i] = self.mask[orig_j, orig_i]
+    else:
+      new_mask = self.mask
+    
+    # Create the new problem
+    new_problem = Problem(new_normals, new_forces, new_density, new_mask, new_name)
+    
+    return new_problem    
+
 
 def mbb_beam(width=60, height=20, density=0.5):
   """Textbook beam example."""

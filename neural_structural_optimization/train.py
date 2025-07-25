@@ -22,10 +22,11 @@ import autograd
 import autograd.numpy as np
 import matplotlib.pyplot as plt
 from neural_structural_optimization import models  # Add this import
-from neural_structural_optimization import topo_physics
+from neural_structural_optimization import topo_physics, topo_api
 import scipy.optimize
 import tensorflow as tf
 import xarray
+from tqdm import tqdm
 
 
 def optimizer_result_dataset(losses, frames, save_intermediate_designs=False):
@@ -157,8 +158,10 @@ def train_lbfgs(
     model.z.assign(tf.cast(init_model(None), model.z.dtype))
 
   tvars = model.trainable_variables
+  pbar = tqdm(total=max_iterations)
 
   def value_and_grad(x):
+    pbar.update(1)
     _set_variables(tvars, x)
     with tf.GradientTape() as t:
       t.watch(tvars)
@@ -181,45 +184,43 @@ def train_lbfgs(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
 def adaptive_train_lbfgs(
-  base_args,
+  problem,
   resolutions,
   max_iter_per_stage,
   model_class=models.CNNModelDynamic,
-  save_intermediate_designs=True,
   **kwargs
 ):
   z_init = None # initial latent vector
+  ds_history = []
   
-  for i, (nely, nelx) in enumerate(resolutions):
+  for i, (nelx, nely) in enumerate(resolutions):
     print(f"\n=== Stage {i+1}/{len(resolutions)}: {nely} x {nelx} ===")
-    args = base_args.copy()
-    args['nely'] = nely
-    args['nelx'] = nelx
+    # Create a fresh problem object for each stage instead of modifying the original
+    clean_problem = problem.copy(width=nelx, height=nely)
+    args = topo_api.specified_task(clean_problem)
 
     model = model_class(args=args)
     # Print density of latent vector z
     z_density = tf.reduce_mean(model.z)
     print(f"Latent vector z density: {z_density:.4f}")
 
-    if z_init is not None: # project the existing latent vector
-      old_shape = z_init.shape[1:]
-      new_shape = model.z.shape[1:]
-      if old_shape != new_shape:
-        z_init_resized = tf.image.resize(
-          tf.reshape(z_init, (1, *old_shape, 1)),
-          new_shape,
-          method='bilinear'
-        )
-        z_init = tf.reshape(z_init_resized, (1, -1))
-      model.z.assign(z_init)
+    # if z_init is not None: # project the existing latent vector
+    #   old_shape = z_init.shape[1:]
+    #   new_shape = model.z.shape[1:]
+    #   if old_shape != new_shape:
+    #     z_init_resized = tf.image.resize(
+    #       tf.reshape(z_init, (1, *old_shape, 1)),
+    #       new_shape,
+    #       method='bilinear'
+    #     )
+    #     z_init = tf.reshape(z_init_resized, (1, -1))
+    #   model.z.assign(z_init)
     
-    ds = train_lbfgs(
-            model, max_iterations=max_iter_per_stage, **kwargs
-        )
-    
+    ds = train_lbfgs(model, max_iter_per_stage)
+    ds_history.append(ds)
     z_init = model.z.numpy()
   
-  return ds
+  return ds_history
 
 def constrained_logits(init_model):
   """Produce matching initial conditions with volume constraints applied."""
