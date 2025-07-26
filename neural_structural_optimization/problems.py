@@ -85,44 +85,40 @@ class Problem:
     new_density = density if density is not None else self.density
     new_name = name if name is not None else self.name
 
+    # Initialize new arrays
     new_normals = np.zeros((new_width + 1, new_height + 1, 2))
     new_forces = np.zeros((new_width + 1, new_height + 1, 2))
 
-     # Scale the boundary conditions and forces
+    # Area ratio for force scaling
+    area_ratio = (self.width * self.height) / (new_width * new_height)
+
     for i in range(new_width + 1):
-      for j in range(new_height + 1):
-        # Map new coordinates to original coordinates
-        orig_i = int(round(i * self.width / new_width))
-        orig_j = int(round(j * self.height / new_height))
-        
-        # Clamp to original bounds
-        orig_i = max(0, min(orig_i, self.width))
-        orig_j = max(0, min(orig_j, self.height))
-        
-        # Copy boundary conditions (normals)
-        new_normals[i, j, :] = self.normals[orig_i, orig_j, :]
-        
-        # Scale forces by area ratio to maintain total force
-        area_ratio = (self.width * self.height) / (new_width * new_height)
-        new_forces[i, j, :] = self.forces[orig_i, orig_j, :] * area_ratio
-    
-    # Handle the mask - scale it appropriately
+        for j in range(new_height + 1):
+            # Map new node (i, j) to original grid
+            orig_i = int(round(i * self.width / new_width))
+            orig_j = int(round(j * self.height / new_height))
+
+            # Clamp to bounds
+            orig_i = min(max(orig_i, 0), self.width)
+            orig_j = min(max(orig_j, 0), self.height)
+
+            new_normals[i, j, :] = self.normals[orig_i, orig_j, :]
+            new_forces[i, j, :] = self.forces[orig_i, orig_j, :] * area_ratio
+
+    # Resize mask
     if isinstance(self.mask, np.ndarray):
-      new_mask = np.ones((new_height, new_width))
-      for i in range(new_width):
-        for j in range(new_height):
-          orig_i = int(round(i * self.width / new_width))
-          orig_j = int(round(j * self.height / new_height))
-          orig_i = max(0, min(orig_i, self.width - 1))
-          orig_j = max(0, min(orig_j, self.height - 1))
-          new_mask[j, i] = self.mask[orig_j, orig_i]
+        new_mask = np.ones((new_height, new_width), dtype=self.mask.dtype)
+        for i in range(new_width):
+            for j in range(new_height):
+                orig_i = int(round(i * self.width / new_width))
+                orig_j = int(round(j * self.height / new_height))
+                orig_i = min(max(orig_i, 0), self.width - 1)
+                orig_j = min(max(orig_j, 0), self.height - 1)
+                new_mask[j, i] = self.mask[orig_j, orig_i]
     else:
-      new_mask = self.mask
-    
-    # Create the new problem
-    new_problem = Problem(new_normals, new_forces, new_density, new_mask, new_name)
-    
-    return new_problem    
+        new_mask = self.mask
+
+    return Problem(new_normals, new_forces, new_density, new_mask, new_name)    
 
 
 def mbb_beam(width=60, height=20, density=0.5):

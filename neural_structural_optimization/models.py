@@ -168,9 +168,12 @@ class CNNModelDynamic(Model):
       self,
       seed=0,
       args=None,
+      base_shape=None,
       max_resizes=4,
       min_base_size=5,
       conv_filter_template=(512, 256, 128, 64, 32, 16, 8, 1),
+      conv_filters=[],
+      dense_channels=None,
       offset_scale=10,
       kernel_size=(5, 5),
       latent_scale=1.0,
@@ -189,31 +192,24 @@ class CNNModelDynamic(Model):
     )
 
     conv_filters = conv_filter_template[-len(resizes):]
-    dense_channels = conv_filters[0] // 2
+    scale_factor = max_resizes / len(resizes)  # will be larger when fewer resizes
+    dense_channels = int(conv_filters[0] // 2 * scale_factor)
+    # dense_channels = conv_filters[0] // 2
 
-    # Now store these as instance variables or pass into build()
-    self.resizes = resizes
+    self.resizes = resizes # (1, 2, 2, 2, 1)
     self.base_shape = base_shape
     self.conv_filters = conv_filters
     self.dense_channels = dense_channels
-    self.activation = activation
-    self.kernel_size = kernel_size
-    self.latent_scale = latent_scale
-    self.dense_init_scale = dense_init_scale
-    self.normalization = normalization
-    self.offset_scale = offset_scale
 
     activation = layers.Activation(activation)
 
     h, w = self.base_shape
-    dense_channels = conv_filters[0] // 2
     latent_size = h * w * dense_channels
 
     net = inputs = layers.Input((latent_size,), batch_size=1)
-    filters = h * w * dense_channels
     dense_initializer = tf.initializers.orthogonal(
-        dense_init_scale * np.sqrt(max(filters / latent_size, 1)))
-    net = layers.Dense(filters, kernel_initializer=dense_initializer)(net)
+        dense_init_scale * np.sqrt(max(dense_channels / latent_size, 1)))
+    net = layers.Dense(latent_size, kernel_initializer=dense_initializer)(net)
     net = layers.Reshape([h, w, dense_channels])(net)
 
     for resize, filters in zip(resizes, conv_filters):
@@ -226,8 +222,6 @@ class CNNModelDynamic(Model):
         net = AddOffset(offset_scale)(net)
 
     outputs = tf.squeeze(net, axis=[-1])
-    # epsilon = 1e-3
-    # outputs = tf.clip_by_value(tf.squeeze(net, axis=[-1]), epsilon, 1.0)
 
     self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
