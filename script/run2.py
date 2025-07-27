@@ -73,23 +73,23 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
-        args = topo_api.specified_task(problem)
-        model = models.CNNModelDynamic(args=args)
-        ds_history = train.train_lbfgs(model, max_iterations)
+        # args = topo_api.specified_task(problem)
+        # model = models.CNNModelDynamic(args=args)
+        # ds_history = train.train_lbfgs(model, max_iterations)
 
-        # resolutions = [
-        #     (30, 10),
-        #     (60, 20),
-        #     (120, 40),
-        #     (240, 80),
-        #     (480, 160),
-        #     (960, 320),
-        #     (1200, 400),
-        #     ]
-        # max_iter = [200, 100, 50, 30, 20, 10, 5]  # fewer iterations at each upsample stage
+        resolutions = [
+            (30, 10),
+            (60, 20),
+            (120, 40),
+            (240, 80),
+            (480, 160),
+            (960, 320),
+            (1200, 400),
+            ]
+        max_iter = [200, 100, 50, 30, 20, 10, 5]  # fewer iterations at each upsample stage
 
-        # ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(20,60),(30,120)], max_iterations)
-        # ds_history = train.adaptive_train_lbfgs(problem, resolutions, max_iter)
+        ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(20,60),(30,120)], max_iterations)
+        ds_history = train.adaptive_train_lbfgs(problem, resolutions, max_iter)
         if not isinstance(ds_history, list):
             ds_history = [ds_history]
             

@@ -192,10 +192,10 @@ class CNNModelDynamic(Model):
     )
 
     conv_filters = conv_filter_template[-len(resizes):]
-    # dense_channels = max(conv_filter_template[min(len(resizes), len(conv_filter_template) - 1)] // 4, 1)
+    dense_channels = max(conv_filter_template[min(len(resizes), len(conv_filter_template) - 1)] // 4, 1)
     # dense_channels = conv_filters[0] // 2
 
-    dense_channels = 32
+    # dense_channels = 32
 
     self.resizes = resizes # (1, 2, 2, 2, 1)
     self.base_shape = base_shape
