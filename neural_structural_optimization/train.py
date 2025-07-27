@@ -174,8 +174,9 @@ def train_lbfgs(
 
   x0 = _get_variables(tvars).astype(np.float64)
   # rely upon the step limit instead of error tolerance for finishing.
+  # cancel that, 
   _, _, info = scipy.optimize.fmin_l_bfgs_b(
-      value_and_grad, x0, maxfun=max_iterations, factr=1, pgtol=1e-14, **kwargs
+      value_and_grad, x0, maxfun=max_iterations, factr=1e7, pgtol=1e-14, **kwargs
   )
   logging.info(info)
 
