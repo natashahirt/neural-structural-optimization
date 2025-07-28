@@ -59,16 +59,16 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
-        # ds_history = train.train_adam_progressive(model, max_iterations)
+        model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
+        ds_history = train.train_adam_progressive(model, max_iterations)
 
-        model = models.PixelModel(problem_params=params)
-        ds_history = train.train_adam(model, max_iterations)
+        # model = models.PixelModel(problem_params=params)
+        # ds_history = train.train_adam(model, max_iterations)
 
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        if not isinstance(ds_history, list):
+        if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
             
         print(f"\nOptimization completed!")
@@ -94,7 +94,8 @@ def main():
         # Create final designs comparison plot
         print("\nCreating final designs plot...")
         fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
-        if not isinstance(axes, list):
+        
+        if not isinstance(axes, (list, np.ndarray)):
             axes = [axes]
         fig.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
 

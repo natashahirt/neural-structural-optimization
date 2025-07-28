@@ -56,26 +56,13 @@ class Model(tf.keras.Model):
     self.env = topo_api.Environment(args)
     self.args = args
 
-  # def loss(self, logits):
-  #   # for our neural network, we use float32, but we use float64 for the physics
-  #   # to avoid any chance of overflow.
-  #   # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
-  #   logits = 0.0 + tf.cast(logits, tf.float64)
-  #   f = lambda x: batched_topo_loss(x, [self.env])
-  #   losses = convert_autograd_to_tensorflow(f)(logits)
-  #   return tf.reduce_mean(losses)
-
   def loss(self, logits):
-    logits = tf.cast(logits, tf.float64)
-    flat_logits = tf.reshape(logits, [logits.shape[0], -1])  # flatten for autograd
-
-    # Build wrapper on-the-fly to ensure `self.env` is current
-    def autograd_loss(x_np):
-        return batched_topo_loss(x_np, [self.env])
-
-    wrapped_loss = convert_autograd_to_tensorflow(autograd_loss)
-    losses = wrapped_loss(flat_logits)
-
+    # for our neural network, we use float32, but we use float64 for the physics
+    # to avoid any chance of overflow.
+    # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
+    logits = 0.0 + tf.cast(logits, tf.float64)
+    f = lambda x: batched_topo_loss(x, [self.env])
+    losses = convert_autograd_to_tensorflow(f)(logits)
     return tf.reduce_mean(losses)
 
   def update_problem_params(self, new_params):
@@ -150,14 +137,17 @@ class PixelModelAdaptive(Model):
 
     self.update_problem_params(new_problem_params)
 
-    self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    
+    self.shape = (1, new_problem_params.height, new_problem_params.width)
+  
+    z = self.z
+    z = tf.expand_dims(z, axis=-1) # add extra channel dimension for tfi
+
     # resize z
-    z_resized = tfi.resize(self.z, 
-      size=[int(self.shape[1] * self.resize_scale),
-            int(self.shape[2] * self.resize_scale)],
+    z_resized = tfi.resize(z, 
+      size=[int(self.shape[1]), int(self.shape[2])],
       method="bilinear", antialias=True)
 
+    z_resized = tf.squeeze(z_resized, axis=-1) # get rid of extra channel dimension
     z_resized = tf.clip_by_value(z_resized, 0.0, 1.0)
     z_resized = tf.expand_dims(z_resized[0], axis=0)  # ensure shape (1, H, W)
     
