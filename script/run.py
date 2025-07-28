@@ -1,171 +1,151 @@
-#!/usr/bin/env python3
-"""
-Example usage of the refactored neural structural optimization code.
-This script demonstrates how to run a simple topology optimization.
-"""
+# Copyright 2019 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-import numpy as np
+from PIL import Image
+import seaborn
 import matplotlib.pyplot as plt
-import tensorflow as tf
-from neural_structural_optimization import models, problems, train, topo_api
-from neural_structural_optimization import clip_config
+import xarray
+import pandas as pd
+import numpy as np
 
-def run_pixel_optimization(problem=problems.cantilever_beam_full(width=40,height=20,density=.4,force_position=0.5)):
-    """Run a simple topology optimization example."""
-    print("Running simple topology optimization example...")
+from neural_structural_optimization import pipeline_utils
+from neural_structural_optimization import problems
+from neural_structural_optimization import models
+from neural_structural_optimization import topo_api
+from neural_structural_optimization import train
+from neural_structural_optimization import pipeline_utils
+from neural_structural_optimization.problems_utils import ProblemParams
+
+def train_all(problem, max_iterations, cnn_kwargs=None):
+    """Train all optimization methods on a given problem."""
+    print(f"Starting optimization for {problem.name} ({problem.width}x{problem.height})")
     
-    # Create a cantilever beam problem
-    print(f"Problem: {problem.name} ({problem.width}x{problem.height})")
-
     args = topo_api.specified_task(problem)
-    
-    # Create a pixel model
-    model = models.PixelModel(args=args)
-    print(f"Model created with {len(model.trainable_variables)} trainable variables")
-    
-    # Run optimization with Adam - much more iterations for better resolution
-    print("Starting optimization with Adam...")
-    result = train.train_adam(model, max_iterations=1000)  # Increased from 200 to 500
-    
-    print(f"Optimization completed!")
-    print(f"Final loss: {result.loss.values[-1]:.6f}")
-    print(f"Best loss: {result.loss.values.min():.6f}")
-    print(f"Total iterations: {len(result.loss.values)}")
-    
-    return model, result
-    
-def visualize_results(model, result, filename=""):
-    """Visualize the optimization results."""
-    print("\nVisualizing results...")
-    
-    # Get the best design - handle both 2D and 3D arrays
-    best_design = result.design.values
-    if len(best_design.shape) == 3:
-        # Take final design if we have intermediate steps
-        best_design = best_design[-1]
-    
-    # Create a simple visualization
-    plt.figure(figsize=(12, 4))
-    
-    # Plot loss history
-    plt.subplot(1, 3, 1)
-    plt.plot(result.loss.values)
-    plt.title('Loss History')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    
-    # Plot initial design - handle both 2D and 3D arrays
-    plt.subplot(1, 3, 2)
-    initial_design = result.design.values[0] if len(result.design.values.shape) == 3 else result.design.values
-    plt.imshow(initial_design, cmap='gray', vmin=0, vmax=1)
-    plt.title('Initial Design')
-    plt.axis('off')
-    
-    # Plot final design
-    plt.subplot(1, 3, 3)
-    plt.imshow(best_design, cmap='gray', vmin=0, vmax=1)
-    plt.title('Final Design')
-    plt.axis('off')
-    plt.tight_layout()
-    if filename != "":
-        plt.savefig(f'optimization_results_{filename}.png', dpi=150, bbox_inches='tight')
-        print(f"Results saved to 'optimization_results_{filename}.png'")
-    else:
-        plt.savefig('optimization_results.png', dpi=150, bbox_inches='tight')
-        print("Results saved to 'optimization_results.png'")
-    
-    return best_design
 
-def run_cnn_optimization():
-    """Run optimization using the CNN model."""
-    print("Running CNN-based optimization...")
-    
-    # Create a cantilever beam problem
-    problem = problems.cantilever_beam_full(
-        width=80, height=40, density=0.4, force_position=0.5
-    )
-    print(f"Problem: {problem.name} ({problem.width}x{problem.height})")
+    if cnn_kwargs is None:
+        cnn_kwargs = {}
 
-    args = topo_api.specified_task(problem)
-    
-    # Create a CNN model instead of PixelModel
-    model = models.CNNModel(
-        args=args,
-        latent_size=128,  # Size of latent space
-    )
-    print(f"CNN Model created with {len(model.trainable_variables)} trainable variables")
-    
-    # Run optimization with Adam
-    print("Starting optimization with Adam...")
-    result = train.train_adam(model, max_iterations=500)
-    
-    print(f"Optimization completed!")
-    print(f"Final loss: {result.loss.values[-1]:.6f}")
-    print(f"Best loss: {result.loss.values.min():.6f}")
-    print(f"Total iterations: {len(result.loss.values)}")
-    
-    return model, result
+    print("Running dynamic CNN Model with L-BFGS...")
+    model = models.CNNModelDynamic(args=args)
+    ds_cnn = train.train_lbfgs(model, max_iterations)
 
-def run_clip_cnn_optimization(prompt="structure"):
-    """Run CNN optimization with CLIP guidance."""
-    print("Running CNN optimization with CLIP guidance...")
-    
-    # Create a cantilever beam problem
-    problem = problems.multistory_building(
-        width=50, height=100
-    )
-    print(f"Problem: {problem.name} ({problem.width}x{problem.height})")
-    
-    # Create CLIP configuration
-    clip_cfg = clip_config.create_clip_config(
-        target_text_prompt=prompt,
-        weight=1.0 # Balance between physics and aesthetics
-    )
-    
-    # Create CNN model with CLIP
-    model = models.CNNModel(
-        args=problem,
-        clip_config=clip_cfg,  # Pass CLIP config
-    )
-    print(f"CNN Model with CLIP created with {len(model.trainable_variables)} trainable variables")
-    
-    # Run optimization with Adam
-    print("Starting optimization with Adam...")
-    result = train.train_adam(model, max_iterations=500)
-    
-    print(f"Optimization completed!")
-    print(f"Final loss: {result.loss.values[-1]:.6f}")
-    print(f"Best loss: {result.loss.values.min():.6f}")
-    print(f"Total iterations: {len(result.loss.values)}")
-    
-    return model, result
+    # resolutions = [
+    #     (20, 40),   # coarse
+    #     (40, 80),   # mid
+    #     (60, 120),  # fine
+    # ]
+
+    # ds_cnn = train.adaptive_train_lbfgs(
+    #     args,
+    #     resolutions=resolutions,
+    #     max_iter_per_stage=200,
+    # )
+
+    dims = pd.Index(['cnn-lbfgs'], name='model')
+    result = xarray.concat([ds_cnn], dim=dims)
+    return result
 
 def main():
-    """Run the example."""
+    """Main function with error handling and progress reporting."""
     print("=" * 60)
-    print("Neural Structural Optimization - Example Usage")
+    print("Neural Structural Optimization - Multi-Method Comparison")
     print("=" * 60)
-    
-    problem = problems.multistory_building(width=50,height=100)
     
     try:
-        # Run simple optimization with more iterations
-        model, result = run_pixel_optimization(problem=problem)
-        best_design = visualize_results(model, result, filename=f"pixelmodel_{problem.name}")
-
-        # Run CNN optimization
-        # cnn_model, cnn_result = run_clip_cnn_optimization(prompt="human skeleton")
-        # cnn_design = visualize_results(cnn_model, cnn_result, filename="clip")
+        # Create problem
+        max_iterations = 200
         
+        print(f"Problem: {problem.name}")
+        print(f"Dimensions: {problem.width}x{problem.height}")
+        print(f"Max iterations: {max_iterations}")
+
+        # Run all optimization methods
+        print("\nStarting optimization...")
+
+        params = ProblemParams(
+            problem_name = "multistory_building",
+            width=20,
+            height=40,
+            density=0.4
+        )
+        model = models.CNNModelDynamic(problem_params=params)
+        ds_history = train.train_lbfgs(model, max_iterations)
+
+        # resolutions = [
+        #     (10, 30),
+        #     (20, 60),
+        #     (40, 120),
+        #     (80, 240),
+        #     (160, 480),
+        #     (320, 960),
+        #     (400, 1200),
+        #     ]
+        # max_iter = [200, 100, 50, 30, 20, 10, 5]  # fewer iterations at each upsample stage
+
+        # ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(20,60),(30,120)], max_iterations)
+        # ds_history = train.adaptive_train_lbfgs(problem, resolutions, max_iter)
+        if not isinstance(ds_history, list):
+            ds_history = [ds_history]
+            
+        print(f"\nOptimization completed!")
+        print(f"Number of stages: {len(ds_history)}")
+
+        # Create loss comparison plot
+        print("\nCreating loss comparison plot...")
+        plt.figure(figsize=(10, 6))
+        for i, ds in enumerate(ds_history):
+            ds = ds.rename({'step': 'iteration'})
+            loss_df = ds.loss.to_pandas().T
+            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.dims['y']}x{ds.dims['x']}")
+        plt.ylabel("Loss")
+        plt.xlabel("Optimization Step")
+        plt.title("Loss Comparison Across Stages")
+        plt.grid(True)
+        plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
+        seaborn.despine()
+        plt.tight_layout()
+        plt.savefig('optimization_comparison_loss.png', dpi=150, bbox_inches='tight')
+        plt.show()
+
+        # Create final designs comparison plot
+        print("\nCreating final designs plot...")
+        fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
+        if not isinstance(axes, list):
+            axes = [axes]
+        fig.suptitle(f'Final Designs: {problem.name}', fontsize=16)
+
+        for i, (ax, ds) in enumerate(zip(axes, ds_history)):
+            ds = ds.rename({'step': 'iteration'})
+            final_design = ds.design.isel(iteration=ds.loss.argmin())
+            im = ax.imshow(final_design, cmap='gray', vmin=0, vmax=1)
+            ax.set_title(f'Stage {i+1}: {ds.dims["y"]}x{ds.dims["x"]}')
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.savefig(f'results_{problem.name}.png', dpi=150, bbox_inches='tight')
+        print(f"Final designs plot saved to 'results_{problem.name}.png'")
+        plt.show()
+
         print("\n" + "=" * 60)
-        print("Example completed successfully!")
+        print("All operations completed successfully!")
         print("=" * 60)
         
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"\nError occurred: {e}")
         import traceback
         traceback.print_exc()
+        print("\nScript failed. Check the error message above.")
 
 if __name__ == "__main__":
-    main() 
+    main()
