@@ -131,7 +131,7 @@ def train_tf_optimizer(
   return optimizer_result_dataset(np.array(losses), np.array(designs),
                                   save_intermediate_designs)
 
-def train_adam(model, max_iterations, save_intermediate_designs=True):
+def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
     """ replaces original in order to use tqdm:
       train_adam = functools.partial(
       train_tf_optimizer, optimizer=tf.keras.optimizers.legacy.Adam(1e-2)) """
@@ -151,13 +151,13 @@ def train_adam(model, max_iterations, save_intermediate_designs=True):
 
         if i < max_iterations:
             grads = t.gradient(loss, tvars)
-            optimizer = tf.keras.optimizers.legacy.Adam(1e-2)
+            optimizer = tf.keras.optimizers.legacy.Adam(lr)
             optimizer.apply_gradients(zip(grads, tvars))
 
     designs = [model.env.render(x, volume_contraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
-def train_adam_progressive(model, max_iterations, save_intermediate_designs=True):
+def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
     """Adam training with tqdm and progressive upsampling."""
 
     ds_history = []
@@ -165,27 +165,7 @@ def train_adam_progressive(model, max_iterations, save_intermediate_designs=True
     for stage in range(model.resize_num + 1):
         print(f"\nTraining at resolution: {model.shape[1]}x{model.shape[2]}")
 
-        losses = []
-        frames = []
-
-        tvars = model.trainable_variables
-        optimizer = tf.keras.optimizers.legacy.Adam(1e-2)
-
-        for i in tqdm(range(max_iterations + 1), desc=f"Stage {stage} - Adam Optimizer"):
-            with tf.GradientTape() as t:
-                t.watch(tvars)
-                logits = model(None)
-                loss = model.loss(logits)
-
-            losses.append(loss.numpy().item())
-            frames.append(logits.numpy())
-
-            if i < max_iterations:
-                grads = t.gradient(loss, tvars)
-                optimizer.apply_gradients(zip(grads, tvars))
-
-        designs = [model.env.render(x, volume_contraint=True) for x in frames]
-        ds = optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
+        ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)
 
         # Upsample after stage if allowed

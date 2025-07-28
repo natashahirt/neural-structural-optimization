@@ -45,8 +45,8 @@ def main():
             problem_name = "multistory_building",
             width=50,
             height=40,
-            density=0.4,
-            interval=5
+            density=0.3,
+            num_stories=5
         )
 
         params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs_simple(params)      
@@ -60,7 +60,7 @@ def main():
         print(f"Max iterations: {max_iterations}")
 
         model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
-        ds_history = train.train_adam_progressive(model, max_iterations)
+        ds_history = train.train_progressive(model, max_iterations)
 
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_adam(model, max_iterations)

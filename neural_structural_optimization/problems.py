@@ -530,20 +530,24 @@ def staggered_points(width=32, height=32, density=0.3, interval=16,
   return problem
 
 
-def multistory_building(width=32, height=32, density=0.3, interval=16):
+def multistory_building(width=32, height=32, density=0.3, num_stories=16):
   """A multi-story building, supported from the ground."""
   normals = np.zeros((width + 1, height + 1, 2))
   normals[:, -1, Y] = 1
   normals[-1, :, X] = 1
 
   forces = np.zeros((width + 1, height + 1, 2))
-  forces[:, ::interval, Y] = -1 / width
+
+  story_height = height // num_stories
+  for story in range(0, num_stories):
+    story_y = story * story_height
+    forces[:, story_y, Y] = -1 / width
 
   problem = Problem(normals, forces, density)
   problem.name = f"multistory_building_{width}x{height}"
   return problem
 
-
+"""
 # pylint: disable=line-too-long
 PROBLEMS_BY_CATEGORY = {
     # idealized beam and cantilevers
@@ -732,3 +736,4 @@ for problem_class, problem_list in PROBLEMS_BY_CATEGORY.items():
     problem.name = name
     assert name not in PROBLEMS_BY_NAME, f'redundant name {name}'
     PROBLEMS_BY_NAME[name] = problem
+"""

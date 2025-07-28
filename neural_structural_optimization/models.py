@@ -125,16 +125,10 @@ class PixelModelAdaptive(Model):
       raise ValueError("No problem_params available for scaling")
     
     # update problem params
-    new_problem_params = self.problem_params.copy(
-                width=int(self.problem_params.width * self.resize_scale),
-                height=int(self.problem_params.height * self.resize_scale)
-            )
-    new_problem_params.interval = int(self.problem_params.interval * self.resize_scale)
-    if self.problem_params.num_points > 1:
-      # Scale num_points but keep it reasonable (don't scale if it's already large)
-      scaled_points = int(self.problem_params.num_points * self.resize_scale)
-      new_problem_params.num_points = min(scaled_points, 50)  # Cap at reasonable maximum
-
+    scaled_width=int(self.problem_params.width * self.resize_scale)
+    scaled_height=int(self.problem_params.height * self.resize_scale)
+    
+    new_problem_params = self.problem_params.copy(width=scaled_width, height=scaled_height)
     self.update_problem_params(new_problem_params)
 
     self.shape = (1, new_problem_params.height, new_problem_params.width)
