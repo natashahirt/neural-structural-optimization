@@ -19,11 +19,27 @@ def batched_topo_loss(params, envs):
 # Autodiff integration utilities
 # =============================================================================
 
+# def convert_autograd_to_tensorflow(func):
+#   @tf.custom_gradient
+#   def wrapper(x):
+#     vjp, ans = autograd.core.make_vjp(func, x.numpy())
+#     return ans, vjp
+#   return wrapper
+
 def convert_autograd_to_tensorflow(func):
   @tf.custom_gradient
-  def wrapper(x):
-    vjp, ans = autograd.core.make_vjp(func, x.numpy())
-    return ans, vjp
+  def wrapper(x_tf):
+    x_np = x_tf.numpy()  # Eager mode only — should not be inside tf.function
+    y_np, grad_np = autograd.value_and_grad(func)(x_np)
+
+    y_tf = tf.convert_to_tensor(y_np, dtype=x_tf.dtype)
+    grad_tf = tf.convert_to_tensor(grad_np, dtype=x_tf.dtype)
+
+    def grad(dy):
+      # dy is upstream scalar gradient (usually 1.0)
+      return dy * grad_tf
+
+    return y_tf, grad
   return wrapper
 
 # =============================================================================

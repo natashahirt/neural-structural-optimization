@@ -23,6 +23,8 @@ from neural_structural_optimization import topo_api, pipeline_utils
 from neural_structural_optimization.models_utils import *
 from neural_structural_optimization.problems_utils import ProblemParams
 import tensorflow as tf
+import tensorflow.image as tfi  # for resizing
+import torchvision.transforms as transforms
 import torch
 import torch.nn as nn
 
@@ -54,13 +56,26 @@ class Model(tf.keras.Model):
     self.env = topo_api.Environment(args)
     self.args = args
 
+  # def loss(self, logits):
+  #   # for our neural network, we use float32, but we use float64 for the physics
+  #   # to avoid any chance of overflow.
+  #   # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
+  #   logits = 0.0 + tf.cast(logits, tf.float64)
+  #   f = lambda x: batched_topo_loss(x, [self.env])
+  #   losses = convert_autograd_to_tensorflow(f)(logits)
+  #   return tf.reduce_mean(losses)
+
   def loss(self, logits):
-    # for our neural network, we use float32, but we use float64 for the physics
-    # to avoid any chance of overflow.
-    # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
-    logits = 0.0 + tf.cast(logits, tf.float64)
-    f = lambda x: batched_topo_loss(x, [self.env])
-    losses = convert_autograd_to_tensorflow(f)(logits)
+    logits = tf.cast(logits, tf.float64)
+    flat_logits = tf.reshape(logits, [logits.shape[0], -1])  # flatten for autograd
+
+    # Build wrapper on-the-fly to ensure `self.env` is current
+    def autograd_loss(x_np):
+        return batched_topo_loss(x_np, [self.env])
+
+    wrapped_loss = convert_autograd_to_tensorflow(autograd_loss)
+    losses = wrapped_loss(flat_logits)
+
     return tf.reduce_mean(losses)
 
   def update_problem_params(self, new_params):
@@ -79,10 +94,10 @@ class Model(tf.keras.Model):
 
 class PixelModel(Model):
 
-  def __init__(self, seed=None, args=None):
-    super().__init__(seed, args)
+  def __init__(self, problem_params=None, seed=None):
+    super().__init__(problem_params=problem_params, seed=seed)
     shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    z_init = np.broadcast_to(args['volfrac'] * args['mask'], shape)
+    z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], shape)
     self.z = tf.Variable(z_init, trainable=True)
 
   def call(self, inputs=None):
@@ -90,54 +105,63 @@ class PixelModel(Model):
 
 class PixelModelAdaptive(Model):
 
-  def __init__(self, problem_params=None, resize_num=None, resize_scale=None, args=None):
-    super().__init__(seed, args)
-    self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
+  def __init__(self, 
+               problem_params=None, 
+               resize_num=0, 
+               resize_scale=2, 
+               args=None, 
+               seed=None
+  ):
+    super().__init__(problem_params=problem_params, seed=seed, args=args)
     
-    self.problem_params = problem_params # ProblemParams object
-    
-    self.z_init = np.broadcast_to(args['volfrac'] * args['mask'], shape)
-    self.z = torch.nn.Parameter(torch.tensor(self.z_init),requires_grad = True)
-    self.prev_loss = 100000.
     self.resize_num = resize_num
     self.resize_scale = resize_scale
     self.resizes = 0
+    self.problem_params = problem_params
+    
+    self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
+    z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
+    self.z = tf.Variable(z_init, trainable=True, dtype=tf.float32)
 
-  def forward(self, x=None):
+    self.prev_loss = tf.constant(1e5, dtype=tf.float32)
+
+  def call(self, inputs=None):
     return self.z
 
   def threshold_crossed(self, loss, threshold=0.05):
-    delta_loss = np.abs(self.prev_loss - loss)
+    delta = tf.abs(self.prev_loss - loss)
     # self.prev_loss = loss # without this it seems kind of useless
-    return delta_loss < threshold
+    return delta < threshold
 
   def upsample(self):
     if self.problem_params is None:
       raise ValueError("No problem_params available for scaling")
     
+    # update problem params
     new_problem_params = self.problem_params.copy(
-      width=int(self.problem_params.width * self.resize_scale),
-      height=int(self.problem_params.height * self.resize_scale)
-    )
-
+                width=int(self.problem_params.width * self.resize_scale),
+                height=int(self.problem_params.height * self.resize_scale)
+            )
     new_problem_params.interval = int(self.problem_params.interval * self.resize_scale)
-
     if self.problem_params.num_points > 1:
       # Scale num_points but keep it reasonable (don't scale if it's already large)
       scaled_points = int(self.problem_params.num_points * self.resize_scale)
       new_problem_params.num_points = min(scaled_points, 50)  # Cap at reasonable maximum
 
-    # get the structural model latent space and resize it
-    resize_transform = transforms.Resize((new_problem_params.height, new_problem_params.width))
-
-    z_resized =  resize_transform(self.z.unsqueeze(0)).squeeze(0)
-
-    # Get the structural problem function
     self.update_problem_params(new_problem_params)
 
-    # Load the structural model
     self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    self.z =  torch.nn.Parameter(z_resized)
+    
+    # resize z
+    z_resized = tfi.resize(self.z, 
+      size=[int(self.shape[1] * self.resize_scale),
+            int(self.shape[2] * self.resize_scale)],
+      method="bilinear", antialias=True)
+
+    z_resized = tf.clip_by_value(z_resized, 0.0, 1.0)
+    z_resized = tf.expand_dims(z_resized[0], axis=0)  # ensure shape (1, H, W)
+    
+    self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
     self.resizes += 1
 
 class CNNModel(Model):
@@ -146,6 +170,7 @@ class CNNModel(Model):
       self,
       seed=0,
       args=None,
+      problem_params=None,
       latent_size=128,
       dense_channels=32,
       resizes=(1, 2, 2, 2, 1),
@@ -158,7 +183,7 @@ class CNNModel(Model):
       conv_initializer=tf.initializers.VarianceScaling,
       normalization=global_normalization,
   ):
-    super().__init__(seed, args)
+    super().__init__(problem_params=problem_params, seed=seed, args=args)
 
     if len(resizes) != len(conv_filters):
       raise ValueError('resizes and filters must be same size')
@@ -190,78 +215,6 @@ class CNNModel(Model):
     self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
     latent_initializer = tf.initializers.RandomNormal(stddev=latent_scale)
-    self.z = self.add_weight(
-        shape=inputs.shape, initializer=latent_initializer, name='z')
-
-  def call(self, inputs=None):
-    return self.core_model(self.z)
-
-class CNNModelDynamic(Model):
-
-  def __init__(
-      self,
-      seed=0,
-      problem_params=None,
-      base_shape=None,
-      max_resizes=4,
-      min_base_size=5,
-      conv_filter_template=(512, 256, 128, 64, 32, 16, 8, 1),
-      conv_filters=[],
-      dense_channels=None,
-      offset_scale=10,
-      kernel_size=(5, 5),
-      latent_scale=1.0,
-      dense_init_scale=1.0,
-      activation=tf.nn.tanh,
-      conv_initializer=tf.initializers.VarianceScaling,
-      normalization=global_normalization,
-      **kwargs
-  ):
-    super().__init__(problem_params=problem_params, seed=seed, **kwargs)
-
-    base_shape, resizes = pipeline_utils.compute_resizes(
-        target_h=self.args['nely'],
-        target_w=self.args['nelx'],
-        max_resizes=max_resizes,
-        min_base_size=min_base_size
-    )
-
-    conv_filters = conv_filter_template[-len(resizes):]
-    # dense_channels = max(conv_filter_template[min(len(resizes), len(conv_filter_template) - 1)] // 4, 1)
-    # dense_channels = conv_filters[0] // 2
-    dense_channels = 32
-
-    self.resizes = resizes # (1, 2, 2, 2, 1)
-    self.base_shape = base_shape
-    self.conv_filters = conv_filters
-    self.dense_channels = dense_channels
-
-    activation = layers.Activation(activation)
-
-    h, w = self.base_shape
-    latent_size = h * w * dense_channels
-
-    net = inputs = layers.Input((latent_size,), batch_size=1)
-    dense_initializer = tf.initializers.orthogonal(
-        dense_init_scale * np.sqrt(max(dense_channels / latent_size, 1)))
-    net = layers.Dense(latent_size, kernel_initializer=dense_initializer)(net)
-    net = layers.Reshape([h, w, dense_channels])(net)
-
-    for resize, filters in zip(resizes, conv_filters):
-      net = activation(net)
-      net = UpSampling2D(resize)(net)
-      net = normalization(net)
-      net = Conv2D(
-          filters, kernel_size, kernel_initializer=conv_initializer)(net)
-      if offset_scale != 0:
-        net = AddOffset(offset_scale)(net)
-
-    outputs = tf.squeeze(net, axis=[-1])
-
-    self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
-
-    latent_initializer = tf.initializers.RandomNormal(stddev=latent_scale)
-
     self.z = self.add_weight(
         shape=inputs.shape, initializer=latent_initializer, name='z')
 

@@ -27,35 +27,6 @@ from neural_structural_optimization import train
 from neural_structural_optimization import pipeline_utils
 from neural_structural_optimization.problems_utils import ProblemParams
 
-def train_all(problem, max_iterations, cnn_kwargs=None):
-    """Train all optimization methods on a given problem."""
-    print(f"Starting optimization for {problem.name} ({problem.width}x{problem.height})")
-    
-    args = topo_api.specified_task(problem)
-
-    if cnn_kwargs is None:
-        cnn_kwargs = {}
-
-    print("Running dynamic CNN Model with L-BFGS...")
-    model = models.CNNModelDynamic(args=args)
-    ds_cnn = train.train_lbfgs(model, max_iterations)
-
-    # resolutions = [
-    #     (20, 40),   # coarse
-    #     (40, 80),   # mid
-    #     (60, 120),  # fine
-    # ]
-
-    # ds_cnn = train.adaptive_train_lbfgs(
-    #     args,
-    #     resolutions=resolutions,
-    #     max_iter_per_stage=200,
-    # )
-
-    dims = pd.Index(['cnn-lbfgs'], name='model')
-    result = xarray.concat([ds_cnn], dim=dims)
-    return result
-
 def main():
     """Main function with error handling and progress reporting."""
     print("=" * 60)
@@ -65,36 +36,38 @@ def main():
     try:
         # Create problem
         max_iterations = 200
-        
-        print(f"Problem: {problem.name}")
-        print(f"Dimensions: {problem.width}x{problem.height}")
-        print(f"Max iterations: {max_iterations}")
 
         # Run all optimization methods
         print("\nStarting optimization...")
 
+        # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
-            width=20,
+            width=50,
             height=40,
-            density=0.4
+            density=0.4,
+            interval=5
         )
-        model = models.CNNModelDynamic(problem_params=params)
-        ds_history = train.train_lbfgs(model, max_iterations)
 
-        # resolutions = [
-        #     (10, 30),
-        #     (20, 60),
-        #     (40, 120),
-        #     (80, 240),
-        #     (160, 480),
-        #     (320, 960),
-        #     (400, 1200),
-        #     ]
-        # max_iter = [200, 100, 50, 30, 20, 10, 5]  # fewer iterations at each upsample stage
+        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs_simple(params)      
 
-        # ds_history = train.adaptive_train_lbfgs(problem, [(5,15),(20,60),(30,120)], max_iterations)
-        # ds_history = train.adaptive_train_lbfgs(problem, resolutions, max_iter)
+        print("Dynamic kwargs:")
+        for key, value in dynamic_kwargs.items():
+            print(f"  {key}: {value}")
+
+        print(f"Problem: {params.problem_name}")
+        print(f"Dimensions: {params.width}x{params.height}")
+        print(f"Max iterations: {max_iterations}")
+
+        # model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
+        # ds_history = train.train_adam_progressive(model, max_iterations)
+
+        model = models.PixelModel(problem_params=params)
+        ds_history = train.train_adam(model, max_iterations)
+
+        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
+        # ds_history = train.train_lbfgs(model, max_iterations)
+
         if not isinstance(ds_history, list):
             ds_history = [ds_history]
             
@@ -123,7 +96,7 @@ def main():
         fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
         if not isinstance(axes, list):
             axes = [axes]
-        fig.suptitle(f'Final Designs: {problem.name}', fontsize=16)
+        fig.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
 
         for i, (ax, ds) in enumerate(zip(axes, ds_history)):
             ds = ds.rename({'step': 'iteration'})
@@ -133,8 +106,8 @@ def main():
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'results_{problem.name}.png', dpi=150, bbox_inches='tight')
-        print(f"Final designs plot saved to 'results_{problem.name}.png'")
+        plt.savefig(f'results_{params.problem_name}.png', dpi=150, bbox_inches='tight')
+        print(f"Final designs plot saved to 'results_{params.problem_name}.png'")
         plt.show()
 
         print("\n" + "=" * 60)

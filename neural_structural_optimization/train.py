@@ -28,6 +28,40 @@ import tensorflow as tf
 import xarray
 from tqdm import tqdm
 
+# utilities
+
+def _set_variables(variables, x):
+  """Set TensorFlow variables from a flattened array.
+  
+  Args:
+    variables: List of TensorFlow variables
+    x: Flattened array of values to assign
+  """
+  # Use shape.as_list() for compatibility with modern TensorFlow
+  shapes = [list(v.shape) for v in variables]
+  values = tf.split(x, [np.prod(s) for s in shapes])
+  for var, value in zip(variables, values):
+    var.assign(tf.reshape(tf.cast(value, var.dtype), var.shape))
+
+def _get_variables(variables):
+  """Get flattened array from TensorFlow variables.
+  
+  Args:
+    variables: List of TensorFlow variables
+    
+  Returns:
+    Flattened numpy array of variable values
+  """
+  return np.concatenate([
+      v.numpy().ravel() if not isinstance(v, np.ndarray) else v.ravel()
+      for v in variables])
+
+def constrained_logits(init_model):
+  """Produce matching initial conditions with volume constraints applied."""
+  logits = init_model(None).numpy().astype(np.float64).squeeze(axis=0)
+  return topo_physics.physical_density(
+      logits, init_model.env.args, volume_contraint=True, cone_filter=False)
+
 
 def optimizer_result_dataset(losses, frames, save_intermediate_designs=False):
   """Create an xarray dataset from optimization results.
@@ -55,6 +89,7 @@ def optimizer_result_dataset(losses, frames, save_intermediate_designs=False):
     }, coords={'step': np.arange(len(losses))})
   return ds
 
+# training
 
 def train_tf_optimizer(
     model, max_iterations, optimizer, save_intermediate_designs=True,
@@ -96,38 +131,69 @@ def train_tf_optimizer(
   return optimizer_result_dataset(np.array(losses), np.array(designs),
                                   save_intermediate_designs)
 
+def train_adam(model, max_iterations, save_intermediate_designs=True):
+    """ replaces original in order to use tqdm:
+      train_adam = functools.partial(
+      train_tf_optimizer, optimizer=tf.keras.optimizers.legacy.Adam(1e-2)) """
 
-train_adam = functools.partial(
-    train_tf_optimizer, optimizer=tf.keras.optimizers.legacy.Adam(1e-2))
+    tvars = model.trainable_variables
+    losses = []
+    frames = []
 
+    for i in tqdm(range(max_iterations + 1), desc="Adam Optimizer"):
+        with tf.GradientTape() as t:
+            t.watch(tvars)
+            logits = model(None)
+            loss = model.loss(logits)
 
-def _set_variables(variables, x):
-  """Set TensorFlow variables from a flattened array.
-  
-  Args:
-    variables: List of TensorFlow variables
-    x: Flattened array of values to assign
-  """
-  # Use shape.as_list() for compatibility with modern TensorFlow
-  shapes = [list(v.shape) for v in variables]
-  values = tf.split(x, [np.prod(s) for s in shapes])
-  for var, value in zip(variables, values):
-    var.assign(tf.reshape(tf.cast(value, var.dtype), var.shape))
+        losses.append(loss.numpy().item())
+        frames.append(logits.numpy())
 
+        if i < max_iterations:
+            grads = t.gradient(loss, tvars)
+            optimizer = tf.keras.optimizers.legacy.Adam(1e-2)
+            optimizer.apply_gradients(zip(grads, tvars))
 
-def _get_variables(variables):
-  """Get flattened array from TensorFlow variables.
-  
-  Args:
-    variables: List of TensorFlow variables
-    
-  Returns:
-    Flattened numpy array of variable values
-  """
-  return np.concatenate([
-      v.numpy().ravel() if not isinstance(v, np.ndarray) else v.ravel()
-      for v in variables])
+    designs = [model.env.render(x, volume_contraint=True) for x in frames]
+    return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
+def train_adam_progressive(model, max_iterations, save_intermediate_designs=True):
+    """Adam training with tqdm and progressive upsampling."""
+
+    ds_history = []
+
+    for stage in range(model.resize_num + 1):
+        print(f"\nTraining at resolution: {model.shape[1]}x{model.shape[2]}")
+
+        losses = []
+        frames = []
+
+        tvars = model.trainable_variables
+        optimizer = tf.keras.optimizers.legacy.Adam(1e-2)
+
+        for i in tqdm(range(max_iterations + 1), desc=f"Stage {stage} - Adam Optimizer"):
+            with tf.GradientTape() as t:
+                t.watch(tvars)
+                logits = model(None)
+                loss = model.loss(logits)
+
+            losses.append(loss.numpy().item())
+            frames.append(logits.numpy())
+
+            if i < max_iterations:
+                grads = t.gradient(loss, tvars)
+                optimizer.apply_gradients(zip(grads, tvars))
+
+        designs = [model.env.render(x, volume_contraint=True) for x in frames]
+        ds = optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
+        ds_history.append(ds)
+
+        # Upsample after stage if allowed
+        if stage < model.resize_num:
+            model.upsample()
+
+    # Render all frames
+    return ds_history
 
 def train_lbfgs(
     model, max_iterations, save_intermediate_designs=True, init_model=None,
@@ -183,76 +249,6 @@ def train_lbfgs(
   designs = [model.env.render(x, volume_contraint=True) for x in frames]
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
-
-def adaptive_train_lbfgs(
-  problem,
-  resolutions,
-  max_iter_per_stage,
-  model_class=models.CNNModelDynamic,
-  **kwargs
-):
-  z_init = None # initial latent vector
-  old_shape = None
-  old_dense = None
-  ds_history = []
-  
-  for i, (nelx, nely) in enumerate(resolutions):
-    print(f"\n=== Stage {i+1}/{len(resolutions)}: {nely} x {nelx} ===")
-    # Create a fresh problem object for each stage instead of modifying the original
-    clean_problem = problem.copy(width=nelx, height=nely)
-    args = topo_api.specified_task(clean_problem)
-
-    model = model_class(args=args)
-
-    if z_init is not None: # project the existing latent vector
-      # old_x, old_y = resolutions[i-1]
-      old_x, old_y = old_shape
-      new_x, new_y = model.base_shape
-
-      print("z init shape", z_init.shape)
-
-      # old_c = z_init.shape[1] // (old_x * old_y)
-      # new_c = model.z.shape[1] // (new_x * new_y)
-
-      old_c = old_dense
-      new_c = model.dense_channels
-
-      print("old base shape: ", old_shape)
-      print("old dense channels: ", old_dense)
-      print("old x:", old_x, " old y:", old_y, " old:", old_c)
-      print("new x:", resolutions[i][0], " new y:", resolutions[i][1], " new_c:", new_c)
-      print("new base shape: ", model.base_shape)
-      print("new dense channels:", model.dense_channels)
-
-      z_spatial = tf.reshape(z_init, [1, old_y, old_x, old_c])
-      z_resized = tf.image.resize(z_spatial, size=(new_y, new_x), method='bilinear')
-
-      if old_c != new_c:
-        # Use a 1x1 conv to project channels if needed
-        conv_projection_layer = tf.keras.layers.Conv2D(new_c, kernel_size=1, use_bias=False)
-        conv_projection_layer.build(z_resized.shape)
-        W = tf.eye(new_c, num_columns=old_c)  # shape (new_c, old_c)
-        W = tf.reshape(W, [1, 1, old_c, new_c])  # for Conv2D
-        conv_projection_layer.set_weights([W.numpy()])
-        z_resized = conv_projection_layer(z_resized)
-      
-      z_final = tf.reshape(z_resized, [1, new_y * new_x * new_c])
-      model.z.assign(z_final)
-    
-    ds = train_lbfgs(model, max_iter_per_stage[i])
-    ds_history.append(ds)
-    
-    z_init = model.z.numpy()
-    old_shape = model.base_shape
-    old_dense = model.dense_channels
-  
-  return ds_history
-
-def constrained_logits(init_model):
-  """Produce matching initial conditions with volume constraints applied."""
-  logits = init_model(None).numpy().astype(np.float64).squeeze(axis=0)
-  return topo_physics.physical_density(
-      logits, init_model.env.args, volume_contraint=True, cone_filter=False)
 
 
 def method_of_moving_asymptotes(
@@ -435,3 +431,4 @@ def train_batch(model_list, flag_values, train_func=train_adam):
     result = train_func(model, flag_values.optimization_steps)
     results.append(result)
   return results
+

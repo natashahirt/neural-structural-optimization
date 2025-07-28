@@ -70,6 +70,26 @@ def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
       dense_channels=conv_filters[0] // 2,
   )
 
+def dynamic_depth_kwargs_simple(params, max_resizes=float('inf'), min_base_size=5):
+  base_h = params.width
+  base_w = params.height
+  resizes = []
+  while base_h > min_base_size and base_w > min_base_size and len(resizes) < max_resizes:
+    base_h //= 2
+    base_w //= 2
+    resizes.append(2)
+  sum_resizes = np.prod(resizes)
+  params.height = base_h * sum_resizes
+  params.width = base_w * sum_resizes
+  resizes = [1] + resizes + [1]
+  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(resizes):]
+  assert len(conv_filters) == len(resizes)
+  return params, dict(
+      resizes=resizes,
+      conv_filters=conv_filters,
+      dense_channels=conv_filters[0] // 2,
+  )
+
 def compute_resizes(
     target_h: int,
     target_w: int,

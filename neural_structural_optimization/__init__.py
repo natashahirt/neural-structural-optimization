@@ -17,6 +17,7 @@
 from . import models
 from . import models_utils
 from . import train
+from . import train_adaptive
 from . import problems
 from . import topo_physics
 from . import autograd_lib
