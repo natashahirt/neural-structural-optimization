@@ -68,7 +68,7 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.CNNModelAdaptive(problem_params=params, resize_num=3, **dynamic_kwargs)
+        model = models.CNNModelAdaptive(problem_params=params, resize_num=4, **dynamic_kwargs)
         ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):

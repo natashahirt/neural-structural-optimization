@@ -263,10 +263,16 @@ class CNNModelAdaptive(CNNModel):
     self.conv_filters = cnn_kwargs['conv_filters']
     self.dense_channels = cnn_kwargs['dense_channels']
 
+    # Get weights from current model before rebuilding
+    old_weights = self.z.numpy()
+
     # Build new model with greater upsamplings / larger dense layer
     self._rebuild_model()
 
   def _rebuild_model(self):
+    # get old weights
+    prev_weights = {layer.name: [w.numpy() for w in layer.weights] for layer in self.model.layers}
+
     activation = layers.Activation(tf.nn.tanh) 
     
     total_upsample = int(np.prod(self.upsample_factors))
@@ -275,20 +281,45 @@ class CNNModelAdaptive(CNNModel):
 
     net = inputs = layers.Input((self.latent_size,), batch_size=1)
     filters = h * w * self.dense_channels
+
     dense_initializer = tf.initializers.orthogonal(
         np.sqrt(max(filters / self.latent_size, 1)))
     net = layers.Dense(filters, kernel_initializer=dense_initializer)(net)
     net = layers.Reshape([h, w, self.dense_channels])(net)
     
     for i, (upsample_factor, filters) in enumerate(zip(self.upsample_factors, self.conv_filters)):
+        idx = len(self.upsample_factors) - i - 1
         net = activation(net)
-        net = layers.UpSampling2D(upsample_factor)(net)
+        net = layers.UpSampling2D(upsample_factor, name=f"upsampling_{idx}")(net)
         net = self.normalization(net)
+
         net = layers.Conv2D(filters, self.kernel_size,
                             kernel_initializer=self.conv_initializer, 
-                            padding="same")(net)
+                            padding="same",
+                            name=f"conv2d_{idx}")(net)
+
         if self.offset_scale != 0:
             net = AddOffset(self.offset_scale)(net)
 
     outputs = tf.squeeze(net, axis=[-1])
     self.model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+    transferred = 0
+    for layer in self.model.layers:
+      if layer.name in prev_weights and layer.weights:
+        try:
+          # Check if weight shapes are compatible
+          prev_weight_shapes = [w.shape for w in prev_weights[layer.name]]
+          new_weight_shapes = [w.shape for w in layer.weights]
+          
+          if prev_weight_shapes == new_weight_shapes:
+              layer.set_weights(prev_weights[layer.name])
+              transferred += 1
+              print(f"Transferred weights for layer: {layer.name}")
+          else:
+              print(f"Skipped {layer.name}: shape mismatch {prev_weight_shapes} vs {new_weight_shapes}")
+        except Exception as e:
+            print(f"Failed to transfer {layer.name}: {e}")
+            continue
+
+    print(f"Transferred weights for {transferred} layers")
