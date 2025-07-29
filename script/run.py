@@ -43,13 +43,13 @@ def main():
         # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
-            width=50,
-            height=40,
+            width=10, # 50
+            height=20, # 40
             density=0.3,
             num_stories=5
         )
 
-        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs_simple(params)      
+        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)      
 
         print("Dynamic kwargs:")
         for key, value in dynamic_kwargs.items():
@@ -68,7 +68,7 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.CNNModelAdaptive(problem_params=params, **dynamic_kwargs)
+        model = models.CNNModelAdaptive(problem_params=params, resize_num=3, **dynamic_kwargs)
         ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):

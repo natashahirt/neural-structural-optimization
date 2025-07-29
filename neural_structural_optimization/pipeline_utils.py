@@ -57,30 +57,36 @@ def image_from_design(
     imaged_designs.append(design.isel(x=slice(None, None, -1)))
   return image_from_array(xarray.concat(imaged_designs, dim='x').data)
 
+# LEGACY
+# def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
+#   max_resize = min(math.gcd(problem.width, problem.height),
+#                    round(math.sqrt(problem.width * problem.height) / 4))
+#   resizes = [1] + [2] * int(math.log2(max_resize)) + [1]
+#   conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(resizes):]
+#   assert len(conv_filters) == len(resizes)
+#   return dict(
+#       resizes=resizes,
+#       conv_filters=conv_filters,
+#       dense_channels=conv_filters[0] // 2,
+#   )
 
-def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
-  max_resize = min(math.gcd(problem.width, problem.height),
-                   round(math.sqrt(problem.width * problem.height) / 4))
-  resizes = [1] + [2] * int(math.log2(max_resize)) + [1]
-  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(resizes):]
-  assert len(conv_filters) == len(resizes)
-  return dict(
-      resizes=resizes,
-      conv_filters=conv_filters,
-      dense_channels=conv_filters[0] // 2,
-  )
-
-def dynamic_depth_kwargs_simple(params, max_upsamples=float('inf'), min_base_size=5):
-  base_h = params.width
-  base_w = params.height
+def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), padding=1):
+  base_h = params.height
+  base_w = params.width
+  kh, kw = kernel_size
   upsample_factors = []
-  while base_h > min_base_size and base_w > min_base_size and len(upsample_factors) < max_upsamples:
-    base_h //= 2
-    base_w //= 2
-    upsample_factors.append(2)
+  max_divisions = min(
+        int(np.log2(base_h // (kh + padding))),
+        int(np.log2(base_w // (kw + padding))),
+        max_upsamples
+    )
+  # Apply the divisions
+  for _ in range(max_divisions):
+      base_h //= 2
+      base_w //= 2
+      upsample_factors.append(2)
   sum_upsamples = np.prod(upsample_factors)
-  params.height = base_h * sum_upsamples
-  params.width = base_w * sum_upsamples
+  params = params.copy(width=int(base_w * sum_upsamples), height=int(base_h * sum_upsamples))
   upsample_factors = [1] + upsample_factors + [1]
   conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(upsample_factors):]
   assert len(conv_filters) == len(upsample_factors)
@@ -111,6 +117,6 @@ def compute_upsamples(
         resizes.append(2)
 
     # Add dummy no-op upsamples at beginning and end for symmetry
-    upsample_factors = [1] + upsample_factors + [1]
+    upsample_factors = [1] + upsamples + [1]
 
     return (base_h, base_w), upsample_factors

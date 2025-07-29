@@ -403,12 +403,12 @@ def train_batch(model_list, flag_values, train_func=train_adam):
 # train progressive
 
 def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
-    """Adam training with tqdm and progressive upsampling."""
+    """Training with tqdm and progressive upsampling. Works on all algs."""
 
     ds_history = []
 
-    for stage in range(model.resize_num + 1):
-        print(f"\nTraining at resolution: {model.shape[1]}x{model.shape[2]}")
+    for stage in range(model.resize_num):
+        print(f"\nTraining stage {stage + 1}/{model.resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
 
         ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)

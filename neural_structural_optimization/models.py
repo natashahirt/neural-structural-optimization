@@ -22,6 +22,7 @@ import autograd.numpy as np
 from neural_structural_optimization import topo_api, pipeline_utils
 from neural_structural_optimization.models_utils import *
 from neural_structural_optimization.problems_utils import ProblemParams
+from neural_structural_optimization.pipeline_utils import dynamic_depth_kwargs
 import tensorflow as tf
 import tensorflow.image as tfi  # for resizing
 import torchvision.transforms as transforms
@@ -160,9 +161,9 @@ class CNNModel(Model):
 
     activation = layers.Activation(activation)
 
-    total_resize = int(np.prod(upsample_factors))
-    h = self.env.args['nely'] // total_resize
-    w = self.env.args['nelx'] // total_resize
+    total_upsample = int(np.prod(upsample_factors))
+    h = self.env.args['nely'] // total_upsample
+    w = self.env.args['nelx'] // total_upsample
 
     net = inputs = layers.Input((latent_size,), batch_size=1)
     filters = h * w * dense_channels
@@ -182,7 +183,7 @@ class CNNModel(Model):
 
     outputs = tf.squeeze(net, axis=[-1])
 
-    self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    self.model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
     latent_initializer = tf.initializers.RandomNormal(stddev=1.0)
     self.z = self.add_weight(
@@ -193,13 +194,13 @@ class CNNModel(Model):
     return (1, self.env.args['nely'], self.env.args['nelx'])
 
   def call(self, inputs=None):
-    return self.core_model(self.z)
+    return self.model(self.z)
 
 class CNNModelAdaptive(CNNModel):
 
   def __init__(self,
                problem_params=None,
-               resize_num=0, 
+               resize_num=2, 
                resize_scale=2,
                latent_size=128,
                dense_channels=32,
@@ -253,25 +254,24 @@ class CNNModelAdaptive(CNNModel):
     new_width = int(self.problem_params.width * self.resize_scale)
     new_height = int(self.problem_params.height * self.resize_scale)
     new_problem_params = self.problem_params.copy(width=new_width, height=new_height)
-    self.problem_params = new_problem_params
 
-    # Build new core model with updated size
-    self._rebuild_core_model()
+    new_problem_params, cnn_kwargs = dynamic_depth_kwargs(new_problem_params)
 
-    # Resize latent vector z
-    z = tf.reshape(self.z, [1, self.latent_size])  # shape: (1, latent_size)
-    z = tf.expand_dims(tf.expand_dims(z, axis=1), axis=1)  # shape: (1, 1, 1, latent_size)
-    z_resized = tfi.resize(z, size=[1, 1], method="bilinear")  
-    z_resized = tf.reshape(z_resized, [1, self.latent_size])
-    z_resized = tf.clip_by_value(z_resized, -3.0, 3.0)
+    self.update_problem_params(new_problem_params)
 
-    self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
+    self.upsample_factors = cnn_kwargs['upsample_factors']
+    self.conv_filters = cnn_kwargs['conv_filters']
+    self.dense_channels = cnn_kwargs['dense_channels']
 
-  def _rebuild_core_model(self):
-    activation = layers.Activation(tf.nn.tanh)  # Fixed: use tf.nn.tanh
-    total_resize = int(np.prod(self.upsample_factors))
-    h = self.problem_params.height // total_resize
-    w = self.problem_params.width // total_resize
+    # Build new model with greater upsamplings / larger dense layer
+    self._rebuild_model()
+
+  def _rebuild_model(self):
+    activation = layers.Activation(tf.nn.tanh) 
+    
+    total_upsample = int(np.prod(self.upsample_factors))
+    h = int(self.problem_params.height // total_upsample)
+    w = int(self.problem_params.width // total_upsample)
 
     net = inputs = layers.Input((self.latent_size,), batch_size=1)
     filters = h * w * self.dense_channels
@@ -279,15 +279,16 @@ class CNNModelAdaptive(CNNModel):
         np.sqrt(max(filters / self.latent_size, 1)))
     net = layers.Dense(filters, kernel_initializer=dense_initializer)(net)
     net = layers.Reshape([h, w, self.dense_channels])(net)
-
-    for upsample_factor, filters in zip(self.upsample_factors, self.initial_conv_filters):
-      net = activation(net)
-      net = layers.UpSampling2D(upsample_factor)(net)
-      net = self.normalization(net)
-      net = layers.Conv2D(filters, self.kernel_size,
-                          kernel_initializer=self.conv_initializer)(net)
-      if self.offset_scale != 0:
-        net = AddOffset(self.offset_scale)(net)
+    
+    for i, (upsample_factor, filters) in enumerate(zip(self.upsample_factors, self.conv_filters)):
+        net = activation(net)
+        net = layers.UpSampling2D(upsample_factor)(net)
+        net = self.normalization(net)
+        net = layers.Conv2D(filters, self.kernel_size,
+                            kernel_initializer=self.conv_initializer, 
+                            padding="same")(net)
+        if self.offset_scale != 0:
+            net = AddOffset(self.offset_scale)(net)
 
     outputs = tf.squeeze(net, axis=[-1])
-    self.core_model = tf.keras.Model(inputs=inputs, outputs=outputs)
+    self.model = tf.keras.Model(inputs=inputs, outputs=outputs)
