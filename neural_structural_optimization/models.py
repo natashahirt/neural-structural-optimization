@@ -314,8 +314,9 @@ class CNNModelAdaptive(CNNModel):
           
           if prev_weight_shapes == new_weight_shapes:
               layer.set_weights(prev_weights[layer.name])
+              layer.trainable = False
               transferred += 1
-              print(f"Transferred weights for layer: {layer.name}")
+              print(f"Transferred and froze weights for layer: {layer.name}")
           else:
               print(f"Skipped {layer.name}: shape mismatch {prev_weight_shapes} vs {new_weight_shapes}")
         except Exception as e:
