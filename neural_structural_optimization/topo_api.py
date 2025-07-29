@@ -55,7 +55,6 @@ def specified_task(problem):
   }
   return params
 
-
 class Environment:
 
   def __init__(self, args):
@@ -66,15 +65,15 @@ class Environment:
   def reshape(self, params):
     return params.reshape(self.args['nely'], self.args['nelx'])
 
-  def render(self, params, volume_contraint=True):
+  def render(self, params, volume_constraint=True):
     return topo_physics.physical_density(
-        self.reshape(params), self.args, volume_contraint=volume_contraint,
+        self.reshape(params), self.args, volume_constraint=volume_constraint,
     )
 
-  def objective(self, params, volume_contraint=False):
+  def objective(self, params, volume_constraint=False):
     return topo_physics.objective(
         self.reshape(params), self.ke, self.args,
-        volume_contraint=volume_contraint,
+        volume_constraint=volume_constraint,
     )
 
   def constraint(self, params):

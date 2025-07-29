@@ -70,38 +70,38 @@ def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
       dense_channels=conv_filters[0] // 2,
   )
 
-def dynamic_depth_kwargs_simple(params, max_resizes=float('inf'), min_base_size=5):
+def dynamic_depth_kwargs_simple(params, max_upsamples=float('inf'), min_base_size=5):
   base_h = params.width
   base_w = params.height
-  resizes = []
-  while base_h > min_base_size and base_w > min_base_size and len(resizes) < max_resizes:
+  upsample_factors = []
+  while base_h > min_base_size and base_w > min_base_size and len(upsample_factors) < max_upsamples:
     base_h //= 2
     base_w //= 2
-    resizes.append(2)
-  sum_resizes = np.prod(resizes)
-  params.height = base_h * sum_resizes
-  params.width = base_w * sum_resizes
-  resizes = [1] + resizes + [1]
-  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(resizes):]
-  assert len(conv_filters) == len(resizes)
+    upsample_factors.append(2)
+  sum_upsamples = np.prod(upsample_factors)
+  params.height = base_h * sum_upsamples
+  params.width = base_w * sum_upsamples
+  upsample_factors = [1] + upsample_factors + [1]
+  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(upsample_factors):]
+  assert len(conv_filters) == len(upsample_factors)
   return params, dict(
-      resizes=resizes,
+      upsample_factors=upsample_factors,
       conv_filters=conv_filters,
       dense_channels=conv_filters[0] // 2,
   )
 
-def compute_resizes(
+def compute_upsamples(
     target_h: int,
     target_w: int,
-    max_resizes: int,
+    max_upsamples: int,
     min_base_size: int = 5
 ) -> Tuple[Tuple[int, int], List[int]]:
     
     base_h = target_h
     base_w = target_w
-    resizes = []
+    upsamples = []
 
-    for i in range(max_resizes):
+    for i in range(max_upsamples):
         if base_h <= min_base_size or base_w <= min_base_size:
             break
         if base_h % 2 != 0 or base_w % 2 != 0:
@@ -110,7 +110,7 @@ def compute_resizes(
         base_w //= 2
         resizes.append(2)
 
-    # Add dummy no-op resizes at beginning and end for symmetry
-    full_resizes = [1] + resizes + [1]
+    # Add dummy no-op upsamples at beginning and end for symmetry
+    upsample_factors = [1] + upsample_factors + [1]
 
-    return (base_h, base_w), full_resizes
+    return (base_h, base_w), upsample_factors

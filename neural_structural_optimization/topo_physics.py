@@ -77,11 +77,11 @@ def default_args():
           'name': 'truss'}
 
 
-def physical_density(x, args, volume_contraint=False, cone_filter=True):
+def physical_density(x, args, volume_constraint=False, cone_filter=True):
   shape = (args['nely'], args['nelx'])
   assert x.shape == shape or x.ndim == 1
   x = x.reshape(shape)
-  if volume_contraint:
+  if volume_constraint:
     mask = np.broadcast_to(args['mask'], x.shape) > 0
     x_designed = sigmoid_with_constrained_mean(x[mask], args['volfrac'])
     x_flat = autograd_lib.scatter1d(
@@ -94,8 +94,8 @@ def physical_density(x, args, volume_contraint=False, cone_filter=True):
   return x
 
 
-def mean_density(x, args, volume_contraint=False, cone_filter=True):
-  return (np.mean(physical_density(x, args, volume_contraint, cone_filter))
+def mean_density(x, args, volume_constraint=False, cone_filter=True):
+  return (np.mean(physical_density(x, args, volume_constraint, cone_filter))
           / np.mean(args['mask']))
 
 
@@ -267,10 +267,10 @@ def calculate_forces(x_phys, args):
   return applied_force + gravitional_force.ravel()
 
 
-def objective(x, ke, args, volume_contraint=False, cone_filter=True):
+def objective(x, ke, args, volume_constraint=False, cone_filter=True):
   """Objective function (compliance) for topology optimization."""
   kwargs = dict(penal=args['penal'], e_min=args['young_min'], e_0=args['young'])
-  x_phys = physical_density(x, args, volume_contraint=volume_contraint,
+  x_phys = physical_density(x, args, volume_constraint=volume_constraint,
                             cone_filter=cone_filter)
   forces = calculate_forces(x_phys, args)
   u = displace(

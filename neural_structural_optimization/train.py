@@ -60,7 +60,7 @@ def constrained_logits(init_model):
   """Produce matching initial conditions with volume constraints applied."""
   logits = init_model(None).numpy().astype(np.float64).squeeze(axis=0)
   return topo_physics.physical_density(
-      logits, init_model.env.args, volume_contraint=True, cone_filter=False)
+      logits, init_model.env.args, volume_constraint=True, cone_filter=False)
 
 
 def optimizer_result_dataset(losses, frames, save_intermediate_designs=False):
@@ -127,7 +127,7 @@ def train_tf_optimizer(
       grads = t.gradient(loss, tvars)
       optimizer.apply_gradients(zip(grads, tvars))
 
-  designs = [model.env.render(x, volume_contraint=True) for x in frames]
+  designs = [model.env.render(x, volume_constraint=True) for x in frames]
   return optimizer_result_dataset(np.array(losses), np.array(designs),
                                   save_intermediate_designs)
 
@@ -154,7 +154,7 @@ def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
             optimizer = tf.keras.optimizers.legacy.Adam(lr)
             optimizer.apply_gradients(zip(grads, tvars))
 
-    designs = [model.env.render(x, volume_contraint=True) for x in frames]
+    designs = [model.env.render(x, volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
 def train_lbfgs(
@@ -208,13 +208,12 @@ def train_lbfgs(
   )
   logging.info(info)
 
-  designs = [model.env.render(x, volume_contraint=True) for x in frames]
+  designs = [model.env.render(x, volume_constraint=True) for x in frames]
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
 def method_of_moving_asymptotes(
-    model, max_iterations, save_intermediate_designs=True, init_model=None, 
-    sigmoid_steepness=10, sigmoid_center=0.5
+    model, max_iterations, save_intermediate_designs=True, init_model=None
 ):
   """Train a model using Method of Moving Asymptotes (MMA) optimization.
   
@@ -241,7 +240,7 @@ def method_of_moving_asymptotes(
   pbar = tqdm(total=max_iterations, desc="MMA Optimization")
 
   def objective(x):
-    return env.objective(x, volume_contraint=False)
+    return env.objective(x, volume_constraint=False)
 
   def constraint(x):
     return env.constraint(x)
@@ -266,7 +265,7 @@ def method_of_moving_asymptotes(
   opt = nlopt.opt(nlopt.LD_MMA, x0.size)
   opt.set_min_objective(wrap_autograd_func(objective, losses, frames))
   opt.add_inequality_constraint(wrap_autograd_func(constraint))
-  opt.set_lower_bounds(1e-9)
+  opt.set_lower_bounds(1e-2)
   opt.set_upper_bounds(1.0)
   opt.set_maxeval(max_iterations)
 
@@ -278,11 +277,12 @@ def method_of_moving_asymptotes(
   finally:
     pbar.close()
 
-  designs = [env.render(x, volume_contraint=True) for x in frames]
+  designs = [env.render(x, volume_constraint=True) for x in frames]
     # Print min/max values across all designs
   designs_array = np.array(designs)
   print(f"Designs min value: {designs_array.min():.4f}")
   print(f"Designs max value: {designs_array.max():.4f}")
+  #designs = threshold_projection(np.array(designs))
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
@@ -350,7 +350,7 @@ def optimality_criteria(
             x = x_new
             
             # Calculate loss
-            loss = env.objective(x, volume_contraint=False)
+            loss = env.objective(x, volume_constraint=False)
             losses.append(loss)
             
             # Create frame
@@ -373,7 +373,7 @@ def optimality_criteria(
     designs = []
     for frame in frames:
         try:
-            design = env.render(frame, volume_contraint=True)
+            design = env.render(frame, volume_constraint=True)
         except:
             design = frame
         designs.append(design)

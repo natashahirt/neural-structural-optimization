@@ -11,7 +11,7 @@ layers = tf.keras.layers
 # =============================================================================
 
 def batched_topo_loss(params, envs):
-  losses = [env.objective(params[i], volume_contraint=True)
+  losses = [env.objective(params[i], volume_constraint=True)
             for i, env in enumerate(envs)]
   return np.stack(losses)
 
