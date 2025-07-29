@@ -157,24 +157,6 @@ def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
     designs = [model.env.render(x, volume_contraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
-def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
-    """Adam training with tqdm and progressive upsampling."""
-
-    ds_history = []
-
-    for stage in range(model.resize_num + 1):
-        print(f"\nTraining at resolution: {model.shape[1]}x{model.shape[2]}")
-
-        ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
-        ds_history.append(ds)
-
-        # Upsample after stage if allowed
-        if stage < model.resize_num:
-            model.upsample()
-
-    # Render all frames
-    return ds_history
-
 def train_lbfgs(
     model, max_iterations, save_intermediate_designs=True, init_model=None,
     **kwargs
@@ -298,7 +280,6 @@ def method_of_moving_asymptotes(
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
-
 def optimality_criteria(
     model, max_iterations, save_intermediate_designs=True, init_model=None,
 ):
@@ -394,6 +375,7 @@ def optimality_criteria(
     return optimizer_result_dataset(
         np.array(losses), np.array(designs), save_intermediate_designs)
 
+# training features
 
 def train_batch(model_list, flag_values, train_func=train_adam):
   """Train multiple models in batch.
@@ -412,3 +394,22 @@ def train_batch(model_list, flag_values, train_func=train_adam):
     results.append(result)
   return results
 
+# train progressive
+
+def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
+    """Adam training with tqdm and progressive upsampling."""
+
+    ds_history = []
+
+    for stage in range(model.resize_num + 1):
+        print(f"\nTraining at resolution: {model.shape[1]}x{model.shape[2]}")
+
+        ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
+        ds_history.append(ds)
+
+        # Upsample after stage if allowed
+        if stage < model.resize_num:
+            model.upsample()
+
+    # Render all frames
+    return ds_history

@@ -60,7 +60,7 @@ def main():
         print(f"Max iterations: {max_iterations}")
 
         model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
-        ds_history = train.train_progressive(model, max_iterations)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.optimality_criteria)
 
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_adam(model, max_iterations)
@@ -80,7 +80,7 @@ def main():
         for i, ds in enumerate(ds_history):
             ds = ds.rename({'step': 'iteration'})
             loss_df = ds.loss.to_pandas().T
-            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.dims['y']}x{ds.dims['x']}")
+            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.sizes['y']}x{ds.sizes['x']}")
         plt.ylabel("Loss")
         plt.xlabel("Optimization Step")
         plt.title("Loss Comparison Across Stages")
@@ -103,7 +103,7 @@ def main():
             ds = ds.rename({'step': 'iteration'})
             final_design = ds.design.isel(iteration=ds.loss.argmin())
             im = ax.imshow(final_design, cmap='gray', vmin=0, vmax=1)
-            ax.set_title(f'Stage {i+1}: {ds.dims["y"]}x{ds.dims["x"]}')
+            ax.set_title(f'Stage {i+1}: {ds.sizes["y"]}x{ds.sizes["x"]}')
             ax.axis('off')
 
         plt.tight_layout()

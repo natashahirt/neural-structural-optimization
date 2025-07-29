@@ -83,14 +83,14 @@ class PixelModel(Model):
 
   def __init__(self, problem_params=None, seed=None):
     super().__init__(problem_params=problem_params, seed=seed)
-    shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], shape)
-    self.z = tf.Variable(z_init, trainable=True)
+    self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
+    z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
+    self.z = tf.Variable(z_init, trainable=True, dtype=tf.float32)
 
   def call(self, inputs=None):
     return self.z
 
-class PixelModelAdaptive(Model):
+class PixelModelAdaptive(PixelModel):
 
   def __init__(self, 
                problem_params=None, 
@@ -99,21 +99,13 @@ class PixelModelAdaptive(Model):
                args=None, 
                seed=None
   ):
-    super().__init__(problem_params=problem_params, seed=seed, args=args)
+    super().__init__(problem_params=problem_params, seed=seed)
     
     self.resize_num = resize_num
     self.resize_scale = resize_scale
     self.resizes = 0
     self.problem_params = problem_params
-    
-    self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
-    z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
-    self.z = tf.Variable(z_init, trainable=True, dtype=tf.float32)
-
     self.prev_loss = tf.constant(1e5, dtype=tf.float32)
-
-  def call(self, inputs=None):
-    return self.z
 
   def threshold_crossed(self, loss, threshold=0.05):
     delta = tf.abs(self.prev_loss - loss)
