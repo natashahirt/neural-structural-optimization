@@ -212,9 +212,9 @@ def train_lbfgs(
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
-
 def method_of_moving_asymptotes(
-    model, max_iterations, save_intermediate_designs=True, init_model=None,
+    model, max_iterations, save_intermediate_designs=True, init_model=None, 
+    sigmoid_steepness=10, sigmoid_center=0.5
 ):
   """Train a model using Method of Moving Asymptotes (MMA) optimization.
   
@@ -238,6 +238,8 @@ def method_of_moving_asymptotes(
   else:
     x0 = constrained_logits(init_model).ravel()
 
+  pbar = tqdm(total=max_iterations, desc="MMA Optimization")
+
   def objective(x):
     return env.objective(x, volume_contraint=False)
 
@@ -254,6 +256,7 @@ def method_of_moving_asymptotes(
         losses.append(value)
       if frames is not None:
         frames.append(env.reshape(x).copy())
+        pbar.update(1)
       return value
     return wrapper
 
@@ -263,20 +266,23 @@ def method_of_moving_asymptotes(
   opt = nlopt.opt(nlopt.LD_MMA, x0.size)
   opt.set_min_objective(wrap_autograd_func(objective, losses, frames))
   opt.add_inequality_constraint(wrap_autograd_func(constraint))
-  opt.set_lower_bounds(0.001)
+  opt.set_lower_bounds(1e-9)
   opt.set_upper_bounds(1.0)
+  opt.set_maxeval(max_iterations)
 
   try:
     x = opt.optimize(x0)
     logging.info(f'MMA optimization completed successfully')
-  except nlopt.RoundoffLimited:
-    logging.info('MMA optimization stopped due to roundoff errors')
-  except nlopt.MaxEvalReached:
-    logging.info('MMA optimization stopped due to maximum evaluations')
-  except nlopt.MaxTimeReached:
-    logging.info('MMA optimization stopped due to time limit')
+  except Exception as e:
+    logging.info(f'MMA optimization stopped: {type(e).__name__}: {e}')
+  finally:
+    pbar.close()
 
   designs = [env.render(x, volume_contraint=True) for x in frames]
+    # Print min/max values across all designs
+  designs_array = np.array(designs)
+  print(f"Designs min value: {designs_array.min():.4f}")
+  print(f"Designs max value: {designs_array.max():.4f}")
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
@@ -313,14 +319,14 @@ def optimality_criteria(
     losses = []
     frames = []
 
-    for i in range(max_iterations):
+    for i in tqdm(range(max_iterations), desc="Optimality Criteria"):
         try:
             # Apply optimality criteria step
             step_result = topo_physics.optimality_criteria_step(x, env.ke, env.args)
             
             # Handle return value - ensure it's a 1D array
             if isinstance(step_result, tuple):
-                x_new = step_result[0]
+                x_new = step_result[1]
             else:
                 x_new = step_result
             

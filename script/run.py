@@ -60,7 +60,7 @@ def main():
         print(f"Max iterations: {max_iterations}")
 
         model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.optimality_criteria)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.method_of_moving_asymptotes)
 
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_adam(model, max_iterations)
