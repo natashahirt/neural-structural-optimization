@@ -131,24 +131,6 @@ class PixelModelAdaptive(PixelModel):
     
   # helper methods for upsampling
 
-  def upsample_z_scipy_zoom(self):
-    # chunked upsample
-
-    z = self.z
-
-    z_np = z.numpy()
-    z_expanded = np.expand_dims(z_np, axis=-1)
-    zoom_factors = (1, self.resize_scale, self.resize_scale, 1)
-    z_resized = zoom(z_expanded, zoom_factors, order=1)
-    z_resized = np.squeeze(z_resized, axis=-1)
-    z_resized = np.clip(z_resized, 0.0, 1.0)
-    if z_resized.shape != self.shape:
-      z_resized = np.expand_dims(z_resized[0], axis=0)
-    
-    tf.keras.backend.clear_session()
-    
-    self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
-
   def upsample_z_tf(self):
     # straight upsample
     z = self.z
@@ -166,7 +148,24 @@ class PixelModelAdaptive(PixelModel):
     tf.keras.backend.clear_session()
 
     self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
+  
+  def upsample_z_scipy_zoom(self):
+    # chunked upsample
 
+    z = self.z
+
+    z_np = z.numpy()
+    z_expanded = np.expand_dims(z_np, axis=-1)
+    zoom_factors = (1, self.resize_scale, self.resize_scale, 1)
+    z_resized = zoom(z_expanded, zoom_factors, order=1)
+    z_resized = np.squeeze(z_resized, axis=-1)
+    z_resized = np.clip(z_resized, 0.0, 1.0)
+    if z_resized.shape != self.shape:
+      z_resized = np.expand_dims(z_resized[0], axis=0)
+    
+    tf.keras.backend.clear_session()
+    
+    self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
 
 class CNNModel(Model):
 

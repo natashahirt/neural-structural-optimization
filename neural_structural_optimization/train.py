@@ -198,15 +198,25 @@ def train_lbfgs(
     grads = t.gradient(loss, tvars)
     frames.append(logits.numpy().copy())
     losses.append(loss.numpy().copy())
+
+    if len(losses) >= 2:
+        rel_improv = abs(losses[-1] - losses[-2]) / max(abs(losses[-1]), abs(losses[-2]), 1e-12)
+        if rel_improv < 1e-3:
+            raise StopIteration("Convergence criterion met.")
+
     return float(loss.numpy()), _get_variables(grads).astype(np.float64)
 
   x0 = _get_variables(tvars).astype(np.float64)
+  
   # rely upon the step limit instead of error tolerance for finishing.
-  # cancel that, we're using a moderate error tolerance
-  _, _, info = scipy.optimize.fmin_l_bfgs_b(
-      value_and_grad, x0, maxfun=max_iterations, factr=1e7, pgtol=1e-14, **kwargs
-  )
-  logging.info(info)
+  try:
+    _, _, info = scipy.optimize.fmin_l_bfgs_b(
+        value_and_grad, x0, maxfun=max_iterations, factr=1, pgtol=1e-14, **kwargs
+    )
+    logging.info(info)
+  except: 
+    logging.info("Terminated early due to custom convergence criterion.")
+    x_opt = losses[-1]
 
   designs = [model.env.render(x, volume_constraint=True) for x in frames]
   return optimizer_result_dataset(
