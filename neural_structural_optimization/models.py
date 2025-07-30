@@ -28,6 +28,7 @@ import tensorflow.image as tfi  # for resizing
 import torchvision.transforms as transforms
 import torch
 import torch.nn as nn
+from scipy.ndimage import zoom
 
 # requires tensorflow 2.0
 
@@ -124,8 +125,34 @@ class PixelModelAdaptive(PixelModel):
     self.update_problem_params(new_problem_params)
 
     self.shape = (1, new_problem_params.height, new_problem_params.width)
-  
+
+    # self.upsample_z_tf()
+    self.upsample_z_scipy_zoom()
+    
+  # helper methods for upsampling
+
+  def upsample_z_scipy_zoom(self):
+    # chunked upsample
+
     z = self.z
+
+    z_np = z.numpy()
+    z_expanded = np.expand_dims(z_np, axis=-1)
+    zoom_factors = (1, self.resize_scale, self.resize_scale, 1)
+    z_resized = zoom(z_expanded, zoom_factors, order=1)
+    z_resized = np.squeeze(z_resized, axis=-1)
+    z_resized = np.clip(z_resized, 0.0, 1.0)
+    if z_resized.shape != self.shape:
+      z_resized = np.expand_dims(z_resized[0], axis=0)
+    
+    tf.keras.backend.clear_session()
+    
+    self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
+
+  def upsample_z_tf(self):
+    # straight upsample
+    z = self.z
+
     z = tf.expand_dims(z, axis=-1) # add extra channel dimension for tfi
 
     # resize z
@@ -136,8 +163,10 @@ class PixelModelAdaptive(PixelModel):
     z_resized = tf.squeeze(z_resized, axis=-1) # get rid of extra channel dimension
     z_resized = tf.clip_by_value(z_resized, 0.0, 1.0)
     z_resized = tf.expand_dims(z_resized[0], axis=0)  # ensure shape (1, H, W)
-    
+    tf.keras.backend.clear_session()
+
     self.z = tf.Variable(z_resized, trainable=True, dtype=tf.float32)
+
 
 class CNNModel(Model):
 
@@ -290,11 +319,23 @@ class CNNModelAdaptive(CNNModel):
     for i, (upsample_factor, filters) in enumerate(zip(self.upsample_factors, self.conv_filters)):
         idx = len(self.upsample_factors) - i - 1
         net = activation(net)
+
         net = layers.UpSampling2D(upsample_factor, name=f"upsampling_{idx}")(net)
         net = self.normalization(net)
-
-        net = layers.Conv2D(filters, self.kernel_size,
-                            kernel_initializer=self.conv_initializer, 
+        # 1x1 bottleneck down
+        bottleneck_filters = max(filters//4, 1)  # Ensure at least 1 filter
+        net = layers.Conv2D(bottleneck_filters, 1,
+                            kernel_initializer=self.conv_initializer,
+                            padding="same",
+                            name=f"conv2d_{idx}_bottleneck1")(net)
+        # 3x3 conv
+        net = layers.Conv2D(bottleneck_filters, 3,
+                            kernel_initializer=self.conv_initializer,
+                            padding="same", 
+                            name=f"conv2d_{idx}_bottleneck2")(net)
+        # 1x1 bottleneck up
+        net = layers.Conv2D(filters, 1,
+                            kernel_initializer=self.conv_initializer,
                             padding="same",
                             name=f"conv2d_{idx}")(net)
 
@@ -314,7 +355,7 @@ class CNNModelAdaptive(CNNModel):
           
           if prev_weight_shapes == new_weight_shapes:
               layer.set_weights(prev_weights[layer.name])
-              layer.trainable = False
+              # layer.trainable = False
               transferred += 1
               print(f"Transferred and froze weights for layer: {layer.name}")
           else:

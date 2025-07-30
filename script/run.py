@@ -59,17 +59,17 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # model = models.PixelModelAdaptive(problem_params=params, resize_num=1)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.method_of_moving_asymptotes)
-
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_adam(model, max_iterations)
 
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.CNNModelAdaptive(problem_params=params, resize_num=4, **dynamic_kwargs)
+        model = models.PixelModelAdaptive(problem_params=params, resize_num=6)
         ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+
+        # model = models.CNNModelAdaptive(problem_params=params, resize_num=4, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
