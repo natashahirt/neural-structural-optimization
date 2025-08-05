@@ -16,27 +16,28 @@
 # pylint: disable=missing-docstring
 # pylint: disable=invalid-name
 
-import autograd
-import autograd.core
-import autograd.numpy as np
-from neural_structural_optimization import topo_api, pipeline_utils
-from neural_structural_optimization.models_utils import *
-from neural_structural_optimization.problems_utils import ProblemParams
-from neural_structural_optimization.pipeline_utils import dynamic_depth_kwargs
+import numpy as np
+
 import tensorflow as tf
-import tensorflow.image as tfi  # for resizing
-import torchvision.transforms as transforms
-import torch
-import torch.nn as nn
+import tensorflow.image as tfi
 from scipy.ndimage import zoom
 
-# requires tensorflow 2.0
+from neural_structural_optimization.models_utils import (
+    set_random_seed, batched_topo_loss, convert_autograd_to_tensorflow,
+    global_normalization, UpSampling2D, Conv2D, AddOffset
+)
+from neural_structural_optimization.clip_config import CLIPConfig
+from neural_structural_optimization.clip_loss import CLIPLoss
+from neural_structural_optimization.problems_utils import ProblemParams
+from neural_structural_optimization.pipeline_utils import dynamic_depth_kwargs
+from neural_structural_optimization import topo_api
 
+# requires tensorflow 2.0
 layers = tf.keras.layers
 
 class Model(tf.keras.Model):
 
-  def __init__(self, problem_params=None, seed=None, args=None):
+  def __init__(self, problem_params=None, clip_config=None, seed=None, args=None):
     super().__init__()
     
     if problem_params is not None:
@@ -58,14 +59,57 @@ class Model(tf.keras.Model):
     self.env = topo_api.Environment(args)
     self.args = args
 
+    #initialize losses
+    self.clip_loss = None
+    self.clip_weight = 0.0
+    if clip_config is not None and clip_config.weight > 0:
+      self.clip_loss = CLIPLoss(config=clip_config)
+      self.clip_weight = clip_config.weight
+
+    self.physics_loss_history = []
+    self.clip_loss_history = []
+
+  # def loss(self, logits):
+  #   # for our neural network, we use float32, but we use float64 for the physics
+  #   # to avoid any chance of overflow.
+  #   # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
+  #   logits = 0.0 + tf.cast(logits, tf.float64)
+  #   f = lambda x: batched_topo_loss(x, [self.env])
+  #   physics_loss = convert_autograd_to_tensorflow(f)(logits)
+  #   return tf.reduce_mean(physics_loss)
+
   def loss(self, logits):
-    # for our neural network, we use float32, but we use float64 for the physics
-    # to avoid any chance of overflow.
-    # add 0.0 to work-around bug in grad of tf.cast on NumPy arrays
     logits = 0.0 + tf.cast(logits, tf.float64)
     f = lambda x: batched_topo_loss(x, [self.env])
-    losses = convert_autograd_to_tensorflow(f)(logits)
-    return tf.reduce_mean(losses)
+    physics_loss = convert_autograd_to_tensorflow(f)(logits)
+    physics_loss = tf.reduce_mean(physics_loss)
+
+    self.physics_loss_history.append(float(physics_loss.numpy()))
+
+    clip_loss = tf.constant(0.0, dtype=tf.float64)
+    if self.clip_loss is not None:
+      try: 
+        if self.clip_loss.target_text_prompt is not None: 
+          clip_loss = self.clip_loss.get_text_loss(logits, self.clip_loss.target_text_prompt)
+        elif self.clip_loss.target_image_path is not None:
+          clip_loss = self.clip_loss.get_image_loss(logits, self.clip_loss.target_image_path)
+
+        self.clip_loss_history.append(float(clip_loss.numpy()))
+
+      except Exception as e:
+        print(f"CLIP loss computation failed: {e}")
+        clip_loss = tf.constant(0.0, dtype=tf.float64)
+
+    # adaptive weight scaling using avg physics loss
+    if len(self.physics_loss_history) > 0 and clip_loss > 0:
+        avg_physics_loss = np.mean(self.physics_loss_history[-10:])  # Last 10 iterations
+        adaptive_clip_weight = self.clip_weight * avg_physics_loss
+    else:
+        adaptive_clip_weight = self.clip_weight
+
+    total_loss = physics_loss + adaptive_clip_weight * clip_loss
+
+    return total_loss
 
   def update_problem_params(self, new_params):
     if isinstance(new_params, dict):
@@ -80,11 +124,11 @@ class Model(tf.keras.Model):
     self.args = new_args
 
     return new_args
-
+  
 class PixelModel(Model):
 
-  def __init__(self, problem_params=None, seed=None):
-    super().__init__(problem_params=problem_params, seed=seed)
+  def __init__(self, problem_params=None, clip_config=None, seed=None):
+    super().__init__(problem_params=problem_params, clip_config=clip_config, seed=seed)
     self.shape = (1, self.env.args['nely'], self.env.args['nelx'])
     z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
     self.z = tf.Variable(z_init, trainable=True, dtype=tf.float32)
@@ -96,12 +140,13 @@ class PixelModelAdaptive(PixelModel):
 
   def __init__(self, 
                problem_params=None, 
+               clip_config=None,
                resize_num=2, 
                resize_scale=2, 
                args=None, 
                seed=None
   ):
-    super().__init__(problem_params=problem_params, seed=seed)
+    super().__init__(problem_params=problem_params, clip_config=clip_config, seed=seed)
     
     self.resize_num = resize_num
     self.resize_scale = resize_scale
@@ -172,6 +217,7 @@ class CNNModel(Model):
   def __init__(
       self,
       problem_params=None,
+      clip_config=None,
       latent_size=128,
       dense_channels=32,
       upsample_factors=(1, 2, 2, 2, 1),
@@ -182,7 +228,7 @@ class CNNModel(Model):
       conv_initializer=tf.initializers.VarianceScaling,
       normalization=global_normalization,
   ):
-    super().__init__(problem_params=problem_params)
+    super().__init__(problem_params=problem_params, clip_config=clip_config)
 
     if len(upsample_factors) != len(conv_filters):
       raise ValueError('upsample_factors and filters must be same size')
@@ -228,6 +274,7 @@ class CNNModelAdaptive(CNNModel):
 
   def __init__(self,
                problem_params=None,
+               clip_config=None,
                resize_num=2, 
                resize_scale=2,
                latent_size=128,
@@ -236,6 +283,7 @@ class CNNModelAdaptive(CNNModel):
                conv_filters=(128, 64, 32, 16, 1),
                offset_scale=10,
                kernel_size=(5, 5),
+               activation=tf.nn.tanh,
                conv_initializer=tf.initializers.VarianceScaling,
                normalization=global_normalization,
   ):
@@ -246,17 +294,20 @@ class CNNModelAdaptive(CNNModel):
     self.conv_filters = conv_filters
     self.offset_scale = offset_scale
     self.kernel_size = kernel_size
+    self.activation = activation
     self.conv_initializer = conv_initializer
     self.normalization = normalization
     
     # Initialize parent with current parameters
     super().__init__(
         problem_params=problem_params,
+        clip_config=clip_config,
         latent_size=latent_size,
         dense_channels=dense_channels,
         upsample_factors=upsample_factors,
         conv_filters=conv_filters,
         offset_scale=offset_scale,
+        activation=activation,
         kernel_size=kernel_size,
         conv_initializer=conv_initializer,
         normalization=normalization
@@ -307,9 +358,11 @@ class CNNModelAdaptive(CNNModel):
     h = int(self.problem_params.height // total_upsample)
     w = int(self.problem_params.width // total_upsample)
 
+    # input layer
     net = inputs = layers.Input((self.latent_size,), batch_size=1)
     filters = h * w * self.dense_channels
 
+    # dense layer initialization
     dense_initializer = tf.initializers.orthogonal(
         np.sqrt(max(filters / self.latent_size, 1)))
     net = layers.Dense(filters, kernel_initializer=dense_initializer)(net)
@@ -317,26 +370,26 @@ class CNNModelAdaptive(CNNModel):
     
     for i, (upsample_factor, filters) in enumerate(zip(self.upsample_factors, self.conv_filters)):
         idx = len(self.upsample_factors) - i - 1
+        
+        # apply activation
         net = activation(net)
 
         net = layers.UpSampling2D(upsample_factor, name=f"upsampling_{idx}")(net)
         net = self.normalization(net)
-        # 1x1 bottleneck down
-        bottleneck_filters = max(filters//4, 1)  # Ensure at least 1 filter
-        net = layers.Conv2D(bottleneck_filters, 1,
-                            kernel_initializer=self.conv_initializer,
-                            padding="same",
-                            name=f"conv2d_{idx}_bottleneck1")(net)
-        # 3x3 conv
-        net = layers.Conv2D(bottleneck_filters, 3,
-                            kernel_initializer=self.conv_initializer,
-                            padding="same", 
-                            name=f"conv2d_{idx}_bottleneck2")(net)
-        # 1x1 bottleneck up
-        net = layers.Conv2D(filters, 1,
-                            kernel_initializer=self.conv_initializer,
-                            padding="same",
-                            name=f"conv2d_{idx}")(net)
+        net = layers.Conv2D(
+            filters, 
+            self.kernel_size, 
+            kernel_initializer=self.conv_initializer,
+            padding='same',
+            name=f"conv2d_{idx}"
+        )(net)
+
+        if i > 0 and filters == self.conv_filters[i-1]:
+            # Add residual connection if filter counts match
+            net = layers.Add(name=f"residual_{idx}")([net, residual_input])
+        
+        # Store for potential residual connection
+        residual_input = net
 
         if self.offset_scale != 0:
             net = AddOffset(self.offset_scale)(net)
@@ -354,7 +407,7 @@ class CNNModelAdaptive(CNNModel):
           
           if prev_weight_shapes == new_weight_shapes:
               layer.set_weights(prev_weights[layer.name])
-              # layer.trainable = False
+              layer.trainable = False
               transferred += 1
               print(f"Transferred and froze weights for layer: {layer.name}")
           else:

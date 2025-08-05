@@ -32,7 +32,6 @@ from PIL import Image
 import xarray
 from typing import Tuple, List
 
-
 def image_from_array(
     data: np.ndarray, cmap: str = 'Greys', vmin: float = 0, vmax: float = 1,
 ) -> Image.Image:

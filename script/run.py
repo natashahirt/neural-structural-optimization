@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import re
+import argparse
 from PIL import Image
 import seaborn
 import matplotlib.pyplot as plt
 import xarray
 import pandas as pd
 import numpy as np
+import tensorflow as tf
 
 from neural_structural_optimization import pipeline_utils
 from neural_structural_optimization import problems
@@ -26,12 +30,32 @@ from neural_structural_optimization import topo_api
 from neural_structural_optimization import train
 from neural_structural_optimization import pipeline_utils
 from neural_structural_optimization.problems_utils import ProblemParams
+from neural_structural_optimization.clip_config import CLIPConfig
+from neural_structural_optimization.clip_loss import CLIPLoss
+
+def create_filename_suffix(suffix_str):
+    if not suffix_str:
+        return ""
+
+    suffix = suffix_str.replace(' ', '_').replace('=', '_').replace(',', '_')
+    suffix = suffix.replace('"', '').replace("'", '')
+    suffix = suffix.replace('/', '_').replace('\\', '_')
+    suffix = suffix.replace(':', '_').replace(';', '_')
+
+    suffix = re.sub(r'[^a-zA-Z0-9_]', '', suffix)
+
+    print(f"Using filename suffix: {suffix}")
+    
+    return f"_{suffix}"
 
 def main():
     """Main function with error handling and progress reporting."""
     print("=" * 60)
     print("Neural Structural Optimization - Multi-Method Comparison")
     print("=" * 60)
+
+    suffix_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
+    filename_suffix = create_filename_suffix(suffix_str)        
     
     try:
         # Create problem
@@ -40,13 +64,28 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
+        clip_config = CLIPConfig(
+            target_text_prompt="human skeleton",
+            weight=10,
+            device = 'auto'
+        )
+
+        clip_loss = CLIPLoss(config=clip_config)
+        test_design = tf.random.uniform((1, 64, 64))
+        loss = clip_loss.get_text_loss(test_design, clip_loss.target_text_prompt)
+        weighted_loss = loss * clip_loss.weight
+
+        print(f"Raw CLIP loss: {loss.numpy()}")
+        print(f"Weighted loss: {weighted_loss.numpy()}")
+        print(f"CLIP weight: {clip_config.weight}")
+
         # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
             width=10, # 50
             height=20, # 40
             density=0.3,
-            num_stories=5
+            num_stories=8
         )
 
         params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)      
@@ -65,11 +104,11 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.PixelModelAdaptive(problem_params=params, resize_num=6)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
-
-        # model = models.CNNModelAdaptive(problem_params=params, resize_num=4, **dynamic_kwargs)
+        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4)
         # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+
+        model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
@@ -91,7 +130,7 @@ def main():
         plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
         seaborn.despine()
         plt.tight_layout()
-        plt.savefig('optimization_comparison_loss.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'optimization_comparison_loss{filename_suffix}.png', dpi=150, bbox_inches='tight')
         plt.show()
 
         # Create final designs comparison plot
@@ -103,16 +142,26 @@ def main():
         fig.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
 
         for i, (ax, ds) in enumerate(zip(axes, ds_history)):
-            ds = ds.rename({'step': 'iteration'})
-            final_design = ds.design.isel(iteration=ds.loss.argmin())
-            im = ax.imshow(final_design, cmap='gray', vmin=0, vmax=1)
+            final_design = ds.design.isel(step=ds.loss.argmin())
+            im = ax.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
             ax.set_title(f'Stage {i+1}: {ds.sizes["y"]}x{ds.sizes["x"]}')
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'results_{params.problem_name}.png', dpi=150, bbox_inches='tight')
-        print(f"Final designs plot saved to 'results_{params.problem_name}.png'")
+        plt.savefig(f'results_{params.problem_name}{filename_suffix}.png', dpi=150, bbox_inches='tight')
+        print(f"Final designs plot saved to 'results_{params.problem_name}{filename_suffix}.png'")
         plt.show()
+
+        # Save final high-resolution design separately
+        final_ds = ds_history[-1]
+        final_design = final_ds.design.isel(step=final_ds.loss.argmin())
+        plt.figure(figsize=(8, 8))
+        plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+        plt.axis('off')
+        plt.title(f'Final Design ({final_ds.sizes["y"]}x{final_ds.sizes["x"]})', pad=20)
+        plt.savefig(f'final_design_{params.problem_name}{filename_suffix}.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"High-resolution final design saved to 'final_design_{params.problem_name}{filename_suffix}.png'")
 
         print("\n" + "=" * 60)
         print("All operations completed successfully!")
