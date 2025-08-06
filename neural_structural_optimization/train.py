@@ -199,10 +199,10 @@ def train_lbfgs(
     frames.append(logits.numpy().copy())
     losses.append(loss.numpy().copy())
 
-    if len(losses) >= 2:
-        rel_improv = abs(losses[-1] - losses[-2]) / max(abs(losses[-1]), abs(losses[-2]), 1e-12)
-        if rel_improv < 1e-3:
-            raise StopIteration("Convergence criterion met.")
+    # if len(losses) >= 2:
+    #     rel_improv = abs(losses[-1] - losses[-2]) / max(abs(losses[-1]), abs(losses[-2]), 1e-12)
+    #     if rel_improv < 1e-3:
+    #         raise StopIteration("Convergence criterion met.")
 
     return float(loss.numpy()), _get_variables(grads).astype(np.float64)
 

@@ -4,14 +4,15 @@ Configuration utils for clip integration
 
 from dataclasses import dataclass
 from typing import Optional
-import torch
+import tensorflow as tf
+from transformers import TFCLIPModel, CLIPTokenizer
 
 @dataclass
 class CLIPConfig:
     """config for clip loss integration"""
 
     device: str = 'auto'
-    model_name: str = 'ViT-B/32'
+    model_name: str = 'openai/clip-vit-base-patch32'
 
     # loss weighting
     weight: float = 0.1
@@ -31,18 +32,25 @@ class CLIPConfig:
         self.device = self._resolve_device()
 
     def _resolve_device(self) -> str:
-        if self.device == 'auto' or self.device == 'cuda':
-            if torch.cuda.is_available():
-                print("CUDA available, using CUDA for CLIP")
-                return 'cuda'
+        if self.device == 'auto':
+            if tf.config.list_physical_devices('GPU'):
+                print("GPU available, using GPU for CLIP")
+                return 'gpu'
             else:
-                print("CUDA not available, using CPU for CLIP")
+                print("GPU not available, using CPU for CLIP")
+                return 'cpu'
+        elif self.device == 'gpu':
+            if tf.config.list_physical_devices('GPU'):
+                print("Using GPU for CLIP")
+                return 'gpu'
+            else:
+                print("GPU requested but not available, falling back to CPU")
                 return 'cpu'
         elif self.device == 'cpu':
             print("Using CPU for CLIP")
             return 'cpu'
         else:
-            print(f"Requested device '{self.device}' unknown. Falling back to CPU.")
+            print(f"Unknown device '{self.device}', falling back to CPU")
             return 'cpu'
 
     def check_clip_availability(self):
@@ -50,28 +58,28 @@ class CLIPConfig:
             import clip
             from PIL import Image
             # basic functionality
-            model, preprocess = clip.load(self.model_name, device=self.device)
+            model = TFCLIPModel.from_pretrained(self.model_name)
+            tokenizer = CLIPTokenizer.from_pretrained(self.model_name)
             # tokenization
-            text = clip.tokenize(["test"]).to(self.device)
+            _ = tokenizer(["test"], return_tensors="tf")
+            print("CLIP (TF) and tokenizer loaded successfully.")
+            return (True, f"CLIP (TF) available on '{self.device}'")
             # image preprocessing
             dummy_image = Image.new('RGB', (224,224), color='white')
             image_input = preprocess(dummy_image).unsqueeze(0).to(self.device)
-            # encoding
-            with torch.no_grad():
-                model.encode_text(text)
-                model.encode_image(image_input)
-            return (True, f"CLIP available on '{self.device}'")
+
+            return (True, f"CLIP (TF) available on '{self.device}'")
         except ImportError as e:
-            return (False, f"CLIP not installed: {e}")
+            return (False, f"HuggingFace Transformers not installed: {e}")
         except Exception as e:
-            return (False, f"CLIP error: {e}")
+            return (False, f"CLIP (TF) error: {e}")
 
 def create_clip_config(
     target_text_prompt=None,
     target_image_path=None,
     weight=0.1,
     device='cpu',
-    model_name='ViT-B/32'
+    model_name='openai/clip-vit-base-patch32'
 ):
     config = CLIPConfig(
         target_text_prompt=target_text_prompt,
@@ -84,7 +92,7 @@ def create_clip_config(
     clip_available, status_message = config.check_clip_availability()
     if not clip_available:
         print(status_message)
-        print("CLIP loss will be disabled.")
+        print("CLIP (TF) loss will be disabled.")
         config.weight = 0.0
     else:
         print(status_message)

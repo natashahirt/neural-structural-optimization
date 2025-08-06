@@ -66,18 +66,9 @@ def main():
 
         clip_config = CLIPConfig(
             target_text_prompt="human skeleton",
-            weight=10,
+            weight=1000,
             device = 'auto'
         )
-
-        clip_loss = CLIPLoss(config=clip_config)
-        test_design = tf.random.uniform((1, 64, 64))
-        loss = clip_loss.get_text_loss(test_design, clip_loss.target_text_prompt)
-        weighted_loss = loss * clip_loss.weight
-
-        print(f"Raw CLIP loss: {loss.numpy()}")
-        print(f"Weighted loss: {weighted_loss.numpy()}")
-        print(f"CLIP weight: {clip_config.weight}")
 
         # note that width and height are targets and not absolute
         params = ProblemParams(
@@ -104,11 +95,11 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.train_adam)
 
-        model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        # model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]

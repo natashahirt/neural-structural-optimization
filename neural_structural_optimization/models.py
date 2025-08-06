@@ -66,9 +66,6 @@ class Model(tf.keras.Model):
       self.clip_loss = CLIPLoss(config=clip_config)
       self.clip_weight = clip_config.weight
 
-    self.physics_loss_history = []
-    self.clip_loss_history = []
-
   # def loss(self, logits):
   #   # for our neural network, we use float32, but we use float64 for the physics
   #   # to avoid any chance of overflow.
@@ -79,37 +76,20 @@ class Model(tf.keras.Model):
   #   return tf.reduce_mean(physics_loss)
 
   def loss(self, logits):
-    logits = 0.0 + tf.cast(logits, tf.float64)
-    f = lambda x: batched_topo_loss(x, [self.env])
-    physics_loss = convert_autograd_to_tensorflow(f)(logits)
-    physics_loss = tf.reduce_mean(physics_loss)
-
-    self.physics_loss_history.append(float(physics_loss.numpy()))
+    # logits = 0.0 + tf.cast(logits, tf.float64)
+    # f = lambda x: batched_topo_loss(x, [self.env])
+    # physics_loss = convert_autograd_to_tensorflow(f)(logits)
+    # physics_loss = tf.reduce_mean(physics_loss)
 
     clip_loss = tf.constant(0.0, dtype=tf.float64)
     if self.clip_loss is not None:
-      try: 
         if self.clip_loss.target_text_prompt is not None: 
           clip_loss = self.clip_loss.get_text_loss(logits, self.clip_loss.target_text_prompt)
-        elif self.clip_loss.target_image_path is not None:
-          clip_loss = self.clip_loss.get_image_loss(logits, self.clip_loss.target_image_path)
+          clip_loss = tf.cast(clip_loss, tf.float64)
 
-        self.clip_loss_history.append(float(clip_loss.numpy()))
+    clip_loss = tf.reduce_mean(clip_loss)
 
-      except Exception as e:
-        print(f"CLIP loss computation failed: {e}")
-        clip_loss = tf.constant(0.0, dtype=tf.float64)
-
-    # adaptive weight scaling using avg physics loss
-    if len(self.physics_loss_history) > 0 and clip_loss > 0:
-        avg_physics_loss = np.mean(self.physics_loss_history[-10:])  # Last 10 iterations
-        adaptive_clip_weight = self.clip_weight * avg_physics_loss
-    else:
-        adaptive_clip_weight = self.clip_weight
-
-    total_loss = physics_loss + adaptive_clip_weight * clip_loss
-
-    return total_loss
+    return clip_loss
 
   def update_problem_params(self, new_params):
     if isinstance(new_params, dict):
