@@ -199,6 +199,9 @@ def train_lbfgs(
     frames.append(logits.numpy().copy())
     losses.append(loss.numpy().copy())
 
+    max_grad = max([tf.reduce_max(tf.abs(g)) for g in grads if g is not None])
+    print("Max grad:", max_grad.numpy(), " Loss:", loss)
+
     # if len(losses) >= 2:
     #     rel_improv = abs(losses[-1] - losses[-2]) / max(abs(losses[-1]), abs(losses[-2]), 1e-12)
     #     if rel_improv < 1e-3:
@@ -211,7 +214,7 @@ def train_lbfgs(
   # rely upon the step limit instead of error tolerance for finishing.
   try:
     _, _, info = scipy.optimize.fmin_l_bfgs_b(
-        value_and_grad, x0, maxfun=max_iterations, factr=1, pgtol=1e-14, **kwargs
+        value_and_grad, x0, maxfun=max_iterations, factr=1e8, **kwargs # pgtol=1e-14
     )
     logging.info(info)
   except: 

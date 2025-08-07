@@ -95,11 +95,11 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.train_adam)
+        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_adam)
 
-        # model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]

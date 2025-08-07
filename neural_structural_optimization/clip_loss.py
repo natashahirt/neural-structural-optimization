@@ -1,5 +1,6 @@
 import numpy as np
 import tensorflow as tf
+import tensorflow_addons as tfa
 from transformers import CLIPProcessor, TFCLIPModel
 from PIL import Image
 from typing import Optional, Union, List, Tuple
@@ -59,21 +60,34 @@ class CLIPLoss:
     def augment_design(self, design: tf.Tensor, num_crops=4, crop_size=224):
         """Simulate Kornia-style batch augmentation for CLIP"""        
         crops = []
-        for _ in range(num_crops):
-            aug = tf.image.random_flip_left_right(design)
-            aug = tf.image.random_brightness(aug, max_delta=0.1)
+        pad_size = crop_size + 20
 
-            # contrast
+        for _ in range(num_crops):
+            aug = design
+
+            # Manual horizontal flip using control flow
+            if tf.random.uniform([]) < 0.5:
+                aug = tf.reverse(aug, axis=[1])  # flip horizontally
+
+            # Brightness jitter (safe)
+            brightness_delta = tf.random.uniform([], -0.1, 0.1)
+            aug = tf.clip_by_value(aug + brightness_delta, 0.0, 1.0)
+
+            # Contrast jitter (manual version)
             factor = tf.random.uniform([], 0.9, 1.1)
             mean = tf.reduce_mean(aug, axis=[0, 1], keepdims=True)
-            augs = tf.clip_by_value((aug - mean) * factor + mean, 0.0, 1.0)
+            aug = tf.clip_by_value((aug - mean) * factor + mean, 0.0, 1.0)
 
-            # Optional: resize with padding before crop
-            pad_size = crop_size + 20
+            # Resize with padding (center pad, differentiable)
             aug = tf.image.resize_with_crop_or_pad(aug, pad_size, pad_size)
 
-            aug = tf.image.random_crop(aug, size=[crop_size, crop_size, 3])
-            crops.append(tf.expand_dims(aug, axis=0))  # [1, crop_size, crop_size, 3]
+            # Manual random crop (differentiable via slicing)
+            max_offset = pad_size - crop_size
+            offset_x = tf.random.uniform([], 0, max_offset + 1, dtype=tf.int32)
+            offset_y = tf.random.uniform([], 0, max_offset + 1, dtype=tf.int32)
+            aug = tf.slice(aug, [offset_y, offset_x, 0], [crop_size, crop_size, 3])
+
+            crops.append(tf.expand_dims(aug, axis=0))  # [1, crop, crop, 3]
 
         return tf.concat(crops, axis=0)  # [num_crops, crop_size, crop_size, 3]
 
@@ -98,13 +112,16 @@ class CLIPLoss:
 
         # Get text embedding
         inputs = self.processor(text=target_text_prompt, return_tensors="tf", padding=True)
-        text_features = self.model.get_text_features(**inputs)
-        text_features = tf.math.l2_normalize(text_features, axis=-1)
+        text_embed = self.model.get_text_features(**inputs)
+        text_embed = tf.math.l2_normalize(text_embed, axis=-1)
 
         # Cosine similarity loss
-        similarity = tf.reduce_sum(image_embed * text_features, axis=-1)
-        return 1.0 - similarity  # scalar loss
+        loss = -tf.keras.losses.cosine_similarity(image_embed, text_embed, axis=-1)
+        
+        return tf.reduce_mean(loss) * 1e3  # because cosine_similarity is negative
 
     def get_image_loss(self, design: tf.Tensor, target_image_path: str, temp: float = 1.0) -> tf.Tensor:
         
         raise NotImplementedError("Image-based CLIP loss not yet implemented")
+
+    
