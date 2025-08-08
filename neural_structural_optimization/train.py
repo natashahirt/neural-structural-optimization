@@ -28,6 +28,9 @@ import tensorflow as tf
 import xarray
 from tqdm import tqdm
 
+import torch
+import numpy as np
+
 # utilities
 
 def _set_variables(variables, x):
@@ -131,98 +134,47 @@ def train_tf_optimizer(
   return optimizer_result_dataset(np.array(losses), np.array(designs),
                                   save_intermediate_designs)
 
-def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
-    """ replaces original in order to use tqdm:
-      train_adam = functools.partial(
-      train_tf_optimizer, optimizer=tf.keras.optimizers.legacy.Adam(1e-2)) """
 
-    tvars = model.trainable_variables
+def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     losses = []
     frames = []
 
-    for i in tqdm(range(max_iterations + 1), desc="Adam Optimizer"):
-        with tf.GradientTape() as t:
-            t.watch(tvars)
-            logits = model(None)
-            loss = model.loss(logits)
+    for i in tqdm(range(max_iterations+1), desc="Adam Optimizer"):
+        optimizer.zero_grad()
+        logits = model()        
+        loss = model.loss()
+        loss.backward()
+        optimizer.step()
 
-        losses.append(loss.numpy().item())
-        frames.append(logits.numpy())
+        losses.append(loss.item())
+        frames.append(logits.detach().cpu().numpy())
 
-        if i < max_iterations:
-            grads = t.gradient(loss, tvars)
-            optimizer = tf.keras.optimizers.legacy.Adam(lr)
-            optimizer.apply_gradients(zip(grads, tvars))
-
-    designs = [model.env.render(x, volume_constraint=True) for x in frames]
+    designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
-def train_lbfgs(
-    model, max_iterations, save_intermediate_designs=True, init_model=None,
-    **kwargs
-):
-  """Train a model using L-BFGS optimization.
-  
-  Args:
-    model: The model to train
-    max_iterations: Maximum number of optimization iterations
-    save_intermediate_designs: Whether to save intermediate designs
-    init_model: Optional model to initialize from
-    **kwargs: Additional arguments for scipy.optimize.fmin_l_bfgs_b
-    
-  Returns:
-    xarray.Dataset containing optimization results
-  """
-  model(None)  # build model, if not built
+def train_lbfgs(model, max_iterations, save_intermediate_designs=True):
+    optimizer = torch.optim.LBFGS(model.parameters(), max_iter=max_iterations, line_search_fn='strong_wolfe')
+    losses = []
+    frames = []
 
-  losses = []
-  frames = []
+    pbar = tqdm(total=max_iterations, desc="L-BFGS Optimization")
 
-  if init_model is not None:
-    # if not isinstance(model, models.PixelModel):
-      # raise TypeError('can only use init_model for initializing a PixelModel')
-    if not hasattr(model, 'z'):
-      raise TypeError('init_model can only be used for models with latent variable `z`')
-    model.z.assign(tf.cast(init_model(None), model.z.dtype))
+    def closure():
+        optimizer.zero_grad()
+        logits = model()
+        loss = model.loss()
+        loss.backward()
+        losses.append(loss.item())
+        frames.append(logits.detach().cpu().numpy())
+        pbar.update(1)
+        return loss
 
-  tvars = model.trainable_variables
-  pbar = tqdm(total=max_iterations)
+    optimizer.step(closure)
+    pbar.close()
 
-  def value_and_grad(x):
-    pbar.update(1)
-    _set_variables(tvars, x)
-    with tf.GradientTape() as t:
-      t.watch(tvars)
-      logits = model(None)
-      loss = model.loss(logits)
-    grads = t.gradient(loss, tvars)
-    frames.append(logits.numpy().copy())
-    losses.append(loss.numpy().copy())
-
-    max_grad = max([tf.reduce_max(tf.abs(g)) for g in grads if g is not None])
-    print("Max grad:", max_grad.numpy(), " Loss:", loss)
-
-    # if len(losses) >= 2:
-    #     rel_improv = abs(losses[-1] - losses[-2]) / max(abs(losses[-1]), abs(losses[-2]), 1e-12)
-    #     if rel_improv < 1e-3:
-    #         raise StopIteration("Convergence criterion met.")
-
-    return float(loss.numpy()), _get_variables(grads).astype(np.float64)
-
-  x0 = _get_variables(tvars).astype(np.float64)
-
-  # rely upon the step limit instead of error tolerance for finishing.
-  try:
-    _, _, info = scipy.optimize.fmin_l_bfgs_b(
-        value_and_grad, x0, maxfun=max_iterations, factr=1e8, **kwargs # pgtol=1e-14
-    )
-    logging.info(info)
-  except: 
-    logging.info("Terminated early due to custom convergence criterion.")
-
-  designs = [model.env.render(x, volume_constraint=True) for x in frames]
-  return optimizer_result_dataset(
-      np.array(losses), np.array(designs), save_intermediate_designs)
+    designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
+    return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
 def method_of_moving_asymptotes(
     model, max_iterations, save_intermediate_designs=True, init_model=None
@@ -417,6 +369,7 @@ def train_batch(model_list, flag_values, train_func=train_adam):
 def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
     """Training with tqdm and progressive upsampling. Works on all algs."""
 
+    stages = getattr(model, "resize_num", 1)
     ds_history = []
 
     for stage in range(model.resize_num):
@@ -426,7 +379,7 @@ def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_d
         ds_history.append(ds)
 
         # Upsample after stage if allowed
-        if stage < model.resize_num:
+        if stage < stages - 1:
             model.upsample()
 
     # Render all frames

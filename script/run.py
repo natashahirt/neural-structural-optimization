@@ -73,8 +73,8 @@ def main():
         # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
-            width=10, # 50
-            height=20, # 40
+            width=40, # 50
+            height=100, # 40
             density=0.3,
             num_stories=8
         )
@@ -90,16 +90,16 @@ def main():
         print(f"Max iterations: {max_iterations}")
 
         # model = models.PixelModel(problem_params=params)
-        # ds_history = train.train_adam(model, max_iterations)
-
-        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_adam)
+        model = models.CNNModel(problem_params=params, **dynamic_kwargs)
+        ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+
+        # model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
