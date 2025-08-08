@@ -233,17 +233,21 @@ def optimality_criteria_combine(x, dc, dv, args, max_move=0.2, eta=0.5):
 
 
 def sigmoid(x):
-  return np.tanh(0.5*x)*.5 + 0.5
+  # Stable logistic sigmoid; differentiable under autograd
+  x = np.clip(x, -40.0, 40.0)
+  return 0.5*np.tanh(0.5*x) + 0.5
 
 
-def logit(p):
-  p = np.clip(p, 0, 1)
+def logit(p, eps=1e-12):
+  p = np.clip(p, eps, 1.0 - eps)
   return np.log(p) - np.log1p(-p)
 
 
 # an alternative to the optimality criteria
 def sigmoid_with_constrained_mean(x, average):
-  f = lambda x, y: sigmoid(x + y).mean() - average
+  def f(x_, y):
+    z = np.clip(x_ + y, -40.0, 40.0)  # keep inputs tame
+    return sigmoid(z).mean() - average
   lower_bound = logit(average) - np.max(x)
   upper_bound = logit(average) - np.min(x)
   b = autograd_lib.find_root(f, x, lower_bound, upper_bound)

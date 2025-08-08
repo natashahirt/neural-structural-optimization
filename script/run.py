@@ -92,13 +92,13 @@ def main():
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        ds_history = train.train_lbfgs(model, max_iterations)
+        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
+        # ds_history = train.train_lbfgs(model, max_iterations)
 
-        # model = models.PixelModelAdaptive(problem_params=params, resize_num=4, clip_config=clip_config)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        model = models.PixelModel(problem_params=params, resize_num=2, clip_config=clip_config)
+        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
-        # model = models.CNNModelAdaptive(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
+        # model = models.CNNModel(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
         # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
@@ -121,7 +121,7 @@ def main():
         plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
         seaborn.despine()
         plt.tight_layout()
-        plt.savefig(f'optimization_comparison_loss{filename_suffix}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'script/test_results_pytorch/optimization_comparison_loss{filename_suffix}.png', dpi=150, bbox_inches='tight')
         plt.show()
 
         # Create final designs comparison plot
@@ -139,7 +139,7 @@ def main():
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'results_{params.problem_name}{filename_suffix}.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'script/test_results_pytorch/results_{params.problem_name}{filename_suffix}.png', dpi=150, bbox_inches='tight')
         print(f"Final designs plot saved to 'results_{params.problem_name}{filename_suffix}.png'")
         plt.show()
 
@@ -150,7 +150,7 @@ def main():
         plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
         plt.axis('off')
         plt.title(f'Final Design ({final_ds.sizes["y"]}x{final_ds.sizes["x"]})', pad=20)
-        plt.savefig(f'final_design_{params.problem_name}{filename_suffix}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'script/test_results_pytorch/final_design_{params.problem_name}{filename_suffix}.png', dpi=300, bbox_inches='tight')
         plt.close()
         print(f"High-resolution final design saved to 'final_design_{params.problem_name}{filename_suffix}.png'")
 

@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from neural_structural_optimization.models_utils import (
-    set_random_seed, batched_topo_loss
+    set_random_seed, batched_topo_loss, to_nchw, normalize_mask
 )
 from neural_structural_optimization.problems_utils import ProblemParams
 from neural_structural_optimization import topo_api
@@ -17,6 +17,17 @@ except Exception:
 
 
 # ---------- NumPy/Autograd bridge for physics ----------
+
+def _gauss33(device, dtype):
+    k = torch.tensor([[1,2,1],
+                      [2,4,2],
+                      [1,2,1]], dtype=dtype, device=device)
+    k = (k / k.sum()).view(1,1,3,3)        # [C_out=1,C_in=1,H,W]
+    return k
+
+def _logit(p, eps=1e-6):
+    p = torch.clamp(p, eps, 1 - eps)
+    return torch.log(p) - torch.log1p(-p)
 
 class StructuralLoss(torch.autograd.Function):
     """
@@ -136,20 +147,61 @@ class Model(nn.Module):
 # ========================================
 
 class PixelModel(Model):
-    def __init__(self, problem_params=None, clip_config=None, seed=None):
+    def __init__(self, 
+        problem_params=None, 
+        clip_config=None, 
+        seed=None,
+        resize_num=1,
+    ):
         super().__init__(problem_params=problem_params, clip_config=clip_config, seed=seed)
-        # shape: (batch=1, H, W)
-        H, W = self.env.args['nely'], self.env.args['nelx']
-        self.shape = (1, H, W)
+        self.resize_num = resize_num
+        H, W = self.env.args['nely'], self.env.args['nelx'] # shape: (batch=1, H, W)
+        # init as densities
         z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
         self.z = nn.Parameter(torch.tensor(z_init, dtype=torch.float64), requires_grad=True)
+
+    @property
+    def shape(self):
+        return (1, self.env.args['nely'], self.env.args['nelx'])
 
     def forward(self):
         return self.z
 
     def loss(self):
         logits = self.forward()
-        return self.total_loss(logits)
+        return self.physics_loss(logits)
+
+    @torch.no_grad()
+    def upsample(self, scale=2, soften=True, preserve_mean=True):
+        # new problem size
+        new_w = int(self.problem_params.width * scale)
+        new_h = int(self.problem_params.height * scale)
+        new_params = self.problem_params.copy(width=new_w, height=new_h)
+        self.update_problem_params(new_params)  # rebuild env/args/ke
+
+        # resize parameter
+        z = self.z.detach()
+        z4 = to_nchw(self.z.detach())                  # [1,1,H,W]
+
+        if soften:
+          z4 = F.conv2d(z4, _gauss33(z4.device, z4.dtype), padding=1)
+
+        z_up = F.interpolate(z4, size=(new_h, new_w), mode="bicubic", align_corners=False, antialias=True)     # nearest preserves edges
+        z_up = z_up[:, 0, :, :]
+
+        if preserve_mean:
+          vf = float(self.env.args.get("volfrac", 0.5))
+          rho = torch.sigmoid(z_up)
+          b = _logit(torch.tensor(vf, device=z_up.device)) - _logit(rho.mean())
+          z_up = z_up + b
+
+        mask_raw = self.env.args.get("mask", None)
+        mask_up = normalize_mask(mask_raw, new_h, new_w, z_up.device, z_up.dtype)
+
+        z_up = z_up * mask_up + (-20.0) * (1 - mask_up)
+
+        # replace parameter
+        self.z = torch.nn.Parameter(z_up, requires_grad=True)
 
 
 # ========================================
@@ -196,7 +248,6 @@ class CNNModel(Model):
         act=nn.LeakyReLU,    # pass a class
         norm=None,           # e.g., nn.BatchNorm2d or lambda C: nn.GroupNorm(8, C)
         final_activation=None,
-        upsample_mode="nearest", 
     ):
         super().__init__(problem_params=problem_params, clip_config=clip_config)
 
@@ -216,7 +267,6 @@ class CNNModel(Model):
         self.w0 = W // total_up
         self.init_channels = int(dense_channels)
         self._target_hw = (H, W)
-        self.upsample_mode = upsample_mode
 
         # latent and dense
         self.latent = nn.Parameter(torch.randn(1, latent_size))
@@ -251,19 +301,20 @@ class CNNModel(Model):
 
     def forward(self):
         # latent -> dense -> [1, C, h0, w0] in fp32
-        x = self.dense(self.latent.float()).view(1, self.init_channels, self.h0, self.w0)
+        z = self.latent.float()
+        x = self.dense(z).view(1, self.init_channels, self.h0, self.w0)
 
-        # nearest-neighbor upsample → conv block
+        # Upsample to each stage size and apply the corresponding block
         for (Ht, Wt), block in zip(self.stage_sizes, self.blocks):
             if (x.shape[-2], x.shape[-1]) != (Ht, Wt):
-                x = F.interpolate(x, size=(Ht, Wt), mode=self.upsample_mode)  # << nearest
+                x = F.interpolate(x, size=(Ht, Wt), mode="bilinear", align_corners=False)
             x = block(x)
 
         x = self.final_1x1(x)
         if self.final_activation is not None:
             x = self.final_activation(x)
 
-        # (1,1,H,W) → (1,H,W) fp64 for physics
+        # (1,1,H,W) -> (1,H,W) as float64 for physics
         return x[:, 0, :, :].to(torch.float64)
 
     def loss(self):

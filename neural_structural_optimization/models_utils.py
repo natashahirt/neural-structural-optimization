@@ -3,6 +3,7 @@ import autograd.core
 import autograd.numpy as np
 from neural_structural_optimization import topo_api, pipeline_utils, models_utils, problems_utils
 import tensorflow as tf
+import torch
 
 layers = tf.keras.layers
 
@@ -42,6 +43,44 @@ def global_normalization(inputs, epsilon=1e-6):
   net *= tf.math.rsqrt(variance + epsilon)
   return net
 
+def to_nchw(z):
+    # expects (1,H,W) or (H,W)
+    if z.ndim == 2:         # (H,W)
+        z = z.unsqueeze(0)  # (1,H,W)
+    if z.ndim == 3:         # (1,H,W)
+        z = z.unsqueeze(1)  # (1,1,H,W)
+    assert z.ndim == 4, f"bad shape: {z.shape}"
+    return z
+
+def normalize_mask(m, H, W, device, dtype):
+    """Return a [H,W] mask tensor (float {0,1})."""
+    if m is None:
+        return torch.ones((H, W), device=device, dtype=dtype)
+
+    m = torch.as_tensor(m, device=device, dtype=dtype)
+
+    # Scalar -> broadcast
+    if m.numel() == 1:
+        val = float(m.item())
+        return torch.full((H, W), val, device=device, dtype=dtype)
+
+    # 1D flat -> reshape if size matches
+    if m.dim() == 1 and m.numel() == H * W:
+        return m.view(H, W)
+
+    # Already [H,W]
+    if m.dim() == 2 and m.shape == (H, W):
+        return m
+
+    # Anything else -> resize with NEAREST
+    if m.dim() == 2:  # different size
+        m4 = m.unsqueeze(0).unsqueeze(0)  # [1,1,h0,w0]
+        return F.interpolate(m4, size=(H, W), mode="nearest")[0, 0]
+
+    # Last resort (unexpected shape)
+    m4 = m.view(1, 1, *([1] * max(0, 2 - m.dim())))  # coerce to 4D-ish
+    return F.interpolate(m4, size=(H, W), mode="nearest")[0, 0]
+
 # =============================================================================
 # Layer factory functions
 # =============================================================================
@@ -68,3 +107,4 @@ class AddOffset(layers.Layer):
 
   def call(self, inputs):
     return inputs + self.scale * self.bias
+
