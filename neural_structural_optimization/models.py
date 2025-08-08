@@ -88,7 +88,7 @@ class StructuralLoss(torch.autograd.Function):
 # ========================================
 
 class Model(nn.Module):
-    def __init__(self, problem_params=None, clip_config=None, seed=None, args=None):
+    def __init__(self, problem_params=None, clip_loss=None, seed=None, args=None):
         super().__init__()
         if problem_params is not None:
             if isinstance(problem_params, dict):
@@ -105,31 +105,27 @@ class Model(nn.Module):
         self.seed = seed
         self.env = topo_api.Environment(args)
         self.args = args
-
-        self.clip_loss = None
-        self.clip_weight = 0.0
-        if clip_config is not None and getattr(clip_config, "weight", 0) > 0 and CLIPLoss is not None:
-            self.clip_loss = CLIPLoss(config=clip_config)
-            self.clip_weight = float(clip_config.weight)
+        
+        self.clip_loss = clip_loss
+        if clip_loss is not None and getattr(clip_loss, "weight", 0) > 0:
+            self.clip_weight = float(clip_loss.weight)
 
     def forward(self):
         # subclasses define self.z or a generator
         raise NotImplementedError
 
-    def physics_loss(self, logits: torch.Tensor) -> torch.Tensor:
+    def get_physics_loss(self, logits: torch.Tensor) -> torch.Tensor:
         # Returns mean over batch of structural losses
         per_example = StructuralLoss.apply(logits, self.env)  # (batch,)
         return per_example.mean()
-
-    def total_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        loss = self.physics_loss(logits)
-        if self.clip_loss is not None:
-            # NOTE: keep CLIP on float32 normally, then cast
-            if self.clip_loss.target_text_prompt is not None:
-                clip = self.clip_loss.get_text_loss(logits, self.clip_loss.target_text_prompt)
-                clip = clip.mean().to(loss.dtype)
-                loss = loss + self.clip_weight * clip
-        return loss
+        
+    def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        physics_loss = self.get_physics_loss(logits)
+        if self.clip_loss is not None and self.clip_loss.target_text_prompt is not None: 
+            clip = self.clip_loss.get_text_loss(logits, self.clip_loss.target_text_prompt)
+            clip = clip.mean().to(physics_loss.dtype)
+            return self.clip_weight * clip
+        return physics_loss
 
     def update_problem_params(self, new_params):
         if isinstance(new_params, dict):
@@ -149,11 +145,11 @@ class Model(nn.Module):
 class PixelModel(Model):
     def __init__(self, 
         problem_params=None, 
-        clip_config=None, 
+        clip_loss=None, 
         seed=None,
         resize_num=1,
     ):
-        super().__init__(problem_params=problem_params, clip_config=clip_config, seed=seed)
+        super().__init__(problem_params=problem_params, clip_loss=clip_loss, seed=seed)
         self.resize_num = resize_num
         H, W = self.env.args['nely'], self.env.args['nelx'] # shape: (batch=1, H, W)
         # init as densities
@@ -169,7 +165,7 @@ class PixelModel(Model):
 
     def loss(self):
         logits = self.forward()
-        return self.physics_loss(logits)
+        return self.get_total_loss(logits)
 
     @torch.no_grad()
     def upsample(self, scale=2, soften=True, preserve_mean=True):
@@ -318,4 +314,4 @@ class CNNModel(Model):
         return x[:, 0, :, :].to(torch.float64)
 
     def loss(self):
-        return self.total_loss(self.forward())
+        return self.get_total_loss(self.forward())

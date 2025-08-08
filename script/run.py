@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import xarray
 import pandas as pd
 import numpy as np
-import tensorflow as tf
+import torch
 
 from neural_structural_optimization import pipeline_utils
 from neural_structural_optimization import problems
@@ -30,7 +30,6 @@ from neural_structural_optimization import topo_api
 from neural_structural_optimization import train
 from neural_structural_optimization import pipeline_utils
 from neural_structural_optimization.problems_utils import ProblemParams
-from neural_structural_optimization.clip_config import CLIPConfig
 from neural_structural_optimization.clip_loss import CLIPLoss
 
 def create_filename_suffix(suffix_str):
@@ -64,16 +63,19 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
-        clip_config = CLIPConfig(
-            target_text_prompt="human skeleton",
-            weight=1000,
-            device = 'auto'
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        clip_loss = CLIPLoss(
+            device=device,
+            model_name="ViT-B/32",
+            target_text_prompt="skeleton",
+            weight=1.0,                     # start small; tune upward
         )
 
         # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
-            width=40, # 50
+            width=30, # 50
             height=100, # 40
             density=0.3,
             num_stories=8
@@ -89,14 +91,14 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # model = models.PixelModel(problem_params=params)
-        # ds_history = train.train_lbfgs(model, max_iterations)
+        model = models.PixelModel(problem_params=params, clip_loss=clip_loss)
+        ds_history = train.train_lbfgs(model, max_iterations)
 
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        model = models.PixelModel(problem_params=params, resize_num=2, clip_config=clip_config)
-        ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        # model = models.PixelModel(problem_params=params, resize_num=2, clip_config=clip_config)
+        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
 
         # model = models.CNNModel(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
         # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
