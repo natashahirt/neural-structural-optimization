@@ -1,3 +1,5 @@
+import copy
+
 import math
 import numpy as np
 import torch
@@ -7,6 +9,7 @@ from torch.nn import functional as F
 from neural_structural_optimization.models_utils import (
     set_random_seed, batched_topo_loss, to_nchw, normalize_mask, AddOffset
 )
+from neural_structural_optimization.topo_physics import logit
 from neural_structural_optimization.problems_utils import ProblemParams
 from neural_structural_optimization import topo_api
 
@@ -141,8 +144,6 @@ class Model(nn.Module):
         return self.get_physics_loss(logits)
 
     def update_problem_params(self, new_params):
-        if isinstance(new_params, dict):
-            new_params = ProblemParams(**new_params)
         self.problem_params = self.problem_params.copy(**new_params)
         problem = self.problem_params.get_problem()
         new_args = topo_api.specified_task(problem)
@@ -211,21 +212,28 @@ class PixelModel(Model):
 # CNN
 # ========================================
 
-def _init_kaiming(module):
-    if isinstance(module, (nn.Conv2d, nn.Linear)):
-        nn.init.kaiming_normal_(module.weight, nonlinearity="leaky_relu")
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
+def _init_dense_orthogonal(dense, latent_size, h_base, w_base, channels):
+    fan_out = h_base * w_base * channels
+    gain = math.sqrt(max(fan_out / latent_size, 1.0))
+    nn.init.orthogonal_(dense.weight, gain=gain)
+    if dense.bias is not None:
+        nn.init.zeros_(dense.bias)
+
+def _upsample_to(x, size, mode='bilinear'):
+    """Resize NCHW tensor x to (H,W)=size with TF/Keras-parity semantics."""
+    if x.shape[-2:] == size:
+        return x
+    if mode == 'nearest':
+        return F.interpolate(x, size=size, mode='nearest')
+    return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k=5, activation=nn.LeakyReLU):
         super().__init__()
-        pad = k // 2
-        layers_ = [nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=pad, bias=True)]
-        layers_.append(activation())
-        self.block = nn.Sequential(*layers_)
+        layers_ = [nn.Conv2d(in_ch, out_ch, kernel_size=k, padding="same", bias=True)]
+        self.conv_block = nn.Sequential(*layers_)
     
-    def forward(self, x): return self.block(x)
+    def forward(self, x): return self.conv_block(x)
 
 class CNNModel(Model):
     def __init__(
@@ -247,54 +255,116 @@ class CNNModel(Model):
         if len(conv_upsample) != len(conv_filters):
             raise ValueError("conv_upsample and conv_filters must have same length")
 
-        H, W = self.env.args['nely'], self.env.args['nelx']
+        self.problem_params = problem_params
+        self.latent_size = int(latent_size)
+        self.init_channels = int(init_channels)
+        self.conv_upsample = conv_upsample
+        self.conv_filters = conv_filters
+        self.kernel_size = kernel_size
+        self.offset_scale = float(offset_scale)
+        self.norm = norm
+        self.final_activation = final_activation
+        self.seed = seed
+
+        if isinstance(activation, type):
+            act_kwargs = {"negative_slope": 0.2}
+            self.activation = activation(**act_kwargs)  # instantiate
+        else:
+            self.activation = activation  # already a module/callable
+
+        self._compute_base_sizes()
+        self._build_modules()
+
+    def _compute_base_sizes(self):
         total_up = 1
-        for f in conv_upsample:
+        for f in self.conv_upsample:
             total_up *= int(f)
 
+        H, W = self.env.args['nely'], self.env.args['nelx']
+
         if H % total_up != 0 or W % total_up != 0:
-            raise ValueError(f"Grid {H}x{W} not divisible by Π(conv_upsample)={total_up}")
+            raise ValueError(f"Grid {H}x{W} too small,not divisible by Π(conv_upsample)={total_up}")
 
         self.h_base = H // total_up
         self.w_base = W // total_up
-        self.init_channels = int(init_channels)
         self._target_hw = (H, W)
 
-        # latent and dense layers
-        self.latent = nn.Parameter(torch.randn(1, latent_size))
-        self.dense = nn.Linear(latent_size, self.h_base * self.w_base * self.init_channels)
-        _init_kaiming(self.dense)
-
-        # stage-wise target sizes
         self.conv_stage_sizes = []
         cur_h, cur_w = self.h_base, self.w_base
-        for f in conv_upsample:
-            f = int(f)
-            cur_h *= f
-            cur_w *= f
+        for f in self.conv_upsample:
+            cur_h *= int(f); cur_w *= int(f)
             self.conv_stage_sizes.append((cur_h, cur_w))
 
-        # convolutions (do not create layers)
-        blocks = []
-        in_ch = self.init_channels
-        for out_ch in conv_filters:
-            blocks.append(ConvBlock(in_ch, int(out_ch), k=kernel_size, activation=activation))
-            in_ch = int(out_ch)
-        self.blocks = nn.ModuleList(blocks)
-        self.offsets = nn.ModuleList([AddOffset(scale=offset_scale) for _ in conv_filters])
+    def _build_modules(self):   # <- consistent name
+        # latent + dense
+        self.latent = nn.Parameter(torch.randn(1, self.latent_size))
+        self.dense  = nn.Linear(self.latent_size, self.h_base * self.w_base * self.init_channels)
+        _init_dense_orthogonal(self.dense, self.latent_size, self.h_base, self.w_base, self.init_channels)        
 
-        self.final_1x1 = nn.Conv2d(in_ch, 1, kernel_size=1)
-        _init_kaiming(self.final_1x1)
+        # convs + offsets
+        conv_blocks, offsets = [], []
+        in_ch = self.init_channels
+        for out_ch in self.conv_filters:
+            conv_blocks.append(ConvBlock(in_ch, int(out_ch), k=self.kernel_size))
+            offsets.append(AddOffset(channels=int(out_ch), scale=self.offset_scale))
+            in_ch = int(out_ch)
+        self.conv_blocks  = nn.ModuleList(conv_blocks)
+        self.offsets = nn.ModuleList(offsets)
+
+        self.final_1x1 = nn.Conv2d(in_ch, 1, kernel_size=1, bias=True)
+
+        # init: Kaiming for convs except final_1x1
+        neg = 0.2  # Leaky slope
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) and m is not self.final_1x1:
+                nn.init.kaiming_normal_(m.weight, a=neg, mode='fan_in', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
         with torch.no_grad():
-            self.final_1x1.weight.zero_()
-            self.final_1x1.bias.fill_(math.log(problem_params.density/(1-problem_params.density)))
-
-        self.final_activation = final_activation() if final_activation is not None else None
-
+            self.final_1x1.weight.zero_() 
+            self.final_1x1.bias.fill_(logit(self.problem_params.density))  # logit target density
+    
     @property
     def shape(self):
         return (1, self.env.args['nely'], self.env.args['nelx'])
+
+    @torch.no_grad()
+    def upsample(self, scale=2, dynamic_depth_fn=None, freeze_transferred=True):
+        old_state = copy.deepcopy(self.state_dict())
+
+        new_W = int(self.problem_params.width  * scale)
+        new_H = int(self.problem_params.height * scale)
+
+        self.update_problem_params({"width": new_W, "height": new_H})
+
+        if dynamic_depth_fn is not None:
+            # {'conv_upsample': tuple, 'conv_filters': tuple, 'init_channels': int}
+            depth = dynamic_depth_fn(self.problem_params)
+            if 'conv_upsample' in depth: self.conv_upsample = tuple(int(x) for x in depth['conv_upsample'])
+            if 'conv_filters'  in depth: self.conv_filters  = tuple(int(x) for x in depth['conv_filters'])
+            if 'init_channels' in depth: self.init_channels = int(depth['init_channels'])
+
+        self._compute_base_sizes()
+        self._build_modules()
+
+        # 5) transfer-by-shape
+        new_state = self.state_dict()
+        transferred = []
+        for k, v in new_state.items():
+            if k in old_state and old_state[k].shape == v.shape:
+                v.copy_(old_state[k])
+                transferred.append(k)
+        self.load_state_dict(new_state, strict=False)
+
+        if freeze_transferred:
+            frozen = set(transferred)
+            for name, p in self.named_parameters():
+                if name in frozen:
+                    p.requires_grad_(False)
+
+        # 7) return info (for logging)
+        return transferred
 
     def forward(self):
         # [1, C, h_base, w_base] in fp32
@@ -302,18 +372,21 @@ class CNNModel(Model):
         x = self.dense(z).view(1, self.init_channels, self.h_base, self.w_base)
 
         # upsample conv stages
-        for (h_target, w_target), block in zip(self.conv_stage_sizes, self.blocks):
-            if (x.shape[-2], x.shape[-1]) != (h_target, w_target):
-                x = F.interpolate(x, size=(h_target, w_target), mode="nearest")
-            x = block(x)
-        x = self.offsets[-1](x)  # use last offset layer
+        for (h_target, w_target), conv_block, offset in zip(self.conv_stage_sizes, self.conv_blocks, self.offsets):
+            x = self.activation(x)
+            x = _upsample_to(x, (h_target, w_target), mode="nearest")
+            x = conv_block(x)
+            x = offset(x)
 
         x = self.final_1x1(x)
+        
         if self.final_activation is not None:
             x = self.final_activation(x)
 
         # (1,1,H,W) -> (1,H,W) as float64 for physics
         return x[:, 0, :, :].to(torch.float64)
 
-    def loss(self):
-        return self.get_total_loss(self.forward())
+    def loss(self, logits=None):
+        if logits is None:
+            logits = self.forward()
+        return self.get_total_loss(logits.to(torch.float64))

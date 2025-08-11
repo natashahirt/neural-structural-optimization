@@ -110,18 +110,11 @@ def Conv2D(filters, kernel_size, **kwargs):
 #     return inputs + self.scale * self.bias
 
 class AddOffset(nn.Module):
-    def __init__(self, x=None, scale=1.0):
-        super().__init__()
-        if isinstance(scale, torch.Tensor):
-            scale = scale.item()
-        self.scale = float(scale)
-        if x is not None:
-            self.bias = nn.Parameter(torch.zeros(1, x.shape[1], 1, 1, device=x.device, dtype=x.dtype))
-        else:
-            self.bias = None
-
-    def forward(self, x):
-        if self.bias is None or self.bias.shape[1] != x.shape[1]:
-            # (1, C, 1, 1)
-            self.bias = nn.Parameter(torch.zeros(1, x.shape[1], 1, 1, device=x.device, dtype=x.dtype))
-        return x + self.scale * self.bias
+  def __init__(self, channels, scale=10.0):
+      super().__init__()
+      self.scale = float(scale)
+      # fixed shape: (1, C, 1, 1) — transfers across H×W changes
+      self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+      
+  def forward(self, x):
+      return x + self.scale * self.bias

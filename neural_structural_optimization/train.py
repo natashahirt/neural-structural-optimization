@@ -170,7 +170,7 @@ def train_adam(model,
         optimizer.param_groups[0]['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
         logits = model()
-        loss = model.loss(logits, clip_weight=clip_w, tv_weight=tv_w)
+        loss = model.get_total_loss(logits)
 
         loss.backward()
         if grad_clip is not None:
@@ -184,25 +184,36 @@ def train_adam(model,
         designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
-def train_lbfgs(model, max_iterations, save_intermediate_designs=True):
-    optimizer = torch.optim.LBFGS(model.parameters(), max_iter=max_iterations, line_search_fn='strong_wolfe')
-    losses = []
-    frames = []
+def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
+                lr=1.0, history_size=100, line_search='strong_wolfe'):
+    
+    opt = torch.optim.LBFGS(
+        model.parameters(),
+        lr=lr,
+        history_size=history_size,
+        max_iter=1,                 # <- exactly one internal iter per step
+        line_search_fn=line_search
+    )
 
-    pbar = tqdm(total=max_iterations, desc="L-BFGS Optimization")
+    losses, frames = [], []
+    pbar = tqdm(range(max_iterations), desc="L-BFGS")
 
-    def closure():
-        optimizer.zero_grad()
-        logits = model()
-        loss = model.loss()
-        loss.backward()
-        losses.append(loss.item())
-        frames.append(logits.detach().cpu().numpy())
-        pbar.update(1)
-        return loss
+    for _ in pbar:
+        def closure():
+            opt.zero_grad(set_to_none=True)
+            logits = model()        # forward
+            loss = model.loss()     # compute scalar loss
+            loss.backward()
+            return loss
 
-    optimizer.step(closure)
-    pbar.close()
+        loss = opt.step(closure)    # does at most 1 internal iter
+        losses.append(float(loss.detach()))
+
+        with torch.no_grad():
+            logits = model()
+            frames.append(logits.detach().cpu().numpy())
+
+        pbar.set_postfix(loss=f"{losses[-1]:.4g}")
 
     designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
@@ -375,25 +386,6 @@ def optimality_criteria(
 
     return optimizer_result_dataset(
         np.array(losses), np.array(designs), save_intermediate_designs)
-
-def clip_bootstrap(model, max_iterations, lr=1e-2, tv_w=5e-3, widen=2.0):
-    opt = torch.optim.Adam([model.z], lr=lr)
-    frames, losses = [], []
-    for t in tqdm(range(max_iterations), desc="CLIP Bootstrap"):
-        opt.zero_grad(set_to_none=True)
-        z = model()  # logits
-        # widen sigmoid keeps more pixels in linear region early
-        x01 = torch.sigmoid(z / widen)
-        Lc  = model.clip_loss(x01).mean().to(z.dtype)
-        # Ltv = tv_w * _tv_loss(x01).to(z.dtype) if tv_w > 0 else 0.0
-        L   = Lc # + Ltv
-        L.backward(); opt.step()
-
-        losses.append(float(Lc.detach()))
-        frames.append(torch.sigmoid(model.z.detach()).squeeze().cpu().numpy())
-
-    # return something consistent with your plotting
-    return optimizer_result_dataset(np.array(losses), np.array(frames), save_intermediate_designs=True)
 
 # training features
 
