@@ -134,23 +134,54 @@ def train_tf_optimizer(
   return optimizer_result_dataset(np.array(losses), np.array(designs),
                                   save_intermediate_designs)
 
+def _cosine_warmup(t, T, warmup=0.1, start=1.0, end=0.0):
+    """Cosine from `start`→`end` after a linear warmup portion."""
+    Tw = max(int(T * warmup), 1)
+    if t < Tw:
+        return start * (t + 1) / Tw
+    tt = (t - Tw) / max(T - Tw, 1)
+    return end + 0.5 * (start - end) * (1 + np.cos(np.pi * tt))
 
-def train_adam(model, max_iterations, save_intermediate_designs=True, lr=1e-2):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+def train_adam(model,
+    max_iterations,
+    lr_init=1e-2,
+    lr_final=3e-3,
+    clip_w_init=0.5,         # strong early CLIP to form silhouette
+    clip_w_final=0.08,       # decay to weaker guidance
+    tv_w_init=5e-3,          # denoise early
+    tv_w_final=5e-4,         # small but nonzero later
+    warmup_frac=0.1,
+    save_intermediate_designs=True,
+    save_every=25,
+    grad_clip=None,          # e.g., 1.0 to clip global norm
+    switch_to_vit_at=None,   # e.g., 1500 -> call model.clip_switch_to_vit()
+    clip_every=1,            # >1 to skip CLIP some steps (Adam only)
+    clip_ema=0.9             # EMA factor for skipped steps
+):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_init)
     losses = []
     frames = []
 
     for i in tqdm(range(max_iterations+1), desc="Adam Optimizer"):
-        optimizer.zero_grad()
-        logits = model()        
-        loss = model.loss()
+        lr      = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=lr_init,  end=lr_final)
+        clip_w  = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=clip_w_init, end=clip_w_final)
+        tv_w    = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=tv_w_init,   end=tv_w_final)
+
+        optimizer.param_groups[0]['lr'] = lr
+        optimizer.zero_grad(set_to_none=True)
+        logits = model()
+        loss = model.loss(logits, clip_weight=clip_w, tv_weight=tv_w)
+
         loss.backward()
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        losses.append(loss.item())
+        losses.append(float(loss.detach()))
         frames.append(logits.detach().cpu().numpy())
-
-    designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
+    
+    with torch.no_grad():
+        designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
 def train_lbfgs(model, max_iterations, save_intermediate_designs=True):
@@ -345,6 +376,25 @@ def optimality_criteria(
     return optimizer_result_dataset(
         np.array(losses), np.array(designs), save_intermediate_designs)
 
+def clip_bootstrap(model, max_iterations, lr=1e-2, tv_w=5e-3, widen=2.0):
+    opt = torch.optim.Adam([model.z], lr=lr)
+    frames, losses = [], []
+    for t in tqdm(range(max_iterations), desc="CLIP Bootstrap"):
+        opt.zero_grad(set_to_none=True)
+        z = model()  # logits
+        # widen sigmoid keeps more pixels in linear region early
+        x01 = torch.sigmoid(z / widen)
+        Lc  = model.clip_loss(x01).mean().to(z.dtype)
+        # Ltv = tv_w * _tv_loss(x01).to(z.dtype) if tv_w > 0 else 0.0
+        L   = Lc # + Ltv
+        L.backward(); opt.step()
+
+        losses.append(float(Lc.detach()))
+        frames.append(torch.sigmoid(model.z.detach()).squeeze().cpu().numpy())
+
+    # return something consistent with your plotting
+    return optimizer_result_dataset(np.array(losses), np.array(frames), save_intermediate_designs=True)
+
 # training features
 
 def train_batch(model_list, flag_values, train_func=train_adam):
@@ -366,21 +416,20 @@ def train_batch(model_list, flag_values, train_func=train_adam):
 
 # train progressive
 
-def train_progressive(model, max_iterations, alg=train_adam, save_intermediate_designs=True):
+def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_intermediate_designs=True):
     """Training with tqdm and progressive upsampling. Works on all algs."""
 
-    stages = getattr(model, "resize_num", 1)
     ds_history = []
 
-    for stage in range(model.resize_num):
-        print(f"\nTraining stage {stage + 1}/{model.resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
+    for stage in range(resize_num):
+        print(f"\nTraining stage {stage + 1}/{resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
 
         ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)
 
         # Upsample after stage if allowed
-        if stage < stages - 1:
-            model.upsample()
+        if stage < resize_num - 1:
+            model.upsample(scale=2)
 
     # Render all frames
     return ds_history

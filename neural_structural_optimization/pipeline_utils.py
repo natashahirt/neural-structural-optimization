@@ -73,7 +73,7 @@ def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), 
   base_h = params.height
   base_w = params.width
   kh, kw = kernel_size
-  upsample_factors = []
+  conv_upsample = []
   max_divisions = min(
         int(np.log2(base_h // (kh + padding))),
         int(np.log2(base_w // (kw + padding))),
@@ -83,39 +83,14 @@ def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), 
   for _ in range(max_divisions):
       base_h //= 2
       base_w //= 2
-      upsample_factors.append(2)
-  sum_upsamples = np.prod(upsample_factors)
+      conv_upsample.append(2)
+  sum_upsamples = np.prod(conv_upsample)
   params = params.copy(width=int(base_w * sum_upsamples), height=int(base_h * sum_upsamples))
-  upsample_factors = [1] + upsample_factors + [1]
-  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(upsample_factors):]
-  assert len(conv_filters) == len(upsample_factors)
+  conv_upsample = [1] + conv_upsample + [1]
+  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(conv_upsample):]
+  assert len(conv_filters) == len(conv_upsample)
   return params, dict(
-      upsample_factors=upsample_factors,
+      conv_upsample=conv_upsample,
       conv_filters=conv_filters,
-      dense_channels=conv_filters[0] // 2,
+      init_channels=conv_filters[0] // 2,
   )
-
-def compute_upsamples(
-    target_h: int,
-    target_w: int,
-    max_upsamples: int,
-    min_base_size: int = 5
-) -> Tuple[Tuple[int, int], List[int]]:
-    
-    base_h = target_h
-    base_w = target_w
-    upsamples = []
-
-    for i in range(max_upsamples):
-        if base_h <= min_base_size or base_w <= min_base_size:
-            break
-        if base_h % 2 != 0 or base_w % 2 != 0:
-            break
-        base_h //= 2
-        base_w //= 2
-        resizes.append(2)
-
-    # Add dummy no-op upsamples at beginning and end for symmetry
-    upsample_factors = [1] + upsamples + [1]
-
-    return (base_h, base_w), upsample_factors

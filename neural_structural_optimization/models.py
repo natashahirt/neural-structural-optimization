@@ -29,6 +29,12 @@ def _logit(p, eps=1e-6):
     p = torch.clamp(p, eps, 1 - eps)
     return torch.log(p) - torch.log1p(-p)
 
+def _tv_loss(x):
+    # x in [0,1], shape [B,1,H,W] or [B,3,H,W]
+    dx = x[..., :, 1:] - x[..., :, :-1]
+    dy = x[..., 1:, :] - x[..., :-1, :]
+    return (dx.abs().mean() + dy.abs().mean())
+
 class StructuralLoss(torch.autograd.Function):
     """
     A bridge that lets PyTorch models optimize against your NumPy/HIPS-autograd
@@ -38,6 +44,7 @@ class StructuralLoss(torch.autograd.Function):
     def forward(ctx, logits: torch.Tensor, env):
         if not isinstance(logits, torch.Tensor):
             raise TypeError("logits must be a torch.Tensor")
+
         # store shape and device/dtype to rebuild grads 
         ctx.input_shape = logits.shape
         ctx.device = logits.device
@@ -120,18 +127,23 @@ class Model(nn.Module):
         return per_example.mean()
         
     def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        physics_loss = self.get_physics_loss(logits)
-        if self.clip_loss is not None and self.clip_loss.target_text_prompt is not None: 
-            clip = self.clip_loss.get_text_loss(logits, self.clip_loss.target_text_prompt)
-            clip = clip.mean().to(physics_loss.dtype)
-            return self.clip_weight * clip
-        return physics_loss
+        """if clip_weight is None:
+            clip_weight = getattr(self.clip_loss, "weight", 0.0)
+        if tv_weight is None:
+            tv_weight = 1e-3
+        total_loss = physics_loss
+
+        if self.clip_loss is not None:
+            clip_loss = self.clip_loss.get_text_loss(logits).mean().to(physics_loss.dtype)
+            total_loss = clip_weight * clip_loss"""
+        
+        return self.get_physics_loss(logits)
 
     def update_problem_params(self, new_params):
         if isinstance(new_params, dict):
             new_params = ProblemParams(**new_params)
-        self.problem_params = new_params
-        problem = new_params.get_problem()
+        self.problem_params = self.problem_params.copy(**new_params)
+        problem = self.problem_params.get_problem()
         new_args = topo_api.specified_task(problem)
         self.env = topo_api.Environment(new_args)
         self.args = new_args
@@ -147,10 +159,8 @@ class PixelModel(Model):
         problem_params=None, 
         clip_loss=None, 
         seed=None,
-        resize_num=1,
     ):
         super().__init__(problem_params=problem_params, clip_loss=clip_loss, seed=seed)
-        self.resize_num = resize_num
         H, W = self.env.args['nely'], self.env.args['nelx'] # shape: (batch=1, H, W)
         # init as densities
         z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
@@ -163,46 +173,43 @@ class PixelModel(Model):
     def forward(self):
         return self.z
 
-    def loss(self):
+    def loss(self, logits=None, clip_weight=None, tv_weight=None):
         logits = self.forward()
-        return self.get_total_loss(logits)
+        return self.get_total_loss(logits, clip_weight, tv_weight)
 
-    @torch.no_grad()
     def upsample(self, scale=2, soften=True, preserve_mean=True):
-        # new problem size
-        new_w = int(self.problem_params.width * scale)
-        new_h = int(self.problem_params.height * scale)
-        new_params = self.problem_params.copy(width=new_w, height=new_h)
-        self.update_problem_params(new_params)  # rebuild env/args/ke
+        current_z = self.z.detach()
 
-        # resize parameter
-        z = self.z.detach()
-        z4 = to_nchw(self.z.detach())                  # [1,1,H,W]
+        # update problem
+        self.problem_params.width *= scale
+        self.problem_params.height *= scale
+        
+        problem = self.problem_params.get_problem()
+        new_args = topo_api.specified_task(problem)
+        self.env = topo_api.Environment(new_args)
+        self.args = new_args
+        
+        # update model
+        new_height = int(current_z.shape[-2] * scale)
+        new_width = int(current_z.shape[-1] * scale)
 
-        if soften:
-          z4 = F.conv2d(z4, _gauss33(z4.device, z4.dtype), padding=1)
+        resized_z = F.interpolate(
+            current_z.unsqueeze(0) if current_z.dim() == 3 else current_z,
+            size=(new_height, new_width),
+            mode='bilinear',
+            align_corners=False
+        )
 
-        z_up = F.interpolate(z4, size=(new_h, new_w), mode="bicubic", align_corners=False, antialias=True)     # nearest preserves edges
-        z_up = z_up[:, 0, :, :]
-
-        if preserve_mean:
-          vf = float(self.env.args.get("volfrac", 0.5))
-          rho = torch.sigmoid(z_up)
-          b = _logit(torch.tensor(vf, device=z_up.device)) - _logit(rho.mean())
-          z_up = z_up + b
-
-        mask_raw = self.env.args.get("mask", None)
-        mask_up = normalize_mask(mask_raw, new_h, new_w, z_up.device, z_up.dtype)
-
-        z_up = z_up * mask_up + (-20.0) * (1 - mask_up)
+        if current_z.dim() == 3:
+            resized_z = resized_z.squeeze(0)
 
         # replace parameter
-        self.z = torch.nn.Parameter(z_up, requires_grad=True)
-
+        self.z = torch.nn.Parameter(resized_z, requires_grad=True)
 
 # ========================================
 # CNN
 # ========================================
+
 
 def _init_kaiming(module):
     if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -211,12 +218,12 @@ def _init_kaiming(module):
             nn.init.zeros_(module.bias)
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=5, act=nn.LeakyReLU, add_offset_scale=0.0, norm=None):
+    def __init__(self, in_ch, out_ch, k=5, activation=nn.LeakyReLU, add_offset_scale=0.0, norm=None):
         super().__init__()
         pad = k // 2
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=pad)
         self.norm = norm(out_ch) if norm is not None else None
-        self.act = act()
+        self.activation = activation()
         self.offset = nn.Parameter(torch.zeros(1, out_ch, 1, 1)) if add_offset_scale != 0 else None
         self.scale = add_offset_scale
         self.apply(_init_kaiming)
@@ -225,7 +232,7 @@ class ConvBlock(nn.Module):
         x = self.conv(x)
         if self.norm is not None:
             x = self.norm(x)
-        x = self.act(x)
+        x = self.activation(x)
         if self.offset is not None:
             x = x + self.scale * self.offset
         return x
@@ -234,34 +241,33 @@ class CNNModel(Model):
     def __init__(
         self,
         problem_params=None,
-        clip_config=None,
         latent_size=128,
-        dense_channels=32,
-        upsample_factors=(1, 2, 2, 2, 1),
+        init_channels=32,
+        conv_upsample=(1, 2, 2, 2, 1),
         conv_filters=(128, 64, 32, 16, 1),
         offset_scale=10.0,
         kernel_size=5,
-        act=nn.LeakyReLU,    # pass a class
+        activation=nn.LeakyReLU,    # pass a class
         norm=None,           # e.g., nn.BatchNorm2d or lambda C: nn.GroupNorm(8, C)
         final_activation=None,
     ):
-        super().__init__(problem_params=problem_params, clip_config=clip_config)
+        super().__init__(problem_params=problem_params)
 
-        if len(upsample_factors) != len(conv_filters):
-            raise ValueError("upsample_factors and conv_filters must have same length")
+        if len(conv_upsample) != len(conv_filters):
+            raise ValueError("conv_upsample and conv_filters must have same length")
 
         H, W = self.env.args['nely'], self.env.args['nelx']
         total_up = 1
-        for f in upsample_factors:
+        for f in conv_upsample:
             total_up *= int(f)
 
         if H % total_up != 0 or W % total_up != 0:
-            raise ValueError(f"Grid {H}x{W} not divisible by Π(upsample_factors)={total_up}")
+            raise ValueError(f"Grid {H}x{W} not divisible by Π(conv_upsample)={total_up}")
 
         # Store coarse grid dims and channels for reshape
         self.h0 = H // total_up
         self.w0 = W // total_up
-        self.init_channels = int(dense_channels)
+        self.init_channels = int(init_channels)
         self._target_hw = (H, W)
 
         # latent and dense
@@ -272,7 +278,7 @@ class CNNModel(Model):
         # Precompute exact per-stage target sizes
         self.stage_sizes = []
         cur_h, cur_w = self.h0, self.w0
-        for f in upsample_factors:
+        for f in conv_upsample:
             f = int(f)
             cur_h *= f
             cur_w *= f
@@ -282,7 +288,7 @@ class CNNModel(Model):
         blocks = []
         in_ch = self.init_channels
         for out_ch in conv_filters:
-            blocks.append(ConvBlock(in_ch, int(out_ch), k=kernel_size, act=act, add_offset_scale=offset_scale, norm=norm))
+            blocks.append(ConvBlock(in_ch, int(out_ch), k=kernel_size, activation=activation, add_offset_scale=offset_scale, norm=norm))
             in_ch = int(out_ch)
         self.blocks = nn.ModuleList(blocks)
 

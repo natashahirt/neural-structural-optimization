@@ -178,6 +178,10 @@ def run_optimization(task):
   with tf.io.gfile.GFile(f'{base_path}.nc', 'wb') as f:
     f.write(history.to_netcdf(encoding={'design': _BINARY_IMAGE_ENCODING}))
 
+  # Ensure design has a step dimension before indexing
+  if 'step' not in history.design.dims:
+    history = history.expand_dims(step=[0])
+    
   best_design = history.design.isel(step=history.loss.argmin(), drop=True)
 
   # TODO(shoyer): save some GIFs!

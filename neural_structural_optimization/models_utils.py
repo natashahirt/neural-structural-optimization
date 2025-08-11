@@ -107,4 +107,3 @@ class AddOffset(layers.Layer):
 
   def call(self, inputs):
     return inputs + self.scale * self.bias
-

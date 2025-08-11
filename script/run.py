@@ -63,19 +63,23 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
         clip_loss = CLIPLoss(
-            device=device,
-            model_name="ViT-B/32",
-            target_text_prompt="skeleton",
+            model_name="RN50", #"RN50", # "ViT-B/32",
+            pretrained="openai",
+            target_text_prompt="x ray of human skeleton",
             weight=1.0,                     # start small; tune upward
         )
+
+        clip_loss.set_negatives([
+            "static noise texture",
+            "random speckle pattern",
+            "grainy background",
+        ])
 
         # note that width and height are targets and not absolute
         params = ProblemParams(
             problem_name = "multistory_building",
-            width=30, # 50
+            width=50, # 50
             height=100, # 40
             density=0.3,
             num_stories=8
@@ -91,20 +95,27 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        model = models.PixelModel(problem_params=params, clip_loss=clip_loss)
+        # model = models.PixelModel(problem_params=params, clip_loss=clip_loss)
+        # ds_history = train.clip_bootstrap(model, max_iterations)
+
+        model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         ds_history = train.train_lbfgs(model, max_iterations)
 
-        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        # ds_history = train.train_lbfgs(model, max_iterations)
+        # model = models.PixelModel(problem_params=params)
+        # ds_history = train.train_progressive(model, max_iterations, resize_num=2, alg=train.train_lbfgs)
 
-        # model = models.PixelModel(problem_params=params, resize_num=2, clip_config=clip_config)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
-
-        # model = models.CNNModel(problem_params=params, clip_config=clip_config, resize_num=3, activation=tf.nn.relu, **dynamic_kwargs)
-        # ds_history = train.train_progressive(model, max_iterations, alg=train.train_lbfgs)
+        # model = models.CNNModel(problem_params=params, activation=torch.nn.LeakyReLU, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, resize_num=2, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
+            
+        # Ensure each dataset has a step dimension for design
+        for i, ds in enumerate(ds_history):
+            if 'step' not in ds.design.dims:
+                # Add step dimension to design if it doesn't exist
+                ds = ds.expand_dims(step=[0])
+                ds_history[i] = ds
             
         print(f"\nOptimization completed!")
         print(f"Number of stages: {len(ds_history)}")
