@@ -4,6 +4,7 @@ import autograd.numpy as np
 from neural_structural_optimization import topo_api, pipeline_utils, models_utils, problems_utils
 import tensorflow as tf
 import torch
+import torch.nn as nn
 
 layers = tf.keras.layers
 
@@ -95,15 +96,32 @@ def Conv2D(filters, kernel_size, **kwargs):
 # Custom layers
 # =============================================================================
 
-class AddOffset(layers.Layer):
+# class AddOffset(layers.Layer):
 
-  def __init__(self, scale=1):
-    super().__init__()
-    self.scale = scale
+#   def __init__(self, scale=1):
+#     super().__init__()
+#     self.scale = scale
 
-  def build(self, input_shape):
-    self.bias = self.add_weight(
-        shape=input_shape, initializer='zeros', trainable=True, name='bias')
+#   def build(self, input_shape):
+#     self.bias = self.add_weight(
+#         shape=input_shape, initializer='zeros', trainable=True, name='bias')
 
-  def call(self, inputs):
-    return inputs + self.scale * self.bias
+#   def call(self, inputs):
+#     return inputs + self.scale * self.bias
+
+class AddOffset(nn.Module):
+    def __init__(self, x=None, scale=1.0):
+        super().__init__()
+        if isinstance(scale, torch.Tensor):
+            scale = scale.item()
+        self.scale = float(scale)
+        if x is not None:
+            self.bias = nn.Parameter(torch.zeros(1, x.shape[1], 1, 1, device=x.device, dtype=x.dtype))
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        if self.bias is None or self.bias.shape[1] != x.shape[1]:
+            # (1, C, 1, 1)
+            self.bias = nn.Parameter(torch.zeros(1, x.shape[1], 1, 1, device=x.device, dtype=x.dtype))
+        return x + self.scale * self.bias

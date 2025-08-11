@@ -427,6 +427,28 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
         ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)
 
+        # Plot current stage results
+        plt.figure(figsize=(8, 4))
+        
+        # Plot loss curve
+        plt.subplot(1, 2, 1)
+        loss_df = ds.loss.to_pandas()
+        plt.plot(loss_df, linewidth=2)
+        plt.title(f'Stage {stage + 1} Loss')
+        plt.xlabel('Iteration')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        
+        # Plot final design
+        plt.subplot(1, 2, 2)
+        final_design = ds.design.isel(step=ds.loss.argmin())
+        plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+        plt.title(f'Design ({model.shape[1]}x{model.shape[2]})')
+        plt.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+
         # Upsample after stage if allowed
         if stage < resize_num - 1:
             model.upsample(scale=2)

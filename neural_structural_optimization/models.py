@@ -1,10 +1,11 @@
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 from neural_structural_optimization.models_utils import (
-    set_random_seed, batched_topo_loss, to_nchw, normalize_mask
+    set_random_seed, batched_topo_loss, to_nchw, normalize_mask, AddOffset
 )
 from neural_structural_optimization.problems_utils import ProblemParams
 from neural_structural_optimization import topo_api
@@ -210,7 +211,6 @@ class PixelModel(Model):
 # CNN
 # ========================================
 
-
 def _init_kaiming(module):
     if isinstance(module, (nn.Conv2d, nn.Linear)):
         nn.init.kaiming_normal_(module.weight, nonlinearity="leaky_relu")
@@ -218,24 +218,14 @@ def _init_kaiming(module):
             nn.init.zeros_(module.bias)
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=5, activation=nn.LeakyReLU, add_offset_scale=0.0, norm=None):
+    def __init__(self, in_ch, out_ch, k=5, activation=nn.LeakyReLU):
         super().__init__()
         pad = k // 2
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=pad)
-        self.norm = norm(out_ch) if norm is not None else None
-        self.activation = activation()
-        self.offset = nn.Parameter(torch.zeros(1, out_ch, 1, 1)) if add_offset_scale != 0 else None
-        self.scale = add_offset_scale
-        self.apply(_init_kaiming)
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.norm is not None:
-            x = self.norm(x)
-        x = self.activation(x)
-        if self.offset is not None:
-            x = x + self.scale * self.offset
-        return x
+        layers_ = [nn.Conv2d(in_ch, out_ch, kernel_size=k, padding=pad, bias=True)]
+        layers_.append(activation())
+        self.block = nn.Sequential(*layers_)
+    
+    def forward(self, x): return self.block(x)
 
 class CNNModel(Model):
     def __init__(
@@ -245,13 +235,14 @@ class CNNModel(Model):
         init_channels=32,
         conv_upsample=(1, 2, 2, 2, 1),
         conv_filters=(128, 64, 32, 16, 1),
-        offset_scale=10.0,
         kernel_size=5,
-        activation=nn.LeakyReLU,    # pass a class
-        norm=None,           # e.g., nn.BatchNorm2d or lambda C: nn.GroupNorm(8, C)
+        offset_scale=10,
+        activation=nn.LeakyReLU,  
+        norm=None, # nn.BatchNorm2d or lambda C: nn.GroupNorm(8, C)
         final_activation=None,
+        seed=None,
     ):
-        super().__init__(problem_params=problem_params)
+        super().__init__(problem_params=problem_params, seed=seed)
 
         if len(conv_upsample) != len(conv_filters):
             raise ValueError("conv_upsample and conv_filters must have same length")
@@ -264,36 +255,40 @@ class CNNModel(Model):
         if H % total_up != 0 or W % total_up != 0:
             raise ValueError(f"Grid {H}x{W} not divisible by Π(conv_upsample)={total_up}")
 
-        # Store coarse grid dims and channels for reshape
-        self.h0 = H // total_up
-        self.w0 = W // total_up
+        self.h_base = H // total_up
+        self.w_base = W // total_up
         self.init_channels = int(init_channels)
         self._target_hw = (H, W)
 
-        # latent and dense
+        # latent and dense layers
         self.latent = nn.Parameter(torch.randn(1, latent_size))
-        self.dense = nn.Linear(latent_size, self.h0 * self.w0 * self.init_channels)
+        self.dense = nn.Linear(latent_size, self.h_base * self.w_base * self.init_channels)
         _init_kaiming(self.dense)
 
-        # Precompute exact per-stage target sizes
-        self.stage_sizes = []
-        cur_h, cur_w = self.h0, self.w0
+        # stage-wise target sizes
+        self.conv_stage_sizes = []
+        cur_h, cur_w = self.h_base, self.w_base
         for f in conv_upsample:
             f = int(f)
             cur_h *= f
             cur_w *= f
-            self.stage_sizes.append((cur_h, cur_w))
+            self.conv_stage_sizes.append((cur_h, cur_w))
 
-        # Conv tower (no layers created in forward)
+        # convolutions (do not create layers)
         blocks = []
         in_ch = self.init_channels
         for out_ch in conv_filters:
-            blocks.append(ConvBlock(in_ch, int(out_ch), k=kernel_size, activation=activation, add_offset_scale=offset_scale, norm=norm))
+            blocks.append(ConvBlock(in_ch, int(out_ch), k=kernel_size, activation=activation))
             in_ch = int(out_ch)
         self.blocks = nn.ModuleList(blocks)
+        self.offsets = nn.ModuleList([AddOffset(scale=offset_scale) for _ in conv_filters])
 
         self.final_1x1 = nn.Conv2d(in_ch, 1, kernel_size=1)
         _init_kaiming(self.final_1x1)
+
+        with torch.no_grad():
+            self.final_1x1.weight.zero_()
+            self.final_1x1.bias.fill_(math.log(problem_params.density/(1-problem_params.density)))
 
         self.final_activation = final_activation() if final_activation is not None else None
 
@@ -302,15 +297,16 @@ class CNNModel(Model):
         return (1, self.env.args['nely'], self.env.args['nelx'])
 
     def forward(self):
-        # latent -> dense -> [1, C, h0, w0] in fp32
+        # [1, C, h_base, w_base] in fp32
         z = self.latent.float()
-        x = self.dense(z).view(1, self.init_channels, self.h0, self.w0)
+        x = self.dense(z).view(1, self.init_channels, self.h_base, self.w_base)
 
-        # Upsample to each stage size and apply the corresponding block
-        for (Ht, Wt), block in zip(self.stage_sizes, self.blocks):
-            if (x.shape[-2], x.shape[-1]) != (Ht, Wt):
-                x = F.interpolate(x, size=(Ht, Wt), mode="bilinear", align_corners=False)
+        # upsample conv stages
+        for (h_target, w_target), block in zip(self.conv_stage_sizes, self.blocks):
+            if (x.shape[-2], x.shape[-1]) != (h_target, w_target):
+                x = F.interpolate(x, size=(h_target, w_target), mode="nearest")
             x = block(x)
+        x = self.offsets[-1](x)  # use last offset layer
 
         x = self.final_1x1(x)
         if self.final_activation is not None:
