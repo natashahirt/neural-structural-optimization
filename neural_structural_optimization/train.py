@@ -196,9 +196,16 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
     )
 
     losses, frames = [], []
-    pbar = tqdm(range(max_iterations), desc="L-BFGS")
 
-    for _ in pbar:
+    pbar = tqdm(range(max_iterations), desc="L-BFGS")
+    prev_loss = None
+
+    for step in pbar:
+        
+        # Adjust warmstart strength at milestones
+        if step > 40:
+            model._set_warmstart_strength(0.1 if step == 40 else 0.0)
+        
         def closure():
             opt.zero_grad(set_to_none=True)
             logits = model()        # forward
@@ -207,13 +214,23 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
             return loss
 
         loss = opt.step(closure)    # does at most 1 internal iter
-        losses.append(float(loss.detach()))
+        curr = float(loss.detach())
+        losses.append(curr)
 
         with torch.no_grad():
             logits = model()
             frames.append(logits.detach().cpu().numpy())
 
-        pbar.set_postfix(loss=f"{losses[-1]:.4g}")
+        if step > 40 and prev_loss is not None:
+            rel = abs(prev_loss - curr) / max(1.0, abs(prev_loss))
+            pbar.set_postfix(loss=f"{curr:.4g}", rel=f"{rel:.2e}")
+            if rel < 1e-6:
+                pbar.write(f"Early stop: relative change {rel:.2e} < 1e-3")
+                break
+        else:
+            pbar.set_postfix(loss=f"{curr:.4g}")
+
+        prev_loss = curr
 
     designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
@@ -444,6 +461,7 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
         # Upsample after stage if allowed
         if stage < resize_num - 1:
             model.upsample(scale=2)
+            model._set_warmstart_strength(0.25)
 
     # Render all frames
     return ds_history

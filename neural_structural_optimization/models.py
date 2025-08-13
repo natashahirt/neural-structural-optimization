@@ -242,7 +242,7 @@ class CNNModel(Model):
         latent_size=128,
         init_channels=32,
         conv_upsample=(1, 2, 2, 2, 1),
-        conv_filters=(128, 64, 32, 16, 1),
+        conv_filters=(128, 64, 32, 16),
         kernel_size=5,
         offset_scale=10,
         activation=nn.LeakyReLU,  
@@ -274,6 +274,10 @@ class CNNModel(Model):
 
         self._compute_base_sizes()
         self._build_modules()
+
+    @property
+    def shape(self):
+        return (1, int(self.env.args['nely']), int(self.env.args['nelx']))
 
     def _compute_base_sizes(self):
         total_up = 1
@@ -324,47 +328,57 @@ class CNNModel(Model):
         with torch.no_grad():
             self.final_1x1.weight.zero_() 
             self.final_1x1.bias.fill_(logit(self.problem_params.density))  # logit target density
-    
-    @property
-    def shape(self):
-        return (1, self.env.args['nely'], self.env.args['nelx'])
+
+    def _downsample_for_distill(self, logits: torch.Tensor) -> torch.Tensor:
+        # logits_f32: (1,H,W) or (H,W)
+        if logits.ndim == 2:
+            logits = logits.unsqueeze(0)  # (1,H,W)
+        x = logits.unsqueeze(0)               # (1,1,H,W)
+        s = int(getattr(self, "_distill_scale", 1))
+        if s > 1:
+            x = torch.nn.functional.avg_pool2d(x, kernel_size=s, stride=s)
+        return x[0,0]
+
+    def _set_warmstart_strength(self, tau: float):
+        self._warm_tau = float(min(1.0, max(0.0, tau)))
 
     @torch.no_grad()
-    def upsample(self, scale=2, dynamic_depth_fn=None, freeze_transferred=True):
-        old_state = copy.deepcopy(self.state_dict())
+    def upsample(self, scale=2, distill_weight=0.1,freeze_transferred=True):
 
-        new_W = int(self.problem_params.width  * scale)
-        new_H = int(self.problem_params.height * scale)
+        if not isinstance(scale, int) or scale < 2:
+            raise ValueError("scale must be an integer >= 2")
+        
+        # set up teacher and run once
+        with torch.no_grad():
+            teacher_target = self.forward()[0].to(torch.float32).contiguous()
+            rho_lo = torch.sigmoid(teacher_target)  # (H_old, W_old)
+            rho_hi = F.interpolate(
+                rho_lo[None, None],  # (1,1,H_old,W_old)
+                scale_factor=scale,
+                mode='bilinear', align_corners=False
+            )[0, 0]  # (H_new, W_new)
+            rho_hi = rho_hi.clamp_(0.01, 0.99)
+            rho_hi_logit = torch.log(rho_hi) - torch.log1p(-rho_hi)
+            self.rho_hi_logit = rho_hi_logit
 
-        self.update_problem_params({"width": new_W, "height": new_H})
+        _, H, W = self.shape
+        new_H, new_W = H * scale, W * scale
+        self.update_problem_params({'height': new_H, 'width': new_W})
 
-        if dynamic_depth_fn is not None:
-            # {'conv_upsample': tuple, 'conv_filters': tuple, 'init_channels': int}
-            depth = dynamic_depth_fn(self.problem_params)
-            if 'conv_upsample' in depth: self.conv_upsample = tuple(int(x) for x in depth['conv_upsample'])
-            if 'conv_filters'  in depth: self.conv_filters  = tuple(int(x) for x in depth['conv_filters'])
-            if 'init_channels' in depth: self.init_channels = int(depth['init_channels'])
-
+        ups = list(map(int, self.conv_upsample))
+        ups[-1] *= int(scale)
+        self.conv_upsample = tuple(ups)
+        
         self._compute_base_sizes()
-        self._build_modules()
 
-        # 5) transfer-by-shape
-        new_state = self.state_dict()
-        transferred = []
-        for k, v in new_state.items():
-            if k in old_state and old_state[k].shape == v.shape:
-                v.copy_(old_state[k])
-                transferred.append(k)
-        self.load_state_dict(new_state, strict=False)
+        # register buffers/knobs
+        self.register_buffer("_rho_hi_logit", rho_hi_logit, persistent=False)
+        self.register_buffer("_distill_target", teacher_target, persistent=False)
+        self._distill_scale = int(scale)
+        self._distill_weight = float(distill_weight)
 
-        if freeze_transferred:
-            frozen = set(transferred)
-            for name, p in self.named_parameters():
-                if name in frozen:
-                    p.requires_grad_(False)
-
-        # 7) return info (for logging)
-        return transferred
+        for p in self.parameters():
+            p.requires_grad_(True)
 
     def forward(self):
         # [1, C, h_base, w_base] in fp32
@@ -379,14 +393,34 @@ class CNNModel(Model):
             x = offset(x)
 
         x = self.final_1x1(x)
+
+        tau = float(getattr(self, "_warm_tau", 0.0))
+        if tau > 0.0 and hasattr(self, "_rho_hi_logit"):
+            if self._rho_hi_logit.shape[-2:] == x.shape[-2:]:
+                # x ← (1-τ)x + τ x*
+                x = (1.0 - tau) * x + tau * self._rho_hi_logit[None, None]
+
         
         if self.final_activation is not None:
             x = self.final_activation(x)
 
         # (1,1,H,W) -> (1,H,W) as float64 for physics
-        return x[:, 0, :, :].to(torch.float64)
+        x = x[:, 0, :, :].to(torch.float64)
+
+        return x
 
     def loss(self, logits=None):
         if logits is None:
             logits = self.forward()
-        return self.get_total_loss(logits.to(torch.float64))
+        base_loss = self.get_total_loss(logits)
+
+        distill_weight = float(getattr(self, "_distill_weight", 0.0))
+        distill_target = getattr(self, "_distill_target", None)
+        distill_scale= int(getattr(self, "_distill_scale", 1))
+
+        if distill_weight > 0.0 and distill_target is not None and distill_scale >= 1:
+            student_downsample = self._downsample_for_distill(logits.to(torch.float32))  # (H_old, W_old)
+            distill = torch.nn.functional.mse_loss(student_downsample, distill_target)
+            base_loss = base_loss + distill_weight * distill
+
+        return base_loss

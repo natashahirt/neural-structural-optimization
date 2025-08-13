@@ -87,7 +87,7 @@ def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), 
   sum_upsamples = np.prod(conv_upsample)
   params = params.copy(width=int(base_w * sum_upsamples), height=int(base_h * sum_upsamples))
   conv_upsample = [1] + conv_upsample + [1]
-  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(conv_upsample):]
+  conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(conv_upsample):] # experiment with this, also got good results with 16 final conv layer
   assert len(conv_filters) == len(conv_upsample)
   return params, dict(
       conv_upsample=conv_upsample,
