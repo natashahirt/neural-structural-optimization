@@ -24,7 +24,6 @@ import matplotlib.pyplot as plt
 from neural_structural_optimization import models  # Add this import
 from neural_structural_optimization import topo_physics, topo_api
 import scipy.optimize
-import tensorflow as tf
 import xarray
 from tqdm import tqdm
 
@@ -34,34 +33,34 @@ import numpy as np
 # utilities
 
 def _set_variables(variables, x):
-  """Set TensorFlow variables from a flattened array.
+  """Set PyTorch parameters from a flattened array.
   
   Args:
-    variables: List of TensorFlow variables
+    variables: List of PyTorch parameters
     x: Flattened array of values to assign
   """
-  # Use shape.as_list() for compatibility with modern TensorFlow
+  # Use shape for PyTorch parameters
   shapes = [list(v.shape) for v in variables]
-  values = tf.split(x, [np.prod(s) for s in shapes])
+  values = np.split(x, [np.prod(s) for s in shapes])
   for var, value in zip(variables, values):
-    var.assign(tf.reshape(tf.cast(value, var.dtype), var.shape))
+    var.data = torch.from_numpy(value.reshape(var.shape)).to(var.dtype)
 
 def _get_variables(variables):
-  """Get flattened array from TensorFlow variables.
+  """Get flattened array from PyTorch parameters.
   
   Args:
-    variables: List of TensorFlow variables
+    variables: List of PyTorch parameters
     
   Returns:
-    Flattened numpy array of variable values
+    Flattened numpy array of parameter values
   """
   return np.concatenate([
-      v.numpy().ravel() if not isinstance(v, np.ndarray) else v.ravel()
+      v.detach().cpu().numpy().ravel() if hasattr(v, 'detach') else v.ravel()
       for v in variables])
 
 def constrained_logits(init_model):
   """Produce matching initial conditions with volume constraints applied."""
-  logits = init_model(None).numpy().astype(np.float64).squeeze(axis=0)
+  logits = init_model(None).detach().cpu().numpy().astype(np.float64).squeeze(axis=0)
   return topo_physics.physical_density(
       logits, init_model.env.args, volume_constraint=True, cone_filter=False)
 
@@ -93,46 +92,6 @@ def optimizer_result_dataset(losses, frames, save_intermediate_designs=False):
   return ds
 
 # training
-
-def train_tf_optimizer(
-    model, max_iterations, optimizer, save_intermediate_designs=True,
-):
-  """Train a model using TensorFlow optimizers.
-  
-  Args:
-    model: The model to train
-    max_iterations: Maximum number of optimization iterations
-    optimizer: TensorFlow optimizer to use
-    save_intermediate_designs: Whether to save intermediate designs
-    
-  Returns:
-    xarray.Dataset containing optimization results
-  """
-  loss = 0
-  model(None)  # build model, if not built
-  tvars = model.trainable_variables
-
-  losses = []
-  frames = []
-  for i in range(max_iterations + 1):
-    with tf.GradientTape() as t:
-      t.watch(tvars)
-      logits = model(None)
-      loss = model.loss(logits)
-
-    losses.append(loss.numpy().item())
-    frames.append(logits.numpy())
-
-    if i % (max_iterations // 10) == 0:
-      logging.info(f'step {i}, loss {losses[-1]:.2f}')
-
-    if i < max_iterations:
-      grads = t.gradient(loss, tvars)
-      optimizer.apply_gradients(zip(grads, tvars))
-
-  designs = [model.env.render(x, volume_constraint=True) for x in frames]
-  return optimizer_result_dataset(np.array(losses), np.array(designs),
-                                  save_intermediate_designs)
 
 def _cosine_warmup(t, T, warmup=0.1, start=1.0, end=0.0):
     """Cosine from `start`→`end` after a linear warmup portion."""
@@ -208,31 +167,23 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
         
         def closure():
             opt.zero_grad(set_to_none=True)
-            logits = model()        # forward
-            loss = model.loss()     # compute scalar loss
+            logits = model()
+            loss = model.get_total_loss(logits)
             loss.backward()
             return loss
 
-        loss = opt.step(closure)    # does at most 1 internal iter
-        curr = float(loss.detach())
-        losses.append(curr)
+        loss = opt.step(closure)
+        
+        losses.append(float(loss.detach()))
+        frames.append(model().detach().cpu().numpy())
+        
+        # Update progress bar
+        if prev_loss is not None:
+            pbar.set_postfix({'loss': f'{loss:.4f}', 'Δ': f'{loss - prev_loss:.2e}'})
+        prev_loss = loss
 
-        with torch.no_grad():
-            logits = model()
-            frames.append(logits.detach().cpu().numpy())
-
-        if step > 40 and prev_loss is not None:
-            rel = abs(prev_loss - curr) / max(1.0, abs(prev_loss))
-            pbar.set_postfix(loss=f"{curr:.4g}", rel=f"{rel:.2e}")
-            if rel < 1e-6:
-                pbar.write(f"Early stop: relative change {rel:.2e} < 1e-3")
-                break
-        else:
-            pbar.set_postfix(loss=f"{curr:.4g}")
-
-        prev_loss = curr
-
-    designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
+    with torch.no_grad():
+        designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
 def method_of_moving_asymptotes(
@@ -436,27 +387,27 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
         ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)
 
-        # Plot current stage results
-        plt.figure(figsize=(8, 4))
+        # # Plot current stage results
+        # plt.figure(figsize=(8, 4))
         
-        # Plot loss curve
-        plt.subplot(1, 2, 1)
-        loss_df = ds.loss.to_pandas()
-        plt.plot(loss_df, linewidth=2)
-        plt.title(f'Stage {stage + 1} Loss')
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss')
-        plt.grid(True)
+        # # Plot loss curve
+        # plt.subplot(1, 2, 1)
+        # loss_df = ds.loss.to_pandas()
+        # plt.plot(loss_df, linewidth=2)
+        # plt.title(f'Stage {stage + 1} Loss')
+        # plt.xlabel('Iteration')
+        # plt.ylabel('Loss')
+        # plt.grid(True)
         
-        # Plot final design
-        plt.subplot(1, 2, 2)
-        final_design = ds.design.isel(step=ds.loss.argmin())
-        plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
-        plt.title(f'Design ({model.shape[1]}x{model.shape[2]})')
-        plt.axis('off')
+        # # Plot final design
+        # plt.subplot(1, 2, 2)
+        # final_design = ds.design.isel(step=ds.loss.argmin())
+        # plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+        # plt.title(f'Design ({model.shape[1]}x{model.shape[2]})')
+        # plt.axis('off')
         
-        plt.tight_layout()
-        plt.show()
+        # plt.tight_layout()
+        # plt.show()
 
         # Upsample after stage if allowed
         if stage < resize_num - 1:

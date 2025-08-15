@@ -24,6 +24,7 @@ overview:
 import ast
 import re
 import time
+import os
 
 from absl import app
 from absl import flags
@@ -35,9 +36,7 @@ from neural_structural_optimization import problems
 from neural_structural_optimization import topo_api
 from neural_structural_optimization import train
 import numpy as np
-import tensorflow as tf
 import xarray
-
 from apache_beam import runners
 
 # requires tensorflow 2.0
@@ -109,58 +108,21 @@ def get_beam_counter(name):
       'neural_structural_optimization_pipeline', name)
 
 
-def run_optimization(task):
-  """Run an optimization task."""
-  logging.info(f'starting optimization for {task}')
-
-  # train model
-  problem_name, seed, model_name, optimizer_name = task
+def save_optimization_task(inputs):
+  """Save a single optimization task."""
+  problem_name, seed, model_name, optimizer_name = inputs
   problem = problems.PROBLEMS_BY_NAME[problem_name]
 
-  model_cls = _get_model_class(model_name)
-  args = topo_api.specified_task(problem)
-  train_func = _TRAIN_FUNCS[optimizer_name]
-
-  if FLAGS.cnn_kwargs:
-    cnn_kwargs = {}
-    for kv in FLAGS.cnn_kwargs.split(';'):
-      key, value = kv.split('=')
-      cnn_kwargs[key] = ast.literal_eval(value)
-  else:
-    cnn_kwargs = {}
-
-  if FLAGS.dynamic_depth:
-    cnn_kwargs.update(pipeline_utils.dynamic_depth_kwargs(problem))
-
-  # By convention, we use seed=-1 to indicate the "constant" initial condition,
-  # and seed >= 0 to indicate initializing from the CNN's output.
-  if seed == -1:
-    assert model_cls is models.PixelModel
-    model = model_cls(args=args)
-    kwargs = dict()
-  elif model_cls is models.PixelModel:
-    model = model_cls(seed=seed, args=args)
-    conv_model_cls = _get_model_class('cnn')
-    kwargs = dict(
-        init_model=conv_model_cls(seed=seed, args=args, **cnn_kwargs)
-    )
-  else:
-    model = model_cls(seed=seed, args=args, **cnn_kwargs)
-    kwargs = dict()
-
-  start_time = time.perf_counter()
-  try:
-    history = train_func(
-        model, max_iterations=FLAGS.optimization_steps, **kwargs)
-  except Exception as e:
-    raise RuntimeError(f'failed during {task} with: {e}')
-  elapsed_time = time.perf_counter() - start_time
-  logging.info(f'finished {task} in {elapsed_time} seconds')
+  start_time = time.time()
+  model = models.MODELS_BY_NAME[model_name](problem)
+  optimizer = train.OPTIMIZERS_BY_NAME[optimizer_name](model)
+  history = train.train_optimizer(model, optimizer, seed=seed)
+  elapsed_time = time.time() - start_time
 
   # save model
   base_dir = f'{FLAGS.save_dir}/{FLAGS.experiment_name}/{problem.name}/'
   method = f'{model_name}-{optimizer_name}'
-  tf.io.gfile.makedirs(base_dir)
+  os.makedirs(base_dir, exist_ok=True)
   base_path = f'{base_dir}/{method}_seed{seed}'
   model.save_weights(f'{base_path}.tf_savedmodel')
 
@@ -175,7 +137,7 @@ def run_optimization(task):
       height=problem.height,
       elapsed_time=elapsed_time,
   ))
-  with tf.io.gfile.GFile(f'{base_path}.nc', 'wb') as f:
+  with open(f'{base_path}.nc', 'wb') as f:
     f.write(history.to_netcdf(encoding={'design': _BINARY_IMAGE_ENCODING}))
 
   # Ensure design has a step dimension before indexing
@@ -186,7 +148,7 @@ def run_optimization(task):
 
   # TODO(shoyer): save some GIFs!
   image = pipeline_utils.image_from_design(best_design, problem)
-  with tf.io.gfile.GFile(f'{base_path}.png', 'wb') as f:
+  with open(f'{base_path}.png', 'wb') as f:
     image.save(f, format='png')
 
   partial_history = history.assign(design=best_design)
@@ -210,14 +172,14 @@ def groupby_seeds(inputs):
   best_seed = int(history.loss.min('step').argmin())
   image = pipeline_utils.image_from_design(
       history.isel(seed=best_seed).design, problem)
-  with tf.io.gfile.GFile(f'{base_path}_best.png', 'wb') as f:
+  with open(f'{base_path}_best.png', 'wb') as f:
     image.save(f, format='png')
 
   median_seed = int(
       history.loss.min('step').data.argsort()[history.sizes['seed'] // 2])
   image = pipeline_utils.image_from_design(
       history.isel(seed=median_seed).design, problem)
-  with tf.io.gfile.GFile(f'{base_path}_median.png', 'wb') as f:
+  with open(f'{base_path}_median.png', 'wb') as f:
     image.save(f, format='png')
 
   return problem.name, history[['loss']]
@@ -233,7 +195,7 @@ def save_all_losses(histories):
   """Save losses for all tasks into one summary file."""
   history = xarray.concat(histories, dim='problem_name').sortby('problem_name')
   path = f'{FLAGS.save_dir}/{FLAGS.experiment_name}/all_losses.nc'
-  with tf.io.gfile.GFile(path, 'wb') as f:
+  with open(path, 'wb') as f:
     f.write(history.to_netcdf())
 
 
@@ -263,7 +225,7 @@ def main(_, runner=None):
 
   pipeline = (
       beam.Create(tasks)
-      | beam.Map(run_optimization)
+      | beam.Map(save_optimization_task)
       | beam.Reshuffle()  # don't fuse optimizations together
       | 'group seeds' >> beam.GroupByKey()
       | beam.Map(groupby_seeds)

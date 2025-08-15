@@ -2,11 +2,9 @@ import autograd
 import autograd.core
 import autograd.numpy as np
 from neural_structural_optimization import topo_api, pipeline_utils, models_utils, problems_utils
-import tensorflow as tf
 import torch
 import torch.nn as nn
-
-layers = tf.keras.layers
+import torch.nn.functional as F
 
 # =============================================================================
 # Loss functions
@@ -21,10 +19,14 @@ def batched_topo_loss(params, envs):
 # Autodiff integration utilities
 # =============================================================================
 
-def convert_autograd_to_tensorflow(func):
-  @tf.custom_gradient
+def convert_autograd_to_pytorch(func):
+  """Convert autograd function to PyTorch-compatible function."""
   def wrapper(x):
-    vjp, ans = autograd.core.make_vjp(func, x.numpy())
+    if isinstance(x, torch.Tensor):
+      x_np = x.detach().cpu().numpy()
+    else:
+      x_np = x
+    vjp, ans = autograd.core.make_vjp(func, x_np)
     return ans, vjp
   return wrapper
 
@@ -35,14 +37,25 @@ def convert_autograd_to_tensorflow(func):
 def set_random_seed(seed):
   if seed is not None:
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed(seed)
 
 def global_normalization(inputs, epsilon=1e-6):
-  mean, variance = tf.nn.moments(inputs, axes=list(range(len(inputs.shape))))
-  net = inputs
-  net -= mean
-  net *= tf.math.rsqrt(variance + epsilon)
-  return net
+  """PyTorch equivalent of TensorFlow's global normalization."""
+  if isinstance(inputs, torch.Tensor):
+    mean = inputs.mean()
+    variance = inputs.var()
+    net = inputs - mean
+    net = net * torch.rsqrt(variance + epsilon)
+    return net
+  else:
+    # Fallback for numpy arrays
+    mean = np.mean(inputs)
+    variance = np.var(inputs)
+    net = inputs - mean
+    net = net * np.sqrt(1.0 / (variance + epsilon))
+    return net
 
 def to_nchw(z):
     # expects (1,H,W) or (H,W)
@@ -83,31 +96,30 @@ def normalize_mask(m, H, W, device, dtype):
     return F.interpolate(m4, size=(H, W), mode="nearest")[0, 0]
 
 # =============================================================================
-# Layer factory functions
+# Layer factory functions (PyTorch equivalents)
 # =============================================================================
 
 def UpSampling2D(factor):
-  return layers.UpSampling2D((factor, factor), interpolation='bilinear')
+  """PyTorch equivalent of TensorFlow's UpSampling2D."""
+  return nn.Upsample(scale_factor=factor, mode='bilinear', align_corners=False)
 
 def Conv2D(filters, kernel_size, **kwargs):
-  return layers.Conv2D(filters, kernel_size, padding='same', **kwargs)
+  """PyTorch equivalent of TensorFlow's Conv2D."""
+  padding = kwargs.get('padding', 'same')
+  if padding == 'same':
+    padding = kernel_size // 2 if isinstance(kernel_size, int) else (kernel_size[0] // 2, kernel_size[1] // 2)
+  
+  return nn.Conv2d(
+    in_channels=kwargs.get('input_shape', [1])[-1] if 'input_shape' in kwargs else 1,
+    out_channels=filters,
+    kernel_size=kernel_size,
+    padding=padding,
+    **{k: v for k, v in kwargs.items() if k not in ['padding', 'input_shape']}
+  )
 
 # =============================================================================
 # Custom layers
 # =============================================================================
-
-# class AddOffset(layers.Layer):
-
-#   def __init__(self, scale=1):
-#     super().__init__()
-#     self.scale = scale
-
-#   def build(self, input_shape):
-#     self.bias = self.add_weight(
-#         shape=input_shape, initializer='zeros', trainable=True, name='bias')
-
-#   def call(self, inputs):
-#     return inputs + self.scale * self.bias
 
 class AddOffset(nn.Module):
   def __init__(self, channels, scale=10.0):
