@@ -179,6 +179,12 @@ class PixelModel(Model):
         logits = self.forward()
         return self.get_total_loss(logits, clip_weight, tv_weight)
 
+    def _repeat_upsample(x: torch.Tensor, s: int) -> torch.Tensor:
+        # x: (1, H, W) cell averages; repeat each cell into s×s fine cells
+        x = x.repeat_interleave(s, dim=-2)
+        x = x.repeat_interleave(s, dim=-1)
+        return x
+
     def upsample(self, scale=2, soften=True, preserve_mean=True):
         current_z = self.z.detach()
 

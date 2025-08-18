@@ -16,21 +16,6 @@ def batched_topo_loss(params, envs):
   return np.stack(losses)
 
 # =============================================================================
-# Autodiff integration utilities
-# =============================================================================
-
-def convert_autograd_to_pytorch(func):
-  """Convert autograd function to PyTorch-compatible function."""
-  def wrapper(x):
-    if isinstance(x, torch.Tensor):
-      x_np = x.detach().cpu().numpy()
-    else:
-      x_np = x
-    vjp, ans = autograd.core.make_vjp(func, x_np)
-    return ans, vjp
-  return wrapper
-
-# =============================================================================
 # Utility functions
 # =============================================================================
 
@@ -104,7 +89,7 @@ def UpSampling2D(factor):
   return nn.Upsample(scale_factor=factor, mode='bilinear', align_corners=False)
 
 def Conv2D(filters, kernel_size, **kwargs):
-  """PyTorch equivalent of TensorFlow's Conv2D."""
+  """PyTorch equivalent of TensorFlow's Conv2D."""`
   padding = kwargs.get('padding', 'same')
   if padding == 'same':
     padding = kernel_size // 2 if isinstance(kernel_size, int) else (kernel_size[0] // 2, kernel_size[1] // 2)

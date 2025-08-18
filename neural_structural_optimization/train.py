@@ -15,52 +15,36 @@
 
 # pylint: disable=missing-docstring
 # pylint: disable=superfluous-parens
-import functools
 
 from absl import logging
 import autograd
 import autograd.numpy as np
 import matplotlib.pyplot as plt
-from neural_structural_optimization import models  # Add this import
+from neural_structural_optimization import models
 from neural_structural_optimization import topo_physics, topo_api
-import scipy.optimize
 import xarray
 from tqdm import tqdm
 
 import torch
-import numpy as np
 
 # utilities
 
-def _set_variables(variables, x):
-  """Set PyTorch parameters from a flattened array.
+def _get_variables(model):
+  """Get flattened array from PyTorch model parameters.
   
   Args:
-    variables: List of PyTorch parameters
-    x: Flattened array of values to assign
-  """
-  # Use shape for PyTorch parameters
-  shapes = [list(v.shape) for v in variables]
-  values = np.split(x, [np.prod(s) for s in shapes])
-  for var, value in zip(variables, values):
-    var.data = torch.from_numpy(value.reshape(var.shape)).to(var.dtype)
-
-def _get_variables(variables):
-  """Get flattened array from PyTorch parameters.
-  
-  Args:
-    variables: List of PyTorch parameters
+    model: PyTorch model with parameters
     
   Returns:
     Flattened numpy array of parameter values
   """
   return np.concatenate([
-      v.detach().cpu().numpy().ravel() if hasattr(v, 'detach') else v.ravel()
-      for v in variables])
+      v.detach().cpu().numpy().ravel() 
+      for v in model.parameters() if v.requires_grad])
 
 def constrained_logits(init_model):
   """Produce matching initial conditions with volume constraints applied."""
-  logits = init_model(None).detach().cpu().numpy().astype(np.float64).squeeze(axis=0)
+  logits = init_model().detach().cpu().numpy().astype(np.float64).squeeze(axis=0)
   return topo_physics.physical_density(
       logits, init_model.env.args, volume_constraint=True, cone_filter=False)
 
@@ -105,26 +89,16 @@ def train_adam(model,
     max_iterations,
     lr_init=1e-2,
     lr_final=3e-3,
-    clip_w_init=0.5,         # strong early CLIP to form silhouette
-    clip_w_final=0.08,       # decay to weaker guidance
-    tv_w_init=5e-3,          # denoise early
-    tv_w_final=5e-4,         # small but nonzero later
     warmup_frac=0.1,
     save_intermediate_designs=True,
-    save_every=25,
     grad_clip=None,          # e.g., 1.0 to clip global norm
-    switch_to_vit_at=None,   # e.g., 1500 -> call model.clip_switch_to_vit()
-    clip_every=1,            # >1 to skip CLIP some steps (Adam only)
-    clip_ema=0.9             # EMA factor for skipped steps
 ):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_init)
     losses = []
     frames = []
 
     for i in tqdm(range(max_iterations+1), desc="Adam Optimizer"):
-        lr      = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=lr_init,  end=lr_final)
-        clip_w  = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=clip_w_init, end=clip_w_final)
-        tv_w    = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=tv_w_init,   end=tv_w_final)
+        lr = _cosine_warmup(i, max_iterations, warmup=warmup_frac, start=lr_init, end=lr_final)
 
         optimizer.param_groups[0]['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
@@ -161,8 +135,8 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
 
     for step in pbar:
         
-        # Adjust warmstart strength at milestones
-        if step > 40:
+        # Adjust warmstart strength at milestones (for CNN models)
+        if hasattr(model, '_set_warmstart_strength') and step > 40:
             model._set_warmstart_strength(0.1 if step == 40 else 0.0)
         
         def closure():
@@ -207,7 +181,7 @@ def method_of_moving_asymptotes(
 
   env = model.env
   if init_model is None:
-    x0 = _get_variables(model.trainable_variables).astype(np.float64)
+    x0 = _get_variables(model).astype(np.float64)
   else:
     x0 = constrained_logits(init_model).ravel()
 
@@ -275,7 +249,7 @@ def optimality_criteria(
 
     # Initialize design
     if init_model is None:
-        x = _get_variables(model.trainable_variables).astype(np.float64)
+        x = _get_variables(model).astype(np.float64)
     else:
         x = constrained_logits(init_model).ravel()
 
@@ -355,24 +329,7 @@ def optimality_criteria(
     return optimizer_result_dataset(
         np.array(losses), np.array(designs), save_intermediate_designs)
 
-# training features
 
-def train_batch(model_list, flag_values, train_func=train_adam):
-  """Train multiple models in batch.
-  
-  Args:
-    model_list: List of models to train
-    flag_values: Configuration flags
-    train_func: Training function to use
-    
-  Returns:
-    List of optimization results
-  """
-  results = []
-  for model in model_list:
-    result = train_func(model, flag_values.optimization_steps)
-    results.append(result)
-  return results
 
 # train progressive
 
@@ -412,7 +369,8 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
         # Upsample after stage if allowed
         if stage < resize_num - 1:
             model.upsample(scale=2)
-            model._set_warmstart_strength(0.25)
+            if hasattr(model, '_set_warmstart_strength'):
+                model._set_warmstart_strength(0.25)
 
     # Render all frames
     return ds_history

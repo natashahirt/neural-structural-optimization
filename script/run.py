@@ -101,11 +101,11 @@ def main():
         # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
         # ds_history = train.train_lbfgs(model, max_iterations)
 
-        # model = models.PixelModel(problem_params=params)
-        # ds_history = train.train_progressive(model, max_iterations, resize_num=2, alg=train.train_lbfgs)
+        model = models.PixelModel(problem_params=params)
+        ds_history = train.train_progressive(model, max_iterations, resize_num=2, alg=train.train_lbfgs)
 
-        model = models.CNNModel(problem_params=params, activation=torch.nn.LeakyReLU, **dynamic_kwargs)
-        ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)
+        # model = models.CNNModel(problem_params=params, activation=torch.nn.LeakyReLU, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
