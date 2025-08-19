@@ -1,6 +1,7 @@
 import copy
 
 import math
+from typing import Iterable, Optional, Sequence, Tuple, Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -247,68 +248,125 @@ class PixelModel(Model):
 # CNN
 # ========================================
 
-def _init_dense_orthogonal(dense, latent_size, h_base, w_base, channels):
+class IdentityNorm(nn.Module):
+    def forward(self,x): return x
+
+class AddOffset(nn.Module):
+    """Per-channel learnable offset, scaled by `scale` (kept 0-init like TF AddOffset)."""
+    def __init__(self, channels: int, scale: float = 10.0):
+        super().__init__()
+        self.scale = float(scale)
+        self.offset = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N,C,H,W)
+        return x + self.scale * self.offset.view(1, -1, 1, 1)
+
+def _init_dense_orthogonal(dense: nn.Linear, latent_size: int, h_base: int, w_base: int, channels: int):
     fan_out = h_base * w_base * channels
-    gain = math.sqrt(max(fan_out / latent_size, 1.0))
+    gain = math.sqrt(max(fan_out/latent_size, 1.0))
     nn.init.orthogonal_(dense.weight, gain=gain)
     if dense.bias is not None:
         nn.init.zeros_(dense.bias)
 
-def _upsample_to(x, size, mode='bilinear'):
-    """Resize NCHW tensor x to (H,W)=size with TF/Keras-parity semantics."""
+def _upsample_nn_to(x: torch.Tensor, size: Tuple[int,int]) -> torch.Tensor:
     if x.shape[-2:] == size:
         return x
-    if mode == 'nearest':
-        return F.interpolate(x, size=size, mode='nearest')
-    return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
+    return F.interpolate(x, size=size, mode='nearest')
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, k=5, activation=nn.LeakyReLU):
+class ConvStage(nn.Module):
+    """
+    One stage = activation -> UpSampling (nearest) -> normalization -> Conv2d -> AddOffset
+    Mirrors the Keras block order.
+    """
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int | Tuple[int,int] = 5,
+        norm_factor: Optional[Callable[[int], nn.Module]] = None,
+        offset_scale: float = 10.0,
+        neg_slope: float = 0.2,
+        conv_initializer: str = "kaiming_fan_in",  # mirrors tf.VarianceScaling(fan_in)
+        stage_name: str = "",
+    ):
         super().__init__()
-        layers_ = [nn.Conv2d(in_ch, out_ch, kernel_size=k, padding="same", bias=True)]
-        self.conv_block = nn.Sequential(*layers_)
-    
-    def forward(self, x): return self.conv_block(x)
+        self.act = nn.LeakyReLU(negative_slope=neg_slope, inplace=True)
+        self.norm = (norm_factor(in_ch) if norm_factor is not None else IdentityNorm())
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding="same", bias=True)
+        self.offset = AddOffset(out_ch, scale=offset_scale)
+        # init conv
+        if conv_initializer == "kaiming_fan_in":
+            nn.init.kaiming_normal_(self.conv.weight, a=neg_slope, mode="fan_in", nonlinearity="leaky_relu")
+        elif conv_initializer == "kaiming_fan_out":
+            nn.init.kaiming_normal_(self.conv.weight, a=neg_slope, mode="fan_out", nonlinearity="leaky_relu")
+        else:
+            raise ValueError(f"Unknown conv_initializer: {conv_initializer}")
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+
+        self.stage_name = stage_name  # used by the adaptive transfer logic
+
+    def forward(self, x: torch.Tensor, target_hw: Tuple[int,int]) -> torch.Tensor:
+        x = self.act(x)
+        x = _upsample_nn_to(x, target_hw)
+        x = self.norm(x)
+        x = self.conv(x)
+        x = self.offset(x)
+        return x
+
 
 class CNNModel(Model):
     def __init__(
         self,
         problem_params=None,
-        latent_size=128,
-        init_channels=32,
-        conv_upsample=(1, 2, 2, 2, 1),
-        conv_filters=(128, 64, 32, 16),
-        kernel_size=5,
-        offset_scale=10,
-        activation=nn.LeakyReLU,  
-        norm=None, # nn.BatchNorm2d or lambda C: nn.GroupNorm(8, C)
-        final_activation=None,
-        seed=None,
+        latent_size: int = 128,
+        dense_channels: int = 32,
+        conv_upsample: Sequence[int] = (1, 2, 2, 2, 1),
+        conv_filters: Sequence[int] = (128, 64, 32, 16, 1),
+        offset_scale: float = 10.0,
+        kernel_size: int | Tuple[int,int] = 5,
+        norm: Optional[Callable[[int], nn.Module]] = lambda C: nn.InstanceNorm2d(num_features=int(C), affine=False, track_running_stats=False),
+        conv_initializer: str = "kaiming_fan_in",
+        neg_slope: float = 0.2,
+        seed: Optional[int] = None,
     ):
         super().__init__(problem_params=problem_params, seed=seed)
 
         if len(conv_upsample) != len(conv_filters):
             raise ValueError("conv_upsample and conv_filters must have same length")
-
+        if conv_filters[-1] != 1:
+            raise ValueError("conv_filters[-1] must be 1 to produce (1,H,W) logits")
+    
         self.problem_params = problem_params
         self.latent_size = int(latent_size)
-        self.init_channels = int(init_channels)
+        self.dense_channels = int(dense_channels)
         self.conv_upsample = conv_upsample
         self.conv_filters = conv_filters
+        self.offset_scale = offset_scale
         self.kernel_size = kernel_size
-        self.offset_scale = float(offset_scale)
         self.norm = norm
-        self.final_activation = final_activation
-        self.seed = seed
+        self.conv_initializer = conv_initializer
+        self.neg_slope = neg_slope
 
-        if isinstance(activation, type):
-            act_kwargs = {"negative_slope": 0.2}
-            self.activation = activation(**act_kwargs)  # instantiate
+        if seed is not None:
+            g = torch.Generator(device='cpu')
+            g.manual_seed(int(seed))
+            z_init = torch.randn(1, self.latent_size, generator=g) 
         else:
-            self.activation = activation  # already a module/callable
+            z_init = torch.randn(1, self.latent_size)
+
+        self.z = nn.Parameter(z_init)
 
         self._compute_base_sizes()
-        self._build_modules()
+        self._build()
+
+
+        self.register_buffer("_distill_target", None, persistent=False)
+        self.register_buffer("_rho_hi_logit", None, False)
+        self._distill_scale = 1
+        self._distill_weight = 0.0
+        self._warm_tau = 0.0
 
     @property
     def shape(self):
@@ -316,146 +374,146 @@ class CNNModel(Model):
 
     def _compute_base_sizes(self):
         total_up = 1
-        for f in self.conv_upsample:
-            total_up *= int(f)
+        for u in self.conv_upsample:
+            total_up *= int(u)
 
-        H, W = self.env.args['nely'], self.env.args['nelx']
+        _, H, W = self.shape
 
         if H % total_up != 0 or W % total_up != 0:
             raise ValueError(f"Grid {H}x{W} too small,not divisible by Π(conv_upsample)={total_up}")
 
         self.h_base = H // total_up
         self.w_base = W // total_up
-        self._target_hw = (H, W)
 
-        self.conv_stage_sizes = []
-        cur_h, cur_w = self.h_base, self.w_base
-        for f in self.conv_upsample:
-            cur_h *= int(f); cur_w *= int(f)
-            self.conv_stage_sizes.append((cur_h, cur_w))
+        sizes = []
+        ch = self.dense_channels
+        h, w, = self.h_base, self.w_base
+        for u in self.conv_upsample:
+            h *= int(u); w *= int(u)
+            sizes.append((h, w))
+        self.stage_sizes = sizes
 
-    def _build_modules(self):   # <- consistent name
-        # latent + dense
-        self.latent = nn.Parameter(torch.randn(1, self.latent_size))
-        self.dense  = nn.Linear(self.latent_size, self.h_base * self.w_base * self.init_channels)
-        _init_dense_orthogonal(self.dense, self.latent_size, self.h_base, self.w_base, self.init_channels)        
+    def _build(self): 
+        self.dense  = nn.Linear(self.latent_size, self.h_base * self.w_base * self.dense_channels)
+        _init_dense_orthogonal(self.dense, self.latent_size, self.h_base, self.w_base, self.dense_channels)        
 
         # convs + offsets
-        conv_blocks, offsets = [], []
-        in_ch = self.init_channels
-        for out_ch in self.conv_filters:
-            conv_blocks.append(ConvBlock(in_ch, int(out_ch), k=self.kernel_size))
-            offsets.append(AddOffset(channels=int(out_ch), scale=self.offset_scale))
-            in_ch = int(out_ch)
-        self.conv_blocks  = nn.ModuleList(conv_blocks)
-        self.offsets = nn.ModuleList(offsets)
+        stages = []
+        in_ch = self.dense_channels
+        for i, (out_ch, target_hw) in enumerate(zip(self.conv_filters, self.stage_sizes)):
+            stage_name = f"stage_{i:02d}_C{in_ch}->{out_ch}"
+            stage = ConvStage(
+                in_ch, out_ch,
+                kernel_size=self.kernel_size,
+                norm_factor=self.norm,
+                offset_scale=self.offset_scale,
+                neg_slope=self.neg_slope,
+                conv_initializer=self.conv_initializer,
+                stage_name=stage_name,
+            )
+            stages.append(stage)
+            in_ch = out_ch
+        self.stages = nn.ModuleList(stages)
 
-        self.final_1x1 = nn.Conv2d(in_ch, 1, kernel_size=1, bias=True)
+    def forward(self) -> torch.Tensor:
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            z = self.z.float()
+            x = self.dense(z).view(1, self.dense_channels, self.h_base, self.w_base).contiguous(memory_format=torch.channels_last)
 
-        # init: Kaiming for convs except final_1x1
-        neg = 0.2  # Leaky slope
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) and m is not self.final_1x1:
-                nn.init.kaiming_normal_(m.weight, a=neg, mode='fan_in', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+            # upsample conv stages
+            for stage, target_hw in zip(self.stages, self.stage_sizes):
+                x = stage(x, target_hw)
 
-        with torch.no_grad():
-            self.final_1x1.weight.zero_() 
-            self.final_1x1.bias.fill_(logit(self.problem_params.density))  # logit target density
-
-    def _downsample_for_distill(self, logits: torch.Tensor) -> torch.Tensor:
-        # logits_f32: (1,H,W) or (H,W)
-        if logits.ndim == 2:
-            logits = logits.unsqueeze(0)  # (1,H,W)
-        x = logits.unsqueeze(0)               # (1,1,H,W)
-        s = int(getattr(self, "_distill_scale", 1))
-        if s > 1:
-            x = torch.nn.functional.avg_pool2d(x, kernel_size=s, stride=s)
-        return x[0,0]
-
-    def _set_warmstart_strength(self, tau: float):
-        self._warm_tau = float(min(1.0, max(0.0, tau)))
-
-    @torch.no_grad()
-    def upsample(self, scale=2, distill_weight=0.1,freeze_transferred=True):
-
-        if not isinstance(scale, int) or scale < 2:
-            raise ValueError("scale must be an integer >= 2")
-        
-        # set up teacher and run once
-        with torch.no_grad():
-            teacher_target = self.forward()[0].to(torch.float32).contiguous()
-            rho_lo = torch.sigmoid(teacher_target)  # (H_old, W_old)
-            rho_hi = F.interpolate(
-                rho_lo[None, None],  # (1,1,H_old,W_old)
-                scale_factor=scale,
-                mode='bilinear', align_corners=False
-            )[0, 0]  # (H_new, W_new)
-            rho_hi = rho_hi.clamp_(0.01, 0.99)
-            rho_hi_logit = torch.log(rho_hi) - torch.log1p(-rho_hi)
-            self.rho_hi_logit = rho_hi_logit
-
-        _, H, W = self.shape
-        new_H, new_W = H * scale, W * scale
-        self._update_problem_params({'height': new_H, 'width': new_W})
-
-        ups = list(map(int, self.conv_upsample))
-        ups[-1] *= int(scale)
-        self.conv_upsample = tuple(ups)
-        
-        self._compute_base_sizes()
-
-        # register buffers/knobs
-        self.register_buffer("_rho_hi_logit", rho_hi_logit, persistent=False)
-        self.register_buffer("_distill_target", teacher_target, persistent=False)
-        self._distill_scale = int(scale)
-        self._distill_weight = float(distill_weight)
-
-        for p in self.parameters():
-            p.requires_grad_(True)
-
-    def forward(self):
-        # [1, C, h_base, w_base] in fp32
-        z = self.latent.float()
-        x = self.dense(z).view(1, self.init_channels, self.h_base, self.w_base)
-
-        # upsample conv stages
-        for (h_target, w_target), conv_block, offset in zip(self.conv_stage_sizes, self.conv_blocks, self.offsets):
-            x = self.activation(x)
-            x = _upsample_to(x, (h_target, w_target), mode="nearest")
-            x = conv_block(x)
-            x = offset(x)
-
-        x = self.final_1x1(x)
-
-        tau = float(getattr(self, "_warm_tau", 0.0))
-        if tau > 0.0 and hasattr(self, "_rho_hi_logit"):
-            if self._rho_hi_logit.shape[-2:] == x.shape[-2:]:
-                # x ← (1-τ)x + τ x*
-                x = (1.0 - tau) * x + tau * self._rho_hi_logit[None, None]
-
-        
-        if self.final_activation is not None:
-            x = self.final_activation(x)
+            if self._warm_tau > 0.0 and (self._rho_hi_logit is not None) and (self._rho_hi_logit.shape[-2:] == x.shape[-2:]):
+                x = (1.0 - self._warm_tau) * x + self._warm_tau * self._rho_hi_logit[None, None]
 
         # (1,1,H,W) -> (1,H,W) as float64 for physics
-        x = x[:, 0, :, :].to(torch.float64)
+        return x[:, 0, :, :].to(torch.float64)
 
-        return x
-
-    def loss(self, logits=None):
+    def loss(self, logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         if logits is None:
             logits = self.forward()
-        base_loss = self.get_total_loss(logits)
 
-        distill_weight = float(getattr(self, "_distill_weight", 0.0))
-        distill_target = getattr(self, "_distill_target", None)
-        distill_scale= int(getattr(self, "_distill_scale", 1))
+        total = self.get_total_loss(logits)
 
-        if distill_weight > 0.0 and distill_target is not None and distill_scale >= 1:
-            student_downsample = self._downsample_for_distill(logits.to(torch.float32))  # (H_old, W_old)
-            distill = torch.nn.functional.mse_loss(student_downsample, distill_target)
-            base_loss = base_loss + distill_weight * distill
+        if self._distill_weight > 0.0 and self._distill_target is not None and self._distill_scale >= 1:
+            x = logits.to(torch.float32)
+            if x.ndim == 3:
+                x = x[None, None]
+            if self._distill_scale > 1:
+                x = F.avg_pool2d(x, kernel_size=self._distill_scale, stride=self._distill_scale)
+            student_ds = x[0,0]
+            distill = F.mse_loss(student_ds, self._distill_target)
+            total = total + float(self._distill_weight) * distill
 
-        return base_loss
+        return total
+
+    @torch.no_grad()
+    def upsample(self, scale:int, *, freeze_transferred=True, distill_weight:float=0.1):
+    
+        # teacher at old res -> nearest upsample to new res -> logit target
+        old_logits = self.forward()[0].to(torch.float32).contiguous() # (H_old, W_old)
+        rho_lo = torch.sigmoid(old_logits)
+        rho_hi = F.interpolate(rho_lo[None, None], scale_factor=scale, mode="nearest")[0,0]
+        rho_hi = rho_hi.clamp_(0.01, 0.99)
+        rho_hi_logit = logit(rho_hi)
+
+        self._update_problem_params(scale=scale)
+        ups = list(map(int, self.conv_upsample))
+        ups[-1] *= scale
+
+        self._rebuild(tuple(ups), rho_hi_logit, old_logits, scale, distill_weight, freeze_transferred)
+
+    def _rebuild(self, ups, rho_hi_logit, distill_target_logits, scale, distill_weight, freeze_transferred):
+        
+        prev_state_dict = self.state_dict()
+        self.conv_upsample = tuple(int(u) for u in ups)
+        self._compute_base_sizes()
+        old_keys = set(prev_state_dict.keys())
+
+        new_self = CNNModel(
+            problem_params=self.problem_params,
+            latent_size=self.latent_size,
+            dense_channels=self.dense_channels,
+            conv_upsample=self.conv_upsample,
+            conv_filters=self.conv_filters,
+            offset_scale=self.offset_scale,
+            kernel_size=self.kernel_size,
+            norm=self.norm,
+            conv_initializer=self.conv_initializer,
+            neg_slope=self.neg_slope,
+        )
+
+        new_state_dict = new_self.state_dict()
+
+        copy_map = {}
+        for k,v in new_state_dict.items():
+            if k in old_keys and prev_state_dict[k].shape == v.shape:
+                copy_map[k] = prev_state_dict[k].clone()
+
+        new_state_dict.update(copy_map)
+        self.load_state_dict(new_state_dict)
+        
+        def should_freeze(name: str) -> bool:
+            if name == "z" or name.startswith(f"stages.{len(self.stages) - 1}."):  # keep last stage plastic
+                return False
+            return name in copy_map  # only freeze transferred early layers
+
+        if freeze_transferred:
+            for name, p in self.named_parameters():
+                p.requires_grad_(not should_freeze(name))
+
+        if not any(p.requires_grad for p in self.parameters()):
+            self.z.requires_grad_(True)
+        
+        self.register_buffer("_rho_hi_logit", rho_hi_logit, persistent=False)
+        self.register_buffer("_distill_target", distill_target_logits.detach().to(torch.float32), persistent=False)
+        self._distill_scale = int(scale)
+        self._distill_weight = float(distill_weight)
+        self._warm_tau = 0.25
+
+    def _unfreeze_all(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+        self._warm_tau = 0.0

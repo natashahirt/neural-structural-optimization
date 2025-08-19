@@ -82,7 +82,7 @@ def main():
             width=50, # 50
             height=100, # 40
             density=0.3,
-            num_stories=5
+            num_stories=5,
         )
 
         params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)      
@@ -95,17 +95,11 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # model = models.PixelModel(problem_params=params, clip_loss=clip_loss)
-        # ds_history = train.clip_bootstrap(model, max_iterations)
-
-        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        # ds_history = train.train_lbfgs(model, max_iterations)
-
-        model = models.PixelModel(problem_params=params)
-        ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
-
-        # model = models.CNNModel(problem_params=params, activation=torch.nn.LeakyReLU, **dynamic_kwargs)
+        # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)
+
+        model = models.CNNModel(problem_params=params, **dynamic_kwargs)
+        ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]

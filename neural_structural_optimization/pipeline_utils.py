@@ -92,5 +92,5 @@ def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), 
   return params, dict(
       conv_upsample=conv_upsample,
       conv_filters=conv_filters,
-      init_channels=conv_filters[0] // 2,
+      dense_channels=conv_filters[0] // 2,
   )

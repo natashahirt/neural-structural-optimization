@@ -21,11 +21,16 @@ import autograd
 import autograd.numpy as np
 import matplotlib.pyplot as plt
 from neural_structural_optimization import models
+from neural_structural_optimization.models import PixelModel, CNNModel
 from neural_structural_optimization import topo_physics, topo_api
 import xarray
 from tqdm import tqdm
 
 import torch
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 
 # utilities
 
@@ -136,11 +141,13 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
     pbar = tqdm(range(max_iterations), desc="L-BFGS")
     prev_loss = None
     stall = 0
-    stopped_at = None
     fine_start = None
     fine_steps = 10
 
     for step in pbar:
+
+        if step > 15:
+            model._unfreeze_all()
 
         def closure():
             opt.zero_grad(set_to_none=True)
@@ -168,11 +175,12 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
                 stall = 0
 
             if fine_start is None and (step + 1) >= min_steps and stall >= patience:
-                if getattr(model, 'analysis_factor', 1) == 1:
+                if isinstance(model, PixelModel) and getattr(model, 'analysis_factor', 1) != 1:
+                    model._set_analysis_factor(reset=True)
+                    fine_start = step
+                else:
                     pbar.set_postfix({'loss': f'{loss_val:.6f}', 'stopped_at': step})
                     break
-                model._set_analysis_factor(reset=True)
-                fine_start = step
             
             if fine_start is not None and (step - fine_start + 1) >= fine_steps:
                 pbar.set_postfix({'loss': f'{loss_val:.6f}', 'stopped_at': step})
@@ -391,9 +399,10 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
 
         # Upsample after stage if allowed
         if stage < resize_num - 1:
-            model.upsample(scale=2, max_dim=500)
-            if hasattr(model, '_set_warmstart_strength'):
-                model._set_warmstart_strength(0.25)
+            if isinstance(model, PixelModel):
+                model.upsample(scale=2, max_dim=500)
+            elif isinstance(model, CNNModel):
+                model.upsample(scale=2, freeze_transferred=True)
 
     # Render all frames
     return ds_history
