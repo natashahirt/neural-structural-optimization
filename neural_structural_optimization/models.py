@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from xarray.backends.h5netcdf_ import H5netcdfBackendEntrypoint
 
 from neural_structural_optimization.models_utils import (
     set_random_seed, batched_topo_loss, to_nchw, normalize_mask, AddOffset
@@ -98,9 +99,8 @@ class Model(nn.Module):
         self.env = topo_api.Environment(args)
         self.args = args
         
-        self.clip_loss = clip_loss
-        if clip_loss is not None and getattr(clip_loss, "weight", 0) > 0:
-            self.clip_weight = float(clip_loss.weight)
+        self.analysis_factor = 1
+        self.analysis_env = self.env
 
     def forward(self):
         # subclasses define self.z or a generator
@@ -138,11 +138,58 @@ class Model(nn.Module):
         self.env = topo_api.Environment(new_args)
         self.args = new_args
 
+    def _set_analysis_factor(self, max_dim: int = 500, reset=False):
+        _, H, W = self.shape
+        f = max(1, max((H + max_dim - 1) // max_dim, (W + max_dim - 1) // max_dim))
+        self.analysis_factor = f
+
+        if f == 1 or reset:
+            self.analysis_env = self.env
+            self.analysis_factor = 1
+            return
+
+        # get analysis environment
+        analysis_dict = {
+            'width'  : int(round(W / f)),
+            'height' : int(round(H / f)),
+            'rmin'   : self.problem_params.rmin / f,
+            'filter_width' : self.problem_params.filter_width / f
+        }
+
+        analysis_params = self.problem_params.copy(**analysis_dict)
+        analysis_problem = analysis_params.get_problem()
+        analysis_args = topo_api.specified_task(analysis_problem)
+        analysis_args['volfrac'] = self.args.get('volfrac', analysis_args.get('volfrac', 0.5))
+
+        self.analysis_env = topo_api.Environment(analysis_args)
+
+    def _downfactor_logits(self, z):
+        _, H, W = self.shape
+        f = self.analysis_factor
+
+        # get "element densities" from analysis grid
+        mask = self._get_mask_3d(H, W)
+
+        z_4d = (z * mask).unsqueeze(0) # (N=1, C=1, H, W)
+        m_4d = mask.unsqueeze(0)
+
+        num = F.avg_pool2d(z_4d, kernel_size=f, stride=f, ceil_mode=True)
+        den = F.avg_pool2d(m_4d, kernel_size=f, stride=f, ceil_mode=True).clamp_min(1e-12)
+
+        z_coarse = (num / den).squeeze(0) 
+        return z_coarse
+
     # losses
 
     def get_physics_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        per_example = StructuralLoss.apply(logits, self.env)
-        return per_example.mean()
+        if not hasattr(self, 'analysis_factor'):
+            self._set_analysis_factor()
+            
+        if getattr(self, 'analysis_factor', 1) == 1:
+            return StructuralLoss.apply(logits, self.env).mean()
+        # use downfactored structural grid
+        z = self._downfactor_logits(logits)
+        return StructuralLoss.apply(z, self.analysis_env).mean()
         
     def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
         physics_loss = self.get_physics_loss(logits)
@@ -160,8 +207,6 @@ class PixelModel(Model):
         seed=None,
     ):
         super().__init__(problem_params=problem_params, clip_loss=clip_loss, seed=seed)
-        H, W = self.env.args['nely'], self.env.args['nelx'] # shape: (batch=1, H, W)
-        # init as densities
         z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
         self.z = nn.Parameter(torch.tensor(z_init, dtype=torch.float64), requires_grad=True)
 
@@ -172,7 +217,7 @@ class PixelModel(Model):
         logits = self.forward()
         return self.get_total_loss(logits)
 
-    def upsample(self, scale=2, preserve_mean=True):
+    def upsample(self, scale=2, preserve_mean=True, max_dim: int = 500):
         with torch.no_grad():
             z_coarse = self.z.detach()
             _, H_coarse, W_coarse = self.shape
@@ -184,14 +229,19 @@ class PixelModel(Model):
 
             _, H_fine, W_fine = self.shape
             z_fine = F.interpolate(z_coarse.unsqueeze(0), size=(H_fine, W_fine), mode='bilinear', align_corners=False).squeeze(0)
-            
+            z_fine = z_fine.clamp(0.0,1.0)
+
             if preserve_mean:
                 mask_fine = self._get_mask_3d(H_fine, W_fine)
                 mask_old = (z_coarse * mask_coarse).sum() / mask_coarse.sum().clamp_min(1e-12)
                 mask_new = (z_fine * mask_fine).sum() / mask_fine.sum().clamp_min(1e-12)
                 z_fine = (z_fine * (mask_old / mask_new.clamp_min(1e-12))).clamp(0.0, 1.0) * mask_fine
+     
+            # check for analysis problem
+            self._set_analysis_factor(max_dim=max_dim)
 
         self.z = torch.nn.Parameter(z_fine, requires_grad=True)
+
 
 # ========================================
 # CNN

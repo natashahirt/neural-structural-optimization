@@ -137,12 +137,10 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
     prev_loss = None
     stall = 0
     stopped_at = None
+    fine_start = None
+    fine_steps = 10
 
     for step in pbar:
-
-        # Adjust warmstart strength at milestones (for CNN models)
-        if hasattr(model, '_set_warmstart_strength') and step > 40:
-            model._set_warmstart_strength(0.1 if step == 40 else 0.0)
 
         def closure():
             opt.zero_grad(set_to_none=True)
@@ -169,11 +167,17 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
             else:
                 stall = 0
 
-            if step + 1 >= min_steps and stall >= patience:
-                stopped_at = step
+            if fine_start is None and (step + 1) >= min_steps and stall >= patience:
+                if getattr(model, 'analysis_factor', 1) == 1:
+                    pbar.set_postfix({'loss': f'{loss_val:.6f}', 'stopped_at': step})
+                    break
+                model._set_analysis_factor(reset=True)
+                fine_start = step
+            
+            if fine_start is not None and (step - fine_start + 1) >= fine_steps:
                 pbar.set_postfix({'loss': f'{loss_val:.6f}', 'stopped_at': step})
                 break
-
+                
         prev_loss = loss_val
 
     # render designs for the steps we actually ran
@@ -387,7 +391,7 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
 
         # Upsample after stage if allowed
         if stage < resize_num - 1:
-            model.upsample(scale=2)
+            model.upsample(scale=2, max_dim=500)
             if hasattr(model, '_set_warmstart_strength'):
                 model._set_warmstart_strength(0.25)
 
