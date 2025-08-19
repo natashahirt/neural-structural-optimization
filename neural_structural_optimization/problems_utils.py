@@ -28,7 +28,11 @@ class ProblemParams:
     width: int = 60
     height: int = 60
     density: float = 0.5
-
+    
+    # filtering parameters
+    filter_width: float = 1.5  # filter width for density filtering
+    rmin: float = 1.5  # minimum radius for density filtering
+    
     # for beam and cantilever
     force_position: float = 0.5 # 0. is top, 1. is bottom
     support_position: float = 0.25 # for 2-point cantilevers
@@ -72,6 +76,12 @@ class ProblemParams:
             value = getattr(self, param_name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{param_name} must be between 0 and 1, got {value}")
+        
+        # Validate filtering parameters
+        if self.filter_width <= 0.0:
+            raise ValueError(f"filter_width must be positive, got {self.filter_width}")
+        if self.rmin <= 0.0:
+            raise ValueError(f"rmin must be positive, got {self.rmin}")
         
         # Validate special cases
         if self.problem_name == "hoop" and 2 * self.width != self.height:

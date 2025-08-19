@@ -102,7 +102,7 @@ def main():
         # ds_history = train.train_lbfgs(model, max_iterations)
 
         model = models.PixelModel(problem_params=params)
-        ds_history = train.train_progressive(model, max_iterations, resize_num=2, alg=train.train_lbfgs)
+        ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
 
         # model = models.CNNModel(problem_params=params, activation=torch.nn.LeakyReLU, **dynamic_kwargs)
         # ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)

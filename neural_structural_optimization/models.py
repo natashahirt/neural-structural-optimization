@@ -20,25 +20,6 @@ except Exception:
     CLIPLoss = None
 
 
-# ---------- NumPy/Autograd bridge for physics ----------
-
-def _gauss33(device, dtype):
-    k = torch.tensor([[1,2,1],
-                      [2,4,2],
-                      [1,2,1]], dtype=dtype, device=device)
-    k = (k / k.sum()).view(1,1,3,3)        # [C_out=1,C_in=1,H,W]
-    return k
-
-def _logit(p, eps=1e-6):
-    p = torch.clamp(p, eps, 1 - eps)
-    return torch.log(p) - torch.log1p(-p)
-
-def _tv_loss(x):
-    # x in [0,1], shape [B,1,H,W] or [B,3,H,W]
-    dx = x[..., :, 1:] - x[..., :, :-1]
-    dy = x[..., 1:, :] - x[..., :-1, :]
-    return (dx.abs().mean() + dy.abs().mean())
-
 class StructuralLoss(torch.autograd.Function):
     """
     A bridge that lets PyTorch models optimize against your NumPy/HIPS-autograd
@@ -125,31 +106,47 @@ class Model(nn.Module):
         # subclasses define self.z or a generator
         raise NotImplementedError
 
-    def get_physics_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        # Returns mean over batch of structural losses
-        per_example = StructuralLoss.apply(logits, self.env)  # (batch,)
-        return per_example.mean()
-        
-    def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        """if clip_weight is None:
-            clip_weight = getattr(self.clip_loss, "weight", 0.0)
-        if tv_weight is None:
-            tv_weight = 1e-3
-        total_loss = physics_loss
+    # properties
 
-        if self.clip_loss is not None:
-            clip_loss = self.clip_loss.get_text_loss(logits).mean().to(physics_loss.dtype)
-            total_loss = clip_weight * clip_loss"""
-        
-        return self.get_physics_loss(logits)
+    @property
+    def shape(self):
+        return (1, self.env.args['nely'], self.env.args['nelx'])
 
-    def update_problem_params(self, new_params):
+    # functions
+
+    def _get_mask_3d(self, H, W):
+        """Get mask as 3D tensor with shape (1, H, W)."""
+        mask = torch.as_tensor(self.args['mask'], device=self.z.device, dtype=self.z.dtype)
+        if mask.ndim == 0:
+            mask = torch.ones((1, H, W), dtype=self.z.dtype, device=self.z.device) * mask
+        elif mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        return mask
+
+    def _update_problem_params(self, scale=None):
+        new_params = {}
+
+        if scale is not None:
+            new_params['width'] = int(self.problem_params.width * scale)
+            new_params['height'] = int(self.problem_params.height * scale)
+            new_params['rmin'] = self.problem_params.rmin * scale
+            new_params['filter_width'] = self.problem_params.filter_width * scale
+        
         self.problem_params = self.problem_params.copy(**new_params)
         problem = self.problem_params.get_problem()
         new_args = topo_api.specified_task(problem)
         self.env = topo_api.Environment(new_args)
         self.args = new_args
-        return new_args
+
+    # losses
+
+    def get_physics_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        per_example = StructuralLoss.apply(logits, self.env)
+        return per_example.mean()
+        
+    def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        physics_loss = self.get_physics_loss(logits)
+        return physics_loss
 
 
 # ========================================
@@ -168,51 +165,33 @@ class PixelModel(Model):
         z_init = np.broadcast_to(self.env.args['volfrac'] * self.env.args['mask'], self.shape)
         self.z = nn.Parameter(torch.tensor(z_init, dtype=torch.float64), requires_grad=True)
 
-    @property
-    def shape(self):
-        return (1, self.env.args['nely'], self.env.args['nelx'])
-
     def forward(self):
         return self.z
 
-    def loss(self, logits=None, clip_weight=None, tv_weight=None):
+    def loss(self, logits=None):
         logits = self.forward()
-        return self.get_total_loss(logits, clip_weight, tv_weight)
+        return self.get_total_loss(logits)
 
-    def _repeat_upsample(x: torch.Tensor, s: int) -> torch.Tensor:
-        # x: (1, H, W) cell averages; repeat each cell into s×s fine cells
-        x = x.repeat_interleave(s, dim=-2)
-        x = x.repeat_interleave(s, dim=-1)
-        return x
+    def upsample(self, scale=2, preserve_mean=True):
+        with torch.no_grad():
+            z_coarse = self.z.detach()
+            _, H_coarse, W_coarse = self.shape
 
-    def upsample(self, scale=2, soften=True, preserve_mean=True):
-        current_z = self.z.detach()
+            mask_coarse = self._get_mask_3d(H_coarse, W_coarse)
+            
+            # update problem        
+            self._update_problem_params(scale=scale)
 
-        # update problem
-        self.problem_params.width *= scale
-        self.problem_params.height *= scale
-        
-        problem = self.problem_params.get_problem()
-        new_args = topo_api.specified_task(problem)
-        self.env = topo_api.Environment(new_args)
-        self.args = new_args
-        
-        # update model
-        new_height = int(current_z.shape[-2] * scale)
-        new_width = int(current_z.shape[-1] * scale)
+            _, H_fine, W_fine = self.shape
+            z_fine = F.interpolate(z_coarse.unsqueeze(0), size=(H_fine, W_fine), mode='bilinear', align_corners=False).squeeze(0)
+            
+            if preserve_mean:
+                mask_fine = self._get_mask_3d(H_fine, W_fine)
+                mask_old = (z_coarse * mask_coarse).sum() / mask_coarse.sum().clamp_min(1e-12)
+                mask_new = (z_fine * mask_fine).sum() / mask_fine.sum().clamp_min(1e-12)
+                z_fine = (z_fine * (mask_old / mask_new.clamp_min(1e-12))).clamp(0.0, 1.0) * mask_fine
 
-        resized_z = F.interpolate(
-            current_z.unsqueeze(0) if current_z.dim() == 3 else current_z,
-            size=(new_height, new_width),
-            mode='bilinear',
-            align_corners=False
-        )
-
-        if current_z.dim() == 3:
-            resized_z = resized_z.squeeze(0)
-
-        # replace parameter
-        self.z = torch.nn.Parameter(resized_z, requires_grad=True)
+        self.z = torch.nn.Parameter(z_fine, requires_grad=True)
 
 # ========================================
 # CNN
@@ -369,7 +348,7 @@ class CNNModel(Model):
 
         _, H, W = self.shape
         new_H, new_W = H * scale, W * scale
-        self.update_problem_params({'height': new_H, 'width': new_W})
+        self._update_problem_params({'height': new_H, 'width': new_W})
 
         ups = list(map(int, self.conv_upsample))
         ups[-1] *= int(scale)

@@ -118,27 +118,32 @@ def train_adam(model,
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
 def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
-                lr=1.0, history_size=100, line_search='strong_wolfe'):
-    
+                lr=1.0, history_size=100, line_search='strong_wolfe',
+                tol_rel=1e-3, tol_abs=1e-2, patience=5, min_steps=10):
+    """
+    Stop when |Δloss| <= tol_abs OR |Δloss|/|loss_prev| <= tol_rel
+    for `patience` consecutive steps (after min_steps).
+    """
     opt = torch.optim.LBFGS(
         model.parameters(),
         lr=lr,
         history_size=history_size,
-        max_iter=1,                 # <- exactly one internal iter per step
+        max_iter=1,                 # exactly one internal iter per step
         line_search_fn=line_search
     )
 
     losses, frames = [], []
-
     pbar = tqdm(range(max_iterations), desc="L-BFGS")
     prev_loss = None
+    stall = 0
+    stopped_at = None
 
     for step in pbar:
-        
+
         # Adjust warmstart strength at milestones (for CNN models)
         if hasattr(model, '_set_warmstart_strength') and step > 40:
             model._set_warmstart_strength(0.1 if step == 40 else 0.0)
-        
+
         def closure():
             opt.zero_grad(set_to_none=True)
             logits = model()
@@ -146,23 +151,38 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
             loss.backward()
             return loss
 
-        loss = opt.step(closure)
-        
-        losses.append(float(loss.detach()))
-        frames.append(model().detach().cpu().numpy())
-        
-        # Update progress bar
-        if prev_loss is not None:
-            pbar.set_postfix({'loss': f'{loss:.4f}', 'Δ': f'{loss - prev_loss:.2e}'})
-        prev_loss = loss
+        loss = opt.step(closure)     # scalar tensor
+        loss_val = float(loss.detach())
 
+        losses.append(loss_val)
+        frames.append(model().detach().cpu().numpy())
+
+        # progress display
+        if prev_loss is not None:
+            d = loss_val - prev_loss
+            rel = abs(d) / (abs(prev_loss) + 1e-12)
+            pbar.set_postfix({'loss': f'{loss_val:.6f}', 'Δ': f'{d:.2e}', 'relΔ': f'{rel:.2e}'})
+
+            # early stopping check
+            if (abs(d) <= tol_abs) or (rel <= tol_rel):
+                stall += 1
+            else:
+                stall = 0
+
+            if step + 1 >= min_steps and stall >= patience:
+                stopped_at = step
+                pbar.set_postfix({'loss': f'{loss_val:.6f}', 'stopped_at': step})
+                break
+
+        prev_loss = loss_val
+
+    # render designs for the steps we actually ran
     with torch.no_grad():
         designs = [model.env.render(torch.tensor(x), volume_constraint=True) for x in frames]
+
     return optimizer_result_dataset(np.array(losses), np.array(designs), save_intermediate_designs)
 
-def method_of_moving_asymptotes(
-    model, max_iterations, save_intermediate_designs=True, init_model=None
-):
+def method_of_moving_asymptotes(model, max_iterations, save_intermediate_designs=True, init_model=None):
   """Train a model using Method of Moving Asymptotes (MMA) optimization.
   
   Args:
@@ -234,9 +254,7 @@ def method_of_moving_asymptotes(
   return optimizer_result_dataset(
       np.array(losses), np.array(designs), save_intermediate_designs)
 
-def optimality_criteria(
-    model, max_iterations, save_intermediate_designs=True, init_model=None,
-):
+def optimality_criteria(model, max_iterations, save_intermediate_designs=True, init_model=None):
     """Train a model using Optimality Criteria optimization."""
     from neural_structural_optimization import models
     
@@ -337,7 +355,8 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
     """Training with tqdm and progressive upsampling. Works on all algs."""
 
     ds_history = []
-
+  
+  
     for stage in range(resize_num):
         print(f"\nTraining stage {stage + 1}/{resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
 

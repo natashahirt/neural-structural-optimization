@@ -89,7 +89,7 @@ def UpSampling2D(factor):
   return nn.Upsample(scale_factor=factor, mode='bilinear', align_corners=False)
 
 def Conv2D(filters, kernel_size, **kwargs):
-  """PyTorch equivalent of TensorFlow's Conv2D."""`
+  """PyTorch equivalent of TensorFlow's Conv2D."""
   padding = kwargs.get('padding', 'same')
   if padding == 'same':
     padding = kernel_size // 2 if isinstance(kernel_size, int) else (kernel_size[0] // 2, kernel_size[1] // 2)
