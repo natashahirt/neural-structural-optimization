@@ -98,8 +98,11 @@ def main():
         # model = models.PixelModel(problem_params=params)
         # ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)
 
+        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
+        # ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
+
         model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
+        ds_history = train.train_pixel_refine(model, max_iterations, resize_num=4, alg=train.train_lbfgs)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
@@ -139,9 +142,20 @@ def main():
             axes = [axes]
         fig.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
 
+        # Get problem object for proper rendering
+        problem = problems.PROBLEMS_BY_NAME.get(params.problem_name)
+        
         for i, (ax, ds) in enumerate(zip(axes, ds_history)):
             final_design = ds.design.isel(step=ds.loss.argmin())
-            im = ax.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+            
+            if problem:
+                # Use pipeline_utils for proper design rendering
+                image = pipeline_utils.image_from_design(final_design, problem)
+                ax.imshow(np.array(image))
+            else:
+                # Fallback to simple visualization
+                ax.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+            
             ax.set_title(f'Stage {i+1}: {ds.sizes["y"]}x{ds.sizes["x"]}')
             ax.axis('off')
 

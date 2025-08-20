@@ -124,10 +124,14 @@ def train_adam(model,
 
 def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
                 lr=1.0, history_size=100, line_search='strong_wolfe',
-                tol_rel=1e-3, tol_abs=1e-2, patience=5, min_steps=10):
+                tol_rel=1e-3, tol_abs=1e-2, patience=5, min_steps=10, coarse_start=True):
     """
     Stop when |Δloss| <= tol_abs OR |Δloss|/|loss_prev| <= tol_rel
     for `patience` consecutive steps (after min_steps).
+    
+    Args:
+        coarse_start: If True, start with coarse analysis and switch to fine when stalled.
+                     If False, use fine analysis from the beginning.
     """
     opt = torch.optim.LBFGS(
         model.parameters(),
@@ -146,7 +150,7 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
 
     for step in pbar:
 
-        if step > 15:
+        if isinstance(model, CNNModel) and step > 15:
             model._unfreeze_all()
 
         def closure():
@@ -175,7 +179,7 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
                 stall = 0
 
             if fine_start is None and (step + 1) >= min_steps and stall >= patience:
-                if isinstance(model, PixelModel) and getattr(model, 'analysis_factor', 1) != 1:
+                if coarse_start and isinstance(model, PixelModel) and getattr(model, 'analysis_factor', 1) != 1:
                     model._set_analysis_factor(reset=True)
                     fine_start = step
                 else:
@@ -375,28 +379,6 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
         ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs)
         ds_history.append(ds)
 
-        # # Plot current stage results
-        # plt.figure(figsize=(8, 4))
-        
-        # # Plot loss curve
-        # plt.subplot(1, 2, 1)
-        # loss_df = ds.loss.to_pandas()
-        # plt.plot(loss_df, linewidth=2)
-        # plt.title(f'Stage {stage + 1} Loss')
-        # plt.xlabel('Iteration')
-        # plt.ylabel('Loss')
-        # plt.grid(True)
-        
-        # # Plot final design
-        # plt.subplot(1, 2, 2)
-        # final_design = ds.design.isel(step=ds.loss.argmin())
-        # plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
-        # plt.title(f'Design ({model.shape[1]}x{model.shape[2]})')
-        # plt.axis('off')
-        
-        # plt.tight_layout()
-        # plt.show()
-
         # Upsample after stage if allowed
         if stage < resize_num - 1:
             if isinstance(model, PixelModel):
@@ -405,4 +387,33 @@ def train_progressive(model, max_iterations, resize_num=2, alg=train_adam, save_
                 model.upsample(scale=2, freeze_transferred=True)
 
     # Render all frames
+    return ds_history
+
+def train_pixel_refine(cnn_model, max_iterations, resize_num=2, alg=train_lbfgs, save_intermediate_designs=True):
+  
+    ds_history = []
+    model = cnn_model
+
+    for stage in range(resize_num):
+        if isinstance(model, CNNModel) and max(model.shape[1], model.shape[2]) > 200:
+            print(f"\nSwitching to PixelModel at resolution: {model.shape[1]}x{model.shape[2]}")
+            pixel_model = PixelModel(problem_params=model.problem_params)
+            
+            # Initialize PixelModel with CNNModel's design
+            with torch.no_grad():
+                cnn_logits = model.forward()
+                pixel_model.z.data.copy_(cnn_logits)
+            
+            model = pixel_model
+
+        print(f"\nTraining stage {stage + 1}/{resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
+        ds = alg(model, max_iterations, save_intermediate_designs=save_intermediate_designs, coarse_start=False)
+        ds_history.append(ds)
+
+        if stage < resize_num - 1:
+            if isinstance(model, PixelModel):
+                model.upsample(scale=2, max_dim=500)
+            elif isinstance(model, CNNModel):
+                model.upsample(scale=2, freeze_transferred=True)
+
     return ds_history

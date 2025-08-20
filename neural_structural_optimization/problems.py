@@ -547,7 +547,6 @@ def multistory_building(width=32, height=32, density=0.3, num_stories=16):
   problem.name = f"multistory_building_{width}x{height}"
   return problem
 
-"""
 # pylint: disable=line-too-long
 PROBLEMS_BY_CATEGORY = {
     # idealized beam and cantilevers
@@ -722,10 +721,10 @@ PROBLEMS_BY_CATEGORY = {
     ],
     'multistory_building': [
         multistory_building(32, 64, density=0.5),
-        multistory_building(64, 128, interval=32, density=0.4),
-        multistory_building(128, 256, interval=64, density=0.3),
-        multistory_building(128, 512, interval=64, density=0.25),
-        multistory_building(128, 512, interval=128, density=0.2),
+        multistory_building(64, 128, num_stories=32, density=0.4),
+        multistory_building(128, 256, num_stories=64, density=0.3),
+        multistory_building(128, 512, num_stories=64, density=0.25),
+        multistory_building(128, 512, num_stories=128, density=0.2),
     ],
 }
 
@@ -736,4 +735,3 @@ for problem_class, problem_list in PROBLEMS_BY_CATEGORY.items():
     problem.name = name
     assert name not in PROBLEMS_BY_NAME, f'redundant name {name}'
     PROBLEMS_BY_NAME[name] = problem
-"""

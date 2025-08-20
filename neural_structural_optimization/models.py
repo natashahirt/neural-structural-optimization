@@ -100,8 +100,13 @@ class Model(nn.Module):
         self.env = topo_api.Environment(args)
         self.args = args
         
+        # Initialize mask tensor once
+        self.mask = torch.as_tensor(self.args['mask'], dtype=torch.float64)
+        
         self.analysis_factor = 1
         self.analysis_env = self.env
+
+        
 
     def forward(self):
         # subclasses define self.z or a generator
@@ -138,6 +143,9 @@ class Model(nn.Module):
         new_args = topo_api.specified_task(problem)
         self.env = topo_api.Environment(new_args)
         self.args = new_args
+        
+        # Update mask for new problem parameters
+        self.mask = torch.as_tensor(self.args['mask'], dtype=torch.float64)
 
     def _set_analysis_factor(self, max_dim: int = 500, reset=False):
         _, H, W = self.shape
@@ -218,31 +226,47 @@ class PixelModel(Model):
         logits = self.forward()
         return self.get_total_loss(logits)
 
-    def upsample(self, scale=2, preserve_mean=True, max_dim: int = 500):
-        with torch.no_grad():
-            z_coarse = self.z.detach()
-            _, H_coarse, W_coarse = self.shape
+    @torch.no_grad()
+    def upsample(self, scale=2, preserve_mean=True, max_dim: int = 500, eps=1e-5, void_density=0.0):
+        z_coarse = self.z.detach()
+        _, H_coarse, W_coarse = self.shape
 
-            mask_coarse = self._get_mask_3d(H_coarse, W_coarse)
-            
-            # update problem        
-            self._update_problem_params(scale=scale)
+        mask_coarse = self._get_mask_3d(H_coarse, W_coarse)
+        x_coarse = (z_coarse * mask_coarse).clamp(0.0,1.0)
+        target_mean = (x_coarse.sum() / mask_coarse.sum().clamp_min(1)).item()
+        
+        # update problem        
+        self._update_problem_params(scale=scale)
+        _, H_fine, W_fine = self.shape
+        mask_fine = self._get_mask_3d(H_fine, W_fine)
 
-            _, H_fine, W_fine = self.shape
-            z_fine = F.interpolate(z_coarse.unsqueeze(0), size=(H_fine, W_fine), mode='bilinear', align_corners=False).squeeze(0)
-            z_fine = z_fine.clamp(0.0,1.0)
+        x_coarse_full = x_coarse + void_density * (1.0 - mask_coarse)
+        z_log_coarse = torch.logit(x_coarse_full.clamp(eps,1-eps))
 
-            if preserve_mean:
-                mask_fine = self._get_mask_3d(H_fine, W_fine)
-                mask_old = (z_coarse * mask_coarse).sum() / mask_coarse.sum().clamp_min(1e-12)
-                mask_new = (z_fine * mask_fine).sum() / mask_fine.sum().clamp_min(1e-12)
-                z_fine = (z_fine * (mask_old / mask_new.clamp_min(1e-12))).clamp(0.0, 1.0) * mask_fine
+        z_log_fine = F.interpolate(z_log_coarse.unsqueeze(0), size=(H_fine, W_fine), mode='bilinear', align_corners=False).squeeze(0)
+        
+        void_logit = torch.logit(torch.tensor(void_density, dtype=z_coarse.dtype, device=z_coarse.device).clamp(eps,1-eps))
+        z_log_fine = torch.where(mask_fine > 0, z_log_fine, torch.full_like(z_log_fine, void_logit))
+
+        if preserve_mean:
+            lo, hi = -20, 20
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                m = (torch.sigmoid(z_log_fine + mid) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
+                if abs(m - target_mean) < 1e-6: # early convergence
+                    break
+                if m < target_mean:
+                    lo = mid
+                else:
+                    hi = mid
+            z_log_fine = z_log_fine + 0.5 * (lo + hi)
      
-            # check for analysis problem
-            self._set_analysis_factor(max_dim=max_dim)
+        z_fine = torch.sigmoid(z_log_fine)
+        z_fine = z_fine * mask_fine + void_density * (1.0-mask_fine)
 
+        # check for analysis problem
+        self._set_analysis_factor(max_dim=max_dim)
         self.z = torch.nn.Parameter(z_fine, requires_grad=True)
-
 
 # ========================================
 # CNN
