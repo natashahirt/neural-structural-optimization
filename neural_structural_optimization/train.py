@@ -150,6 +150,10 @@ def train_lbfgs(model, max_iterations, save_intermediate_designs=True,
 
     for step in pbar:
 
+        if not coarse_start:
+            model.analysis_factor = 1
+            model.analysis_env = model.env
+
         if isinstance(model, CNNModel) and step > 15:
             model._unfreeze_all()
 

@@ -249,19 +249,25 @@ class PixelModel(Model):
         z_log_fine = torch.where(mask_fine > 0, z_log_fine, torch.full_like(z_log_fine, void_logit))
 
         if preserve_mean:
-            lo, hi = -20, 20
-            for _ in range(30):
-                mid = 0.5 * (lo + hi)
-                m = (torch.sigmoid(z_log_fine + mid) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
-                if abs(m - target_mean) < 1e-6: # early convergence
-                    break
-                if m < target_mean:
-                    lo = mid
-                else:
-                    hi = mid
-            z_log_fine = z_log_fine + 0.5 * (lo + hi)
+            # Try analytical first, fall back to Newton if needed
+            current_mean = (torch.sigmoid(z_log_fine) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
+            
+            if abs(current_mean - target_mean) > 1e-4:  # only if significant difference
+                b = 0.0
+                for _ in range(8):  # max 8 iterations
+                    m = (torch.sigmoid(z_log_fine + b) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
+                    if abs(m - target_mean) < 1e-6:
+                        break
+                    sigmoid_b = torch.sigmoid(z_log_fine + b)
+                    dm_db = (sigmoid_b * (1 - sigmoid_b) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
+                    step = (target_mean - m) / (dm_db + 1e-8)
+                    b += step
+                    if abs(step) < 1e-6:
+                        break
+        
+        z_log_fine = z_log_fine + b
      
-        z_fine = torch.sigmoid(z_log_fine)
+        z_fine = torch.sigmoid(z_log_fine / 1.4) # T = 1.4 = temperature
         z_fine = z_fine * mask_fine + void_density * (1.0-mask_fine)
 
         # check for analysis problem
