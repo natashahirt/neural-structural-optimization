@@ -4,6 +4,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 import kornia.augmentation as K
 import clip
+import math
+from typing import Sequence, Tuple
+
+# ---- multi-patch pyramid and tiling helpers ----
+def _affine_grid_from_boxes(H: int, W: int, boxes_xywh: torch.Tensor, out: Tuple[int,int]):
+    """
+    boxes_xywh: [N,4] in absolute pixels (cx, cy, w, h) on the input image (H,W).
+    Returns sampling grid for F.grid_sample to produce [N, C, outH, outW].
+    """
+    assert boxes_xywh.ndim == 2 and boxes_xywh.shape[1] == 4
+    cx = boxes_xywh[:, 0] * (2.0 / W) - 1.0
+    cy = boxes_xywh[:, 1] * (2.0 / H) - 1.0
+    sx = boxes_xywh[:, 2] / W
+    sy = boxes_xywh[:, 3] / H
+    # Map output ([-1,1]) -> selected window centered at (cx,cy) with half-width sx and half-height sy
+    # Note: for affine_grid, the scale maps full [-1,1] span to 2*sx in normalized coords, so use sx, sy directly.
+    theta = boxes_xywh.new_zeros((boxes_xywh.size(0), 2, 3))
+    theta[:, 0, 0] = sx
+    theta[:, 1, 1] = sy
+    theta[:, 0, 2] = cx
+    theta[:, 1, 2] = cy
+    grid = F.affine_grid(theta, size=(boxes_xywh.size(0), 3, out[0], out[1]), align_corners=False)
+    return grid
+
+def _fixed_grid_boxes(H: int, W: int, patch_px: int, stride_px: int, jitter_frac: float = 0.0, device=None):
+    """
+    Create a fixed, overlapping grid of (cx, cy, w, h) boxes in pixels covering the image.
+    patch_px: square crop (w=h=patch_px at input scale)
+    stride_px: stride between patch centers
+    jitter_frac: random jitter up to +/- jitter_frac * stride_px on centers (per patch)
+    """
+    xs = torch.arange(patch_px//2, W - patch_px//2 + 1, stride_px, device=device)
+    ys = torch.arange(patch_px//2, H - patch_px//2 + 1, stride_px, device=device)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    cx = gx.reshape(-1).float()
+    cy = gy.reshape(-1).float()
+    if jitter_frac > 0:
+        jx = (torch.rand_like(cx) - 0.5) * 2.0 * (jitter_frac * stride_px)
+        jy = (torch.rand_like(cy) - 0.5) * 2.0 * (jitter_frac * stride_px)
+        cx = (cx + jx).clamp(patch_px/2, W - patch_px/2)
+        cy = (cy + jy).clamp(patch_px/2, H - patch_px/2)
+    w = torch.full_like(cx, float(patch_px))
+    h = torch.full_like(cy, float(patch_px))
+    return torch.stack([cx, cy, w, h], dim=1)  # [N,4]
+
+def _random_boxes_multiscale(H: int, W: int,
+                             patch_fracs: Sequence[float],
+                             counts: Sequence[int],
+                             min_px: int,
+                             device=None):
+    """
+    Random boxes at multiple scales, expressed as fractions of min(H,W).
+    Ensures min side >= min_px.
+    """
+    assert len(patch_fracs) == len(counts)
+    MN = min(H, W)
+    boxes = []
+    for f, n in zip(patch_fracs, counts):
+        size = max(int(round(MN * float(f))), min_px)
+        if size > min(H, W):
+            size = min(H, W)
+        # sample centers uniformly feasible for this size
+        cx = torch.randint(low=size//2, high=W - size//2 + 1, size=(n,), device=device).float()
+        cy = torch.randint(low=size//2, high=H - size//2 + 1, size=(n,), device=device).float()
+        w  = torch.full_like(cx, float(size))
+        h  = torch.full_like(cy, float(size))
+        boxes.append(torch.stack([cx, cy, w, h], dim=1))
+    return torch.cat(boxes, dim=0) if boxes else torch.empty(0,4, device=device)
+
+def _clip_diy_weights(H: int, W: int, patch_fracs: Sequence[float]) -> torch.Tensor:
+    """
+    Heuristic per-scale weights that:
+      * favor global at low res,
+      * balanced at mid res,
+      * favor local at high res.
+    Returns per-frac weights (sum to 1).
+    """
+    mn = min(H, W)
+    # normalize ~ [0,1] where 0: <=256, 1: >=1024
+    t = float(mn - 256) / float(max(1024 - 256, 1))
+    t = max(0.0, min(1.0, t))
+    # base weights per scale index (0=global largest frac, last=local smallest)
+    n = len(patch_fracs)
+    idx = torch.arange(n).float()
+    # linear ramp from global-heavy to local-heavy across t
+    w_global = torch.softmax(-(idx)* (0.5 + 1.0*t), dim=0)
+    w_local  = torch.softmax(idx * (0.5 + 1.0*t), dim=0)
+    # blend to keep some global signal at high res and some local at low res
+    w = 0.5 * w_global + 0.5 * w_local
+    return (w / w.sum()).detach()
 
 @torch.no_grad()
 def _load_clip_model(clip_model_name, device):
@@ -19,6 +109,7 @@ def _encode_texts(clip_model, texts, device):
     z = clip_model.encode_text(tokens).float()
     return F.normalize(z, dim=-1)
 
+@torch.no_grad()
 def _encode_image_microbatch(encoder: nn.Module, imgs: torch.Tensor, chunk: int = 32, device: torch.device | None = None):
     """Encode images in microbatches to manage memory usage."""
     device = device or imgs.device
@@ -212,6 +303,17 @@ class CLIPLoss(nn.Module):
         conv_layer_weights = (1.0, 0.0, 0.0, 0.0, 0.0),
         use_arcsin_transform: bool = True,
         margin: float = 0.1,
+        # NEW: multi-patch pyramid and tiling controls
+        use_patch_pyramid: bool = True,
+        patch_fracs: Tuple[float,...] = (1.00, 0.50, 0.25),   # relative to min(H,W)
+        crops_per_frac: Tuple[int,...] = (4, 8, 16),
+        min_patch_px: int = 96,
+        hard_mining_frac: float = 0.25,     # weight top-k hardest patches more
+        fixed_grid_at_highres: bool = True,  # switch to fixed tiling for large images
+        tiled_min_res: int = 640,            # if min(H,W) >= this, enable tiling
+        tile_px: int = 336,                   # tile size at input scale
+        tile_overlap: float = 0.33,           # 0..0.9
+        tile_jitter_frac: float = 0.05,       # small jitter for tiles
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -222,6 +324,18 @@ class CLIPLoss(nn.Module):
         self.margin = float(margin)
         self.use_pairwise_spread = True
         self.consistency_weight = 0.03
+
+        # Multi-patch pyramid and tiling parameters
+        self.use_patch_pyramid = use_patch_pyramid
+        self.patch_fracs       = tuple(patch_fracs)
+        self.crops_per_frac    = tuple(crops_per_frac)
+        self.min_patch_px      = int(min_patch_px)
+        self.hard_mining_frac  = float(hard_mining_frac)
+        self.fixed_grid_at_highres = bool(fixed_grid_at_highres)
+        self.tiled_min_res     = int(tiled_min_res)
+        self.tile_px           = int(tile_px)
+        self.tile_overlap      = float(tile_overlap)
+        self.tile_jitter_frac  = float(tile_jitter_frac)
 
         # Models
         self.clip_model, _    = _load_clip_model(clip_model_name, device=self.device)
@@ -338,12 +452,12 @@ class CLIPLoss(nn.Module):
         if self.device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 _, x_feats = self.rn_trunk(x_aug)
-            with torch.no_grad():  # Use no_grad instead of inference_mode for target
+            with torch.inference_mode():
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     _, y_feats = self.rn_trunk(y_aug)
         else:
             _, x_feats = self.rn_trunk(x_aug)
-            with torch.no_grad():  # Use no_grad instead of inference_mode for target
+            with torch.inference_mode():
                 _, y_feats = self.rn_trunk(y_aug)
 
         conv_losses = self.distance_metrics[self.conv_loss_type](x_feats, y_feats)
@@ -366,24 +480,120 @@ class CLIPLoss(nn.Module):
 
     # ---- semantics: image↔text (positives + optional negatives with hinge) ----
     def evaluate_image_to_text(self, input_image: torch.Tensor, use_arcsin_transform: bool = True):
-        crops = self.cropper.single(_ensure_nchw3(input_image))
-        imgs  = _preprocess_image_for_clip(crops, self.clip_input_res, self.clip_mean, self.clip_std)
-        z_img = _encode_image_microbatch(self.clip_encoder, imgs, chunk=32, device=self.device)
-        z_img = F.normalize(z_img, dim=-1)
+        """
+        Multi-scale CLIP-DIY style: combine random multi-frac crops (global/mid/local)
+        and, for high-res images, a fixed overlapping tile coverage. Optionally hard-mines
+        the worst-matching patches for stronger gradients.
+        """
+        x = _ensure_nchw3(input_image)
+        B, C, H, W = x.shape
+        assert B == 1, "This implementation assumes a single image tensor."
 
-        # positive loss
-        L_pos = self._spherical_loss(z_img, self.e_pos, use_arcsin_transform)
+        crops = []
 
-        # negative hinge (margin + cos_neg - cos_pos)
+        # --- A) CLIP-DIY style random pyramid (global/mid/local) ---
+        if self.use_patch_pyramid:
+            boxes_rand = _random_boxes_multiscale(
+                H, W,
+                patch_fracs=self.patch_fracs,
+                counts=self.crops_per_frac,
+                min_px=self.min_patch_px,
+                device=x.device
+            )
+            if boxes_rand.numel() > 0:
+                grid_rand = _affine_grid_from_boxes(H, W, boxes_rand, (self.clip_input_res, self.clip_input_res))
+                x_rep = x.repeat(boxes_rand.size(0), 1, 1, 1)
+                crops_rand = F.grid_sample(x_rep, grid_rand, mode='bilinear', align_corners=False)
+                crops.append(crops_rand)
+
+        # --- B) Ultra-high-res: fixed overlapping tiles for coverage ---
+        mn = min(H, W)
+        if self.fixed_grid_at_highres and mn >= self.tiled_min_res:
+            stride = max(1, int(round(self.tile_px * (1.0 - self.tile_overlap))))
+            boxes_fix = _fixed_grid_boxes(H, W, patch_px=self.tile_px, stride_px=stride,
+                                          jitter_frac=self.tile_jitter_frac, device=x.device)
+            if boxes_fix.numel() > 0:
+                grid_fix = _affine_grid_from_boxes(H, W, boxes_fix, (self.clip_input_res, self.clip_input_res))
+                x_rep = x.repeat(boxes_fix.size(0), 1, 1, 1)
+                crops_fix = F.grid_sample(x_rep, grid_fix, mode='bilinear', align_corners=False)
+                crops.append(crops_fix)
+
+        # Fallback: if nothing produced (tiny image), just use standard random crops
+        if not crops:
+            crops = [self.cropper.single(x)]
+        imgs = torch.cat(crops, dim=0)  # [Ncuts,3,224,224] (or 336 if your model has that input_res)
+
+        # CLIP preprocess (your function handles std/mean & resize if needed)
+        imgs = _preprocess_image_for_clip(imgs, self.clip_input_res, self.clip_mean, self.clip_std)
+
+        # Encode all crops with CLIP
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                z_img = self.clip_encoder(imgs).float()
+        else:
+            z_img = self.clip_encoder(imgs).float()
+        z_img = F.normalize(z_img, dim=-1)  # [Ncuts, D]
+
+        # Positive loss per-crop
+        if self.e_pos is None:
+            L_pos = z_img.new_tensor(0.0)
+            Ncuts = z_img.size(0)
+        else:
+            # spherical (on unit sphere) or cosine; compute per-crop
+            if use_arcsin_transform:
+                d = torch.norm(z_img - self.e_pos[None, :], dim=1).clamp(0.0, 2.0 - 1e-6)
+                per_crop = (torch.arcsin(d * 0.5) ** 2)  # [Ncuts]
+            else:
+                cos = (z_img * self.e_pos[None, :]).sum(dim=1).clamp(-1+1e-6, 1-1e-6)
+                per_crop = (1.0 - cos)
+
+            # Optional scale-aware weighting (global vs local)
+            # Build weights per-crop based on which frac bucket it came from.
+            # For simplicity, infer counts by how we stacked crops above:
+            weights = torch.ones_like(per_crop)
+            offset = 0
+            if self.use_patch_pyramid:
+                # make per-scale weights
+                scale_w = _clip_diy_weights(H, W, self.patch_fracs).to(per_crop.device)
+                for i, cnt in enumerate(self.crops_per_frac):
+                    if cnt <= 0: 
+                        continue
+                    weights[offset : offset + cnt] = scale_w[i]
+                    offset += cnt
+            if self.fixed_grid_at_highres and mn >= self.tiled_min_res:
+                # tiles get equal per-patch weight but are many; normalize later
+                tile_cnt = (per_crop.numel() - offset)
+                if tile_cnt > 0:
+                    weights[offset : offset + tile_cnt] = weights[offset : offset + tile_cnt] * (weights.mean() if offset > 0 else 1.0)
+
+            # Hard mining: upweight top-k hardest patches
+            if self.hard_mining_frac > 0:
+                Ncuts = per_crop.numel()
+                k = max(1, int(round(self.hard_mining_frac * Ncuts)))
+                vals, idxs = torch.topk(per_crop, k=k, largest=True, sorted=False)
+                # 2x weight on hardest, keep others at 1x of their current weight
+                w = weights.clone()
+                w[idxs] = w[idxs] * 2.0
+                weights = w
+
+            # Final positive loss: weighted mean
+            L_pos = (weights * per_crop).sum() / (weights.sum().clamp_min(1e-8))
+            Ncuts = per_crop.size(0)
+
+        # Negative hinge per-crop (optional)
         L_neg = z_img.new_tensor(0.0)
         if self._E_neg_bank is not None and self._E_neg_bank.numel() > 0:
             sims_neg = z_img @ self._E_neg_bank.t()                    # [B,K]
             cos_neg_max = sims_neg.max(dim=1).values                   # [B]
-            cos_pos = (z_img * self.e_pos[None, :]).sum(dim=1) if self.e_pos is not None else z_img.new_zeros(z_img.size(0))
+            cos_pos = (z_img * self.e_pos[None, :]).sum(dim=1) if self.e_pos is not None else z_img.new_zeros(z_img.size(0), device=z_img.device, dtype=z_img.dtype)
             hinge = F.relu(self.margin + cos_neg_max - cos_pos)
-            L_neg = hinge.mean()
+            # Match positive weights if computed, else simple mean
+            if 'weights' in locals():
+                L_neg = (weights * hinge).sum() / (weights.sum().clamp_min(1e-8))
+            else:
+                L_neg = hinge.mean()
 
-        # pairwise cosine spread loss
+        # Pairwise cosine spread loss
         L_spread = z_img.new_tensor(0.0)
         if self.use_pairwise_spread:
             L_spread = _pairwise_cosine_spread(z_img, weights=None)  # equal weights for all crops

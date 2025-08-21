@@ -23,6 +23,11 @@ import pandas as pd
 import numpy as np
 import torch
 
+# Enable performance optimizations for modern NVIDIA GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 from neural_structural_optimization.structural import utils as pipeline_utils
 from neural_structural_optimization.structural import problems
 from neural_structural_optimization import models
@@ -67,10 +72,11 @@ def main():
 
         # ViT-B/32, RN50
         clip_loss = CLIPLoss(
-            clip_model_name="ViT-L/14",
+            clip_model_name="ViT-B/32",
             clip_rn_model_name="RN50",
             device=device,
             positive_prompts=["x ray of human skeleton"],   # or "x ray of human skeleton"
+            negative_prompts=["blurry", "low quality", "cartoon"],  # Multiple negatives
             pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
         )
 
@@ -100,7 +106,7 @@ def main():
 
         # Example 2: CNNModel with L-BFGS optimization
         model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
+        trainer = ProgressiveTrainer(model, max_iterations, resize_num=1)
         ds_history = trainer.train(LBFGS_Optimizer)
 
         # # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
@@ -121,8 +127,11 @@ def main():
         print(f"\nOptimization completed!")
         print(f"Number of stages: {len(ds_history)}")
 
+        # Create and save all plots first
+        print("\nCreating and saving plots...")
+        
         # Create loss comparison plot
-        print("\nCreating loss comparison plot...")
+        print("Creating loss comparison plot...")
         plt.figure(figsize=(10, 6))
         for i, ds in enumerate(ds_history):
             ds = ds.rename({'step': 'iteration'})
@@ -135,11 +144,12 @@ def main():
         plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
         seaborn.despine()
         plt.tight_layout()
-        plt.savefig(f'script/test_results_pytorch/optimization_comparison_loss{filename_suffix}.png', dpi=150, bbox_inches='tight')
-        plt.show()
+        loss_plot_path = f'script/test_results_pytorch/optimization_comparison_loss{filename_suffix}.png'
+        plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()  # Close the figure to free memory
 
         # Create final designs comparison plot
-        print("\nCreating final designs plot...")
+        print("Creating final designs plot...")
         fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
         
         if not isinstance(axes, (list, np.ndarray)):
@@ -164,7 +174,29 @@ def main():
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'script/test_results_pytorch/final_designs{filename_suffix}.png', dpi=150, bbox_inches='tight')
+        designs_plot_path = f'script/test_results_pytorch/final_designs{filename_suffix}.png'
+        plt.savefig(designs_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()  # Close the figure to free memory
+        
+        print("All plots saved successfully!")
+        
+        # Now display the saved plots
+        print("\nDisplaying saved plots...")
+        
+        # Display loss comparison plot
+        loss_img = plt.imread(loss_plot_path)
+        plt.figure(figsize=(10, 6))
+        plt.imshow(loss_img)
+        plt.axis('off')
+        plt.title("Loss Comparison Across Stages")
+        plt.show()
+
+        # Display final designs plot
+        designs_img = plt.imread(designs_plot_path)
+        plt.figure(figsize=(4*len(ds_history), 6))
+        plt.imshow(designs_img)
+        plt.axis('off')
+        plt.title(f'Final Designs: {params.problem_name}')
         plt.show()
 
         # Save results
