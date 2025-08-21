@@ -1,3 +1,9 @@
+"""API interface for structural optimization.
+
+This module provides a clean interface between physics engine and neural networks,
+handling problem parameter setup, boundary conditions, forces, and constraints.
+"""
+
 # lint as python3
 # Copyright 2019 Google LLC.
 #
@@ -24,7 +30,7 @@ overview:
 """
 
 import autograd.numpy as np
-from neural_structural_optimization import topo_physics
+from neural_structural_optimization.structural import physics
 from typing import Any, Dict
 
 import numpy as _np
@@ -125,7 +131,7 @@ class Environment:
         # normalize args to NumPy once
         self.args = _args_to_numpy(args)
         # stiffness matrix (NumPy)
-        self.ke = topo_physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
+        self.ke = physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
 
     def reshape(self, params):
         p = _to_numpy(params)  # ensure NumPy
@@ -133,17 +139,17 @@ class Environment:
 
     def render(self, params, volume_constraint=True):
         x2d = self.reshape(params)
-        return topo_physics.physical_density(
+        return physics.physical_density(
             x2d, self.args, volume_constraint=volume_constraint, cone_filter=False
         )
 
     def objective(self, params, volume_constraint=False):
         x2d = self.reshape(params)
-        return topo_physics.objective(
+        return physics.objective(
             x2d, self.ke, self.args, volume_constraint=volume_constraint, cone_filter=True
         )
 
     def constraint(self, params):
         x2d = self.reshape(params)
-        vol = topo_physics.mean_density(x2d, self.args)
+        vol = physics.mean_density(x2d, self.args)
         return vol - self.args["volfrac"]

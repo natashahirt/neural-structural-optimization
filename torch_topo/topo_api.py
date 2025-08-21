@@ -1,5 +1,5 @@
 # lint as python3
-# PyTorch-native wrapper around topo_physics
+# PyTorch-native wrapper around physics
 
 from __future__ import annotations
 from typing import Any, Dict, Optional, Union
@@ -10,7 +10,7 @@ except Exception as e:
     raise RuntimeError("This module requires PyTorch.") from e
 
 import numpy as _np  # only for tolerant boundary input ingestion
-from neural_structural_optimization import topo_physics
+from neural_structural_optimization import physics
 
 DTYPE = torch.float64  # keep double for stability, as in your pipeline
 
@@ -220,8 +220,8 @@ class Environment:
         # Normalize args to torch once
         self.args = _args_to_torch(args, dtype=self.dtype, device=self.device)
 
-        # Stiffness matrix (torch). Handle either torch or numpy return from topo_physics.
-        ke = topo_physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
+        # Stiffness matrix (torch). Handle either torch or numpy return from physics.
+        ke = physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
         if not torch.is_tensor(ke):
             ke = torch.as_tensor(ke, dtype=self.dtype, device=self.device)
         else:
@@ -277,7 +277,7 @@ class Environment:
     ) -> torch.Tensor:
         """Apply physical density mapping."""
         x2d = self.reshape(params)
-        return topo_physics.physical_density(
+        return physics.physical_density(
             x2d,
             self.args,
             volume_constraint=volume_constraint,
@@ -295,13 +295,13 @@ class Environment:
         # Get stiffness matrix (cached or compute)
         ke = self.ke
         if ke is None:  # if not persisted
-            ke = topo_physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
+            ke = physics.get_stiffness_matrix(self.args["young"], self.args["poisson"])
             if not torch.is_tensor(ke):
                 ke = torch.as_tensor(ke, dtype=self.dtype, device=self.device)
             else:
                 ke = ke.to(dtype=self.dtype, device=self.device)
 
-        return topo_physics.objective(
+        return physics.objective(
             x2d,
             ke,
             self.args,
@@ -312,7 +312,7 @@ class Environment:
     def constraint(self, params: Union[torch.Tensor, _np.ndarray]) -> torch.Tensor:
         """Compute volume constraint violation."""
         x2d = self.reshape(params)
-        vol = topo_physics.mean_density(x2d, self.args)
+        vol = physics.mean_density(x2d, self.args)
         # Return a scalar tensor matching autograd expectations
         return vol - float(self.args["volfrac"])
 

@@ -1,3 +1,9 @@
+"""Physics computation for structural optimization.
+
+This module contains the core physics computations for topology optimization,
+including finite element analysis, compliance calculation, and structural analysis.
+"""
+
 # lint as python3
 # Copyright 2019 Google LLC.
 #
@@ -34,7 +40,7 @@ http://www.topopt.mek.dtu.dk/Apps-and-software/Efficient-topology-optimization-i
 
 import autograd
 import autograd.numpy as np
-from neural_structural_optimization import autograd_lib
+from neural_structural_optimization.structural import autograd
 from neural_structural_optimization import caching
 
 # A note on conventions:
@@ -84,13 +90,13 @@ def physical_density(x, args, volume_constraint=False, cone_filter=True):
   if volume_constraint:
     mask = np.broadcast_to(args['mask'], x.shape) > 0
     x_designed = sigmoid_with_constrained_mean(x[mask], args['volfrac'])
-    x_flat = autograd_lib.scatter1d(
+    x_flat = autograd.scatter1d(
         x_designed, np.flatnonzero(mask), x.size)
     x = x_flat.reshape(x.shape)
   else:
     x = x * args['mask']
   if cone_filter:
-    x = autograd_lib.cone_filter(x, args['filter_width'], args['mask'])
+    x = autograd.cone_filter(x, args['filter_width'], args['mask'])
   return x
 
 
@@ -117,7 +123,7 @@ def get_stiffness_matrix(young, poisson):
 
 @caching.ndarray_safe_lru_cache(1)
 def _get_dof_indices(freedofs, fixdofs, k_xlist, k_ylist):
-  index_map = autograd_lib.inverse_permutation(
+  index_map = autograd.inverse_permutation(
       np.concatenate([freedofs, fixdofs]))
   keep = np.isin(k_xlist, freedofs) & np.isin(k_ylist, freedofs)
   i = index_map[k_ylist][keep]
@@ -135,7 +141,7 @@ def displace(x_phys, ke, forces, freedofs, fixdofs, *,
   index_map, keep, indices = _get_dof_indices(
       freedofs, fixdofs, k_ylist, k_xlist
   )
-  u_nonzero = autograd_lib.solve_coo(k_entries[keep], indices, forces[freedofs],
+  u_nonzero = autograd.solve_coo(k_entries[keep], indices, forces[freedofs],
                                      sym_pos=True)
   u_values = np.concatenate([u_nonzero, np.zeros(len(fixdofs))])
 
@@ -228,7 +234,7 @@ def optimality_criteria_combine(x, dc, dv, args, max_move=0.2, eta=0.5):
 
   # find_root allows us to differentiate through the while loop.
   inputs = pack(x, dc, dv)
-  lambda_ = autograd_lib.find_root(f, inputs, lower_bound=1e-9, upper_bound=1e9)
+  lambda_ = autograd.find_root(f, inputs, lower_bound=1e-9, upper_bound=1e9)
   return compute_xnew(inputs, lambda_)
 
 
@@ -250,7 +256,7 @@ def sigmoid_with_constrained_mean(x, average):
     return sigmoid(z).mean() - average
   lower_bound = logit(average) - np.max(x)
   upper_bound = logit(average) - np.min(x)
-  b = autograd_lib.find_root(f, x, lower_bound, upper_bound)
+  b = autograd.find_root(f, x, lower_bound, upper_bound)
   return sigmoid(x + b)
 
 

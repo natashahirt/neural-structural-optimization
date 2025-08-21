@@ -1,0 +1,24 @@
+# Ignore torch_topo directory - it's a duplicate/legacy version
+torch_topo/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+neural_opt_env_py311/
+
+# Build artifacts
+neural_structural_optimization.egg-info/
+*.egg-info/
+
+# Test results
+script/test_results_*/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE files
+.vscode/

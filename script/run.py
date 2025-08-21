@@ -23,14 +23,13 @@ import pandas as pd
 import numpy as np
 import torch
 
-from neural_structural_optimization import pipeline_utils
-from neural_structural_optimization import problems
+from neural_structural_optimization.structural import utils as pipeline_utils
+from neural_structural_optimization.structural import problems
 from neural_structural_optimization import models
-from neural_structural_optimization import topo_api
-from neural_structural_optimization import train
-from neural_structural_optimization import pipeline_utils
-from neural_structural_optimization.problems_utils import ProblemParams
-from neural_structural_optimization.clip_loss import CLIPLoss
+from neural_structural_optimization.structural import api as topo_api
+from neural_structural_optimization.train import ProgressiveTrainer, PixelRefineTrainer, LBFGS_Optimizer
+from neural_structural_optimization.structural.problems import StructuralParams
+from neural_structural_optimization.models.loss_clip import CLIPLoss
 
 def create_filename_suffix(suffix_str):
     if not suffix_str:
@@ -63,21 +62,22 @@ def main():
         # Run all optimization methods
         print("\nStarting optimization...")
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        # ViT-B/32, RN50
         clip_loss = CLIPLoss(
-            model_name="RN50", #"RN50", # "ViT-B/32",
-            pretrained="openai",
-            target_text_prompt="x ray of human skeleton",
-            weight=1.0,                     # start small; tune upward
+            clip_model_name="ViT-B/32",
+            clip_rn_model_name="RN50",
+            device=device,
+            positive_prompts=["x ray of human skeleton"],   # or "x ray of human skeleton"
+            pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
+            extra_random_crops=10,
+            use_fixed_crops=False,
         )
 
-        clip_loss.set_negatives([
-            "static noise texture",
-            "random speckle pattern",
-            "grainy background",
-        ])
-
         # note that width and height are targets and not absolute
-        params = ProblemParams(
+        params = StructuralParams(
             problem_name = "multistory_building",
             width=50, # 50
             height=100, # 40
@@ -95,14 +95,20 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # model = models.PixelModel(problem_params=params)
-        # ds_history = train.train_progressive(model, max_iterations, resize_num=3, alg=train.train_lbfgs)
+        # Example 1: PixelModel with L-BFGS optimization 
+        # model = models.PixelModel(structural_params=params, clip_loss=clip_loss)
+        # trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
+        # ds_history = trainer.train(LBFGS_Optimizer)
 
-        # model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        # ds_history = train.train_progressive(model, max_iterations, resize_num=5, alg=train.train_lbfgs)
+        # Example 2: CNNModel with L-BFGS optimization
+        model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
+        ds_history = trainer.train(LBFGS_Optimizer)
 
-        model = models.CNNModel(problem_params=params, **dynamic_kwargs)
-        ds_history = train.train_pixel_refine(model, max_iterations, resize_num=4, alg=train.train_lbfgs)
+        # # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
+        # model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        # trainer = PixelRefineTrainer(model, max_iterations, resize_num=4, switch_threshold=200, coarse_start = False)
+        # ds_history = trainer.train(LBFGS_Optimizer)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
@@ -153,37 +159,31 @@ def main():
                 image = pipeline_utils.image_from_design(final_design, problem)
                 ax.imshow(np.array(image))
             else:
-                # Fallback to simple visualization
-                ax.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
+                # Fallback to direct plotting
+                ax.imshow(final_design.values, cmap='gray')
             
             ax.set_title(f'Stage {i+1}: {ds.sizes["y"]}x{ds.sizes["x"]}')
             ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig(f'script/test_results_pytorch/results_{params.problem_name}{filename_suffix}.png', dpi=150, bbox_inches='tight')
-        print(f"Final designs plot saved to 'results_{params.problem_name}{filename_suffix}.png'")
+        plt.savefig(f'script/test_results_pytorch/final_designs{filename_suffix}.png', dpi=150, bbox_inches='tight')
         plt.show()
 
-        # Save final high-resolution design separately
-        final_ds = ds_history[-1]
-        final_design = final_ds.design.isel(step=final_ds.loss.argmin())
-        plt.figure(figsize=(8, 8))
-        plt.imshow(1 - final_design, cmap='gray', vmin=0, vmax=1)
-        plt.axis('off')
-        plt.title(f'Final Design ({final_ds.sizes["y"]}x{final_ds.sizes["x"]})', pad=20)
-        plt.savefig(f'script/test_results_pytorch/final_design_{params.problem_name}{filename_suffix}.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"High-resolution final design saved to 'final_design_{params.problem_name}{filename_suffix}.png'")
-
-        print("\n" + "=" * 60)
-        print("All operations completed successfully!")
-        print("=" * 60)
+        # Save results
+        print(f"\nSaving results...")
+        for i, ds in enumerate(ds_history):
+            ds.to_netcdf(f'script/test_results_pytorch/stage_{i+1}_results{filename_suffix}.nc')
         
+        print(f"Results saved to script/test_results_pytorch/")
+        print(f"Files saved with suffix: {filename_suffix}")
+
     except Exception as e:
-        print(f"\nError occurred: {e}")
+        print(f"Error during optimization: {e}")
         import traceback
         traceback.print_exc()
-        print("\nScript failed. Check the error message above.")
+        return 1
+
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit(main())

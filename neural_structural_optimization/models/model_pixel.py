@@ -25,11 +25,11 @@ class PixelModel(Model):
     
     def __init__(
         self, 
-        problem_params: Optional[dict] = None, 
+        structural_params: Optional[dict] = None, 
         clip_loss: Optional[object] = None, 
         seed: Optional[int] = None,
     ):
-        super().__init__(problem_params=problem_params, clip_loss=clip_loss, seed=seed)
+        super().__init__(structural_params=structural_params, clip_loss=clip_loss, seed=seed)
         
         # Initialize design parameters with volume fraction
         z_init = np.broadcast_to(
@@ -69,8 +69,8 @@ class PixelModel(Model):
         x_coarse = (z_coarse * mask_coarse).clamp(0.0, 1.0)
         target_mean = (x_coarse.sum() / mask_coarse.sum().clamp_min(1)).item()
         
-        # Update problem parameters for new resolution
-        self._update_problem_params(scale=scale)
+        # Update structural parameters for new resolution
+        self._update_structural_params(scale=scale)
         _, H_fine, W_fine = self.shape
         mask_fine = self._get_mask_3d(H_fine, W_fine)
 

@@ -16,18 +16,14 @@
 # Core modules
 from . import models
 from . import train
-from . import problems
-from . import topo_physics
-from . import autograd_lib
 from . import pipeline
-from . import pipeline_utils
 from . import caching
-from . import topo_api
+from . import structural
+
 
 # CLIP integration (optional - only if CLIP is available)
 try:
-    from . import clip_loss
-    from . import clip_config
+    from .models.loss_clip import CLIPLoss
     CLIP_AVAILABLE = True
 except ImportError:
     CLIP_AVAILABLE = False

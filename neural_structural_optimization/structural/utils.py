@@ -26,7 +26,7 @@ from typing import Any, Dict
 
 import matplotlib.cm
 import matplotlib.colors
-from neural_structural_optimization import problems
+from . import problems
 import numpy as np
 from PIL import Image
 import xarray
@@ -56,20 +56,8 @@ def image_from_design(
     imaged_designs.append(design.isel(x=slice(None, None, -1)))
   return image_from_array(xarray.concat(imaged_designs, dim='x').data)
 
-# LEGACY
-# def dynamic_depth_kwargs(problem: problems.Problem) -> Dict[str, Any]:
-#   max_resize = min(math.gcd(problem.width, problem.height),
-#                    round(math.sqrt(problem.width * problem.height) / 4))
-#   resizes = [1] + [2] * int(math.log2(max_resize)) + [1]
-#   conv_filters = [512, 256, 128, 64, 32, 16, 8, 1][-len(resizes):]
-#   assert len(conv_filters) == len(resizes)
-#   return dict(
-#       resizes=resizes,
-#       conv_filters=conv_filters,
-#       dense_channels=conv_filters[0] // 2,
-#   )
-
 def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), padding=1):
+  """Calculate dynamic depth parameters for CNN architectures."""
   base_h = params.height
   base_w = params.width
   kh, kw = kernel_size

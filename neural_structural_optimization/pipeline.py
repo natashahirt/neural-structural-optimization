@@ -31,10 +31,12 @@ from absl import flags
 from absl import logging
 import apache_beam as beam
 from neural_structural_optimization import models
-from neural_structural_optimization import pipeline_utils
-from neural_structural_optimization import problems
-from neural_structural_optimization import topo_api
-from neural_structural_optimization import train
+from neural_structural_optimization.structural import utils as pipeline_utils
+from neural_structural_optimization.structural import problems
+from neural_structural_optimization.structural import api as topo_api
+from neural_structural_optimization.train import (
+    Adam_Optimizer, LBFGS_Optimizer, MMA_Optimizer, OptimalityCriteria_Optimizer
+)
 import numpy as np
 import xarray
 from apache_beam import runners
@@ -86,10 +88,10 @@ _BINARY_IMAGE_ENCODING = {
 }
 
 _TRAIN_FUNCS = {
-    'adam': train.train_adam,
-    'lbfgs': train.train_lbfgs,
-    'oc': train.optimality_criteria,
-    'mma': train.method_of_moving_asymptotes,
+    'adam': lambda model, **kwargs: Adam_Optimizer(model, **kwargs).optimize(),
+    'lbfgs': lambda model, **kwargs: LBFGS_Optimizer(model, **kwargs).optimize(),
+    'oc': lambda model, **kwargs: OptimalityCriteria_Optimizer(model, **kwargs).optimize(),
+    'mma': lambda model, **kwargs: MMA_Optimizer(model, **kwargs).optimize(),
 }
 
 
@@ -115,8 +117,12 @@ def save_optimization_task(inputs):
 
   start_time = time.time()
   model = models.MODELS_BY_NAME[model_name](problem)
-  optimizer = train.OPTIMIZERS_BY_NAME[optimizer_name](model)
-  history = train.train_optimizer(model, optimizer, seed=seed)
+  
+  if optimizer_name in _TRAIN_FUNCS:
+    history = _TRAIN_FUNCS[optimizer_name](model, max_iterations=200)
+  else:
+    raise ValueError(f'Unknown optimizer: {optimizer_name}')
+    
   elapsed_time = time.time() - start_time
 
   # save model

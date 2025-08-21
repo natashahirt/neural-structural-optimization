@@ -1,2 +1,0 @@
-stage,resolution,final_loss,best_step,total_steps,algorithm,model,problem
-1,25x80,3.5038828188507507,25,200,lbfgs,cnn,multistory_building

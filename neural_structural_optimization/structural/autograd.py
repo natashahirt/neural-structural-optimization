@@ -1,3 +1,9 @@
+"""Autograd utilities for structural computations.
+
+This module provides specialized autograd operations for topology optimization,
+including cone filtering, sparse matrix solving, and efficient gradient computation.
+"""
+
 # lint as python3
 # Copyright 2019 Google LLC.
 #

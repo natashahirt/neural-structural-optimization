@@ -13,8 +13,8 @@ neural_structural_optimization/pipeline_test.py
 neural_structural_optimization/pipeline_utils.py
 neural_structural_optimization/problems.py
 neural_structural_optimization/problems_utils.py
-neural_structural_optimization/topo_api.py
-neural_structural_optimization/topo_physics.py
+neural_structural_optimization/api.py
+neural_structural_optimization/physics.py
 neural_structural_optimization/topo_physics_test.py
 neural_structural_optimization/train.py
 neural_structural_optimization.egg-info/PKG-INFO

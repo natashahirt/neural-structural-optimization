@@ -20,7 +20,7 @@ from .config import (
     DEFAULT_DISTILL_WEIGHT,
     DEFAULT_WARM_TAU,
 )
-from neural_structural_optimization.topo_physics import logit
+from neural_structural_optimization.structural.physics import logit
 
 
 class CNNModel(Model):
@@ -28,7 +28,7 @@ class CNNModel(Model):
     
     def __init__(
         self,
-        problem_params: Optional[dict] = None,
+        structural_params: Optional[dict] = None,
         latent_size: int = DEFAULT_LATENT_SIZE,
         dense_channels: int = DEFAULT_DENSE_CHANNELS,
         conv_upsample: Sequence[int] = DEFAULT_CONV_UPSAMPLE,
@@ -41,8 +41,9 @@ class CNNModel(Model):
         conv_initializer: str = DEFAULT_CONV_INITIALIZER,
         neg_slope: float = DEFAULT_NEG_SLOPE,
         seed: Optional[int] = None,
+        clip_loss: Optional[object] = None,
     ):
-        super().__init__(problem_params=problem_params, seed=seed)
+        super().__init__(structural_params=structural_params, clip_loss=clip_loss, seed=seed)
 
         # Validate inputs
         if len(conv_upsample) != len(conv_filters):
@@ -51,7 +52,7 @@ class CNNModel(Model):
             raise ValueError("conv_filters[-1] must be 1 to produce (1,H,W) logits")
     
         # Store configuration
-        self.problem_params = problem_params
+        self.structural_params = structural_params
         self.latent_size = int(latent_size)
         self.dense_channels = int(dense_channels)
         self.conv_upsample = conv_upsample
@@ -203,7 +204,7 @@ class CNNModel(Model):
         rho_hi_logit = logit(rho_hi)
 
         # Update problem parameters and rebuild network
-        self._update_problem_params(scale=scale)
+        self._update_structural_params(scale=scale)
         ups = list(map(int, self.conv_upsample))
         ups[-1] *= scale
 
@@ -227,7 +228,7 @@ class CNNModel(Model):
 
         # Create new model with updated architecture
         new_self = CNNModel(
-            problem_params=self.problem_params,
+            structural_params=self.structural_params,
             latent_size=self.latent_size,
             dense_channels=self.dense_channels,
             conv_upsample=self.conv_upsample,

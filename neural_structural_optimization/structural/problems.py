@@ -1,3 +1,9 @@
+"""Problem definitions and utilities for structural optimization.
+
+This module consolidates problem definitions, parameter handling, and problem utilities
+for structural optimization tasks.
+"""
+
 # lint as python3
 # Copyright 2019 Google LLC.
 #
@@ -17,8 +23,10 @@
 overview:
 - multiple different topopt problems
 - Problem dataclass includes boundary conditions, forces, constraints
+- StructuralParams dataclass for parameterized problem creation
 """
 
+import inspect
 from typing import Optional, Union
 
 import dataclasses
@@ -546,6 +554,152 @@ def multistory_building(width=32, height=32, density=0.3, num_stories=16):
   problem = Problem(normals, forces, density)
   problem.name = f"multistory_building_{width}x{height}"
   return problem
+
+# =============================================================================
+# StructuralParams dataclass for parameterized problem creation
+# =============================================================================
+
+@dataclasses.dataclass
+class StructuralParams:
+    """
+    Parameterized problem creation utility.
+    
+    Example use: 
+    
+    # Create problem parameters
+    params = StructuralParams(
+        problem_name="cantilever_beam_full",
+        width=60,
+        height=60,
+        density=0.4,
+        force_position=0.5
+    )
+
+    # Get the problem and create a model
+    problem = params.get_problem()
+    """
+    
+    # general
+    problem_name: str = "cantilever_beam_full"
+    width: int = 60
+    height: int = 60
+    density: float = 0.5
+    
+    # filtering parameters
+    filter_width: float = 1.5  # filter width for density filtering
+    rmin: float = 1.5  # minimum radius for density filtering
+    
+    # for beam and cantilever
+    force_position: float = 0.5 # 0. is top, 1. is bottom
+    support_position: float = 0.25 # for 2-point cantilevers
+
+    # for bridge
+    deck_level: float = 1. # for causeway bridges, 0. is top, 1. is bottom
+    deck_height: float = 0.2 # for two-level bridges, 0. is top, 1. is bottom
+    span_position: float = 0.2 # for suspended bridges
+    anchored: bool = False # is suspended bridge anchored?
+    design_width: float = 0.25 # for thin support bridges
+
+    # for shape/aspect
+    aspect: float = 0.4 # for L-shaped/crane problems
+
+    # for multipoint circle only
+    radius: float = 6/7
+    weights: tuple = (1,)  # Single weight for one point
+    num_points: int = 1
+
+    # n_stories for staircase
+    num_stories: int = 2
+
+    # grid and interval params
+    interval: int = 16 # for multistory buildings
+    break_symmetry: bool = False # for staggered points
+
+    # position for michell_centered_both
+    position: float = 0.05
+
+    # validation + utility
+    def __post_init__(self):
+        if not 0.0 < self.density <= 1.0:
+            raise ValueError(f"density must be positive, nonzero, between 0. and 1. Got {self.density}.")
+        
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"width and height must be greater than 0. Got {self.width}x{self.height}.")
+
+        for param_name in ['force_position', 'support_position', 'deck_level', 
+                          'deck_height', 'span_position', 'design_width', 
+                          'aspect', 'radius', 'position']:
+            value = getattr(self, param_name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{param_name} must be between 0 and 1, got {value}")
+        
+        # Validate filtering parameters
+        if self.filter_width <= 0.0:
+            raise ValueError(f"filter_width must be positive, got {self.filter_width}")
+        if self.rmin <= 0.0:
+            raise ValueError(f"rmin must be positive, got {self.rmin}")
+        
+        # Validate special cases
+        if self.problem_name == "hoop" and 2 * self.width != self.height:
+            raise ValueError("hoop problems require height = 2 * width")
+    
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    def copy(self, **kwargs) -> 'StructuralParams':
+        return dataclasses.replace(self, **kwargs)
+
+    @classmethod
+    def get_available_problems(cls) -> list:
+        """Get list of all available problem names."""
+        return [
+            # Beam and cantilever problems
+            "mbb_beam",
+            "cantilever_beam_full", 
+            "cantilever_beam_two_point",
+            "pure_bending_moment",
+            
+            # Michell structures
+            "michell_centered_both",
+            "michell_centered_below",
+            
+            # Constrained designs
+            "ground_structure",
+            "l_shape",
+            "crane",
+            
+            # Vertical support structures
+            "tower",
+            "center_support", 
+            "column",
+            "roof",
+            
+            # Bridge problems
+            "causeway_bridge",
+            "two_level_bridge",
+            "suspended_bridge",
+            "canyon_bridge",
+            "thin_support_bridge",
+            "drawbridge",
+            
+            # Complex designs
+            "hoop",
+            "multipoint_circle",
+            "dam",
+            "ramp",
+            "staircase",
+            "staggered_points",
+            "multistory_building"
+        ]
+
+    def get_problem(self) -> 'Problem':
+        problem_function = globals().get(self.problem_name)
+        if problem_function is None or not callable(problem_function):
+            raise ValueError(f"No problem found with the name {self.problem_name}.")
+
+        sig = inspect.signature(problem_function)
+        filtered_params = {k: v for k, v in self.to_dict().items() if k in sig.parameters}
+        return problem_function(**filtered_params)
 
 # pylint: disable=line-too-long
 PROBLEMS_BY_CATEGORY = {

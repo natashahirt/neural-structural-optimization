@@ -17,16 +17,16 @@
 
 import autograd.numpy
 from autograd.test_util import check_grads
-from neural_structural_optimization import autograd_lib
+from neural_structural_optimization.structural import autograd
 import numpy as np
 from absl.testing import absltest
 
-cone_filter = autograd_lib.cone_filter
-gaussian_filter = autograd_lib.gaussian_filter
-scatter1d = autograd_lib.scatter1d
-solve_coo = autograd_lib.solve_coo
-inverse_permutation = autograd_lib.inverse_permutation
-find_root = autograd_lib.find_root
+cone_filter = autograd.cone_filter
+gaussian_filter = autograd.gaussian_filter
+scatter1d = autograd.scatter1d
+solve_coo = autograd.solve_coo
+inverse_permutation = autograd.inverse_permutation
+find_root = autograd.find_root
 
 
 class AutogradLibTest(absltest.TestCase):

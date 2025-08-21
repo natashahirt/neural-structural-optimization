@@ -24,8 +24,8 @@ import torch
 from torch.autograd import gradcheck
 from absl.testing import absltest
 
-# Torch-based topo_physics (ported module)
-from neural_structural_optimization import topo_physics
+# Torch-based physics (ported module)
+from neural_structural_optimization import physics
 
 DTYPE = torch.float64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -33,7 +33,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ######### HELPER FUNCTIONS #########
 def get_mini_problem(device=DEVICE):
-    args = topo_physics.default_args(device=device)
+    args = physics.default_args(device=device)
     args['nely'], args['nelx'] = 10, 15
 
     # Recompute BCs for the new grid
@@ -52,9 +52,9 @@ def get_mini_problem(device=DEVICE):
     args['forces'][1] = -1.0
 
     coeffs = torch.full((args['nely'], args['nelx']), float(args['volfrac']), dtype=DTYPE, device=device)
-    ke = topo_physics.get_stiffness_matrix(young=args['young'], poisson=args['poisson'],
+    ke = physics.get_stiffness_matrix(young=args['young'], poisson=args['poisson'],
                                            dtype=DTYPE, device=device)
-    u = topo_physics.displace(coeffs, ke, args['forces'], args['freedofs'], args['fixdofs'],
+    u = physics.displace(coeffs, ke, args['forces'], args['freedofs'], args['fixdofs'],
                               penal=args['penal'], e_min=args['young_min'], e_0=args['young'])
     return args, coeffs, ke, u
 
@@ -85,15 +85,15 @@ class TopoPhysicsTest(absltest.TestCase):
         args, coeffs, ke, u = get_mini_problem()
         args['volfrac'] = 1.0
 
-        _, x, _ = topo_physics.run_toposim(args=args, loss_only=False, verbose=False)
-        md = topo_physics.mean_density(x, args).item()
+        _, x, _ = physics.run_toposim(args=args, loss_only=False, verbose=False)
+        md = physics.mean_density(x, args).item()
         self.assertAlmostEqual(md, 1.0, places=4)
 
     def test_compliance_sign(self):
         # compliance gradients should ALL always be greater than 0
         args, coeffs, ke, u = get_mini_problem()
         coeffs = coeffs.clone().requires_grad_(True)
-        c = topo_physics.compliance(coeffs, u.detach(), ke,
+        c = physics.compliance(coeffs, u.detach(), ke,
                                     penal=args['penal'], e_min=args['young_min'], e_0=args['young'])
         (dc,) = torch.autograd.grad(c, coeffs, create_graph=False)
         self.assertGreater(float(dc.min()), 0.0)
@@ -104,14 +104,14 @@ class TopoPhysicsTest(absltest.TestCase):
         args, coeffs, ke, u = get_mini_problem()
         coeffs = torch.rand_like(coeffs) * 0.4
 
-        c = topo_physics.compliance(coeffs, u, ke,
+        c = physics.compliance(coeffs, u, ke,
                                     penal=args['penal'], e_min=args['young_min'], e_0=args['young'])
         c_old = old_compliance_fn(coeffs, u, ke, args['penal'])
         np.testing.assert_almost_equal(actual=float(c.item()), desired=float(c_old.item()), decimal=5)
 
     def test_sigmoid(self):
         x = torch.randn(5, dtype=DTYPE, device=DEVICE)
-        actual = topo_physics.logit(topo_physics.sigmoid(x))
+        actual = physics.logit(physics.sigmoid(x))
         torch.testing.assert_close(actual, x, atol=1e-6, rtol=0)
 
     def test_structure(self):
@@ -128,14 +128,14 @@ class TopoPhysicsTest(absltest.TestCase):
         forces = torch.zeros(2 * (nely + 1) * (nelx + 1), dtype=DTYPE, device=DEVICE)
         forces[1] = -1.0
 
-        args = topo_physics.default_args(device=DEVICE)
+        args = physics.default_args(device=DEVICE)
         args.update({'nelx': nelx,
                      'nely': nely,
                      'freedofs': freedofs,
                      'fixdofs': fixdofs,
                      'forces': forces})
 
-        _, x, _ = topo_physics.run_toposim(args=args, loss_only=False, verbose=False)
+        _, x, _ = physics.run_toposim(args=args, loss_only=False, verbose=False)
         x = x.abs()  # remove negative zeros!
         x_bin = (x >= 0.5).to(torch.int32).cpu().numpy()
 
@@ -173,7 +173,7 @@ class TopoPhysicsTest(absltest.TestCase):
         coeffs = (coeffs.clone() * 0.9 + 0.05).requires_grad_(True)  # stay away from 0/1 corners
 
         def f(x):
-            u_free = topo_physics.displace(
+            u_free = physics.displace(
                 x, ke, args['forces'], args['freedofs'], args['fixdofs'],
                 penal=args['penal'], e_min=args['young_min'], e_0=args['young']
             )
@@ -193,7 +193,7 @@ class TopoPhysicsTest(absltest.TestCase):
 
         def g(x):
             # run_toposim returns scalar loss when loss_only=True
-            return topo_physics.run_toposim(x, args, loss_only=True, verbose=False)
+            return physics.run_toposim(x, args, loss_only=True, verbose=False)
 
         ok = gradcheck(g, (x0,), eps=1e-6, atol=1e-4, rtol=1e-3)
         self.assertTrue(ok)
