@@ -63,50 +63,6 @@ def _combine_weighted_prompts(embeds: torch.Tensor, weights: torch.Tensor):
     z = (w * embeds).sum(dim=0, keepdim=True)
     return F.normalize(z, dim=-1)[0]  # [D]
 
-def _fixed_coverage_crops(x: torch.Tensor, crop_size: int, include_edges: bool = True):
-    """
-    Returns [1 + 4 (+4), C, crop_size, crop_size]:
-      - 1 full-frame downscale (global)
-      - 4 corners
-      - 4 edge centers (optional)
-    """
-    x = _ensure_nchw3(x)
-    assert x.shape[0] == 1, "Pass a single image"
-    _, C, H, W = x.shape
-    cs = crop_size
-
-    # Upscale if needed to be crop-able
-    if H < cs or W < cs:
-        x = F.interpolate(x, size=(max(H, cs), max(W, cs)), mode='bilinear', align_corners=False)
-        _, C, H, W = x.shape
-
-    def _crop(y, top, left):
-        top = int(top); left = int(left)
-        return y[..., top: top + cs, left: left + cs]
-
-    # 1) Global full-frame (keeps borders "seen" every step)
-    global_full = F.interpolate(x, size=(cs, cs), mode='bilinear', align_corners=False)
-
-    # 2) Corners
-    corners = [
-        _crop(x, 0,        0       ),  # TL
-        _crop(x, 0,        W - cs  ),  # TR
-        _crop(x, H - cs,   0       ),  # BL
-        _crop(x, H - cs,   W - cs  ),  # BR
-    ]
-
-    # 3) Edge centers
-    edges = []
-    if include_edges:
-        edges = [
-            _crop(x, 0,          (W - cs)//2),   # top center
-            _crop(x, H - cs,     (W - cs)//2),   # bottom center
-            _crop(x, (H - cs)//2, 0),            # left center
-            _crop(x, (H - cs)//2, W - cs),       # right center
-        ]
-
-    return torch.cat([global_full] + corners + edges, dim=0)  # [Kfix, C, cs, cs]
-
 class PairedCrops(nn.Module):
     def __init__(self, crop_size, num_augs, min_original_size=480, noise=0.0, paired_noise=True, use_fixed_crops=True, extra_random_crops=4):
         super().__init__()
@@ -117,109 +73,57 @@ class PairedCrops(nn.Module):
         self.use_fixed_crops = bool(use_fixed_crops)
         self.extra_random_crops = int(extra_random_crops)
 
-        if not self.use_fixed_crops:
-            # Fallback to random crops if needed
-            scale_min = crop_size / float(min_original_size)
-            try:
-                rrc = K.RandomResizedCrop(size=(crop_size, crop_size),
-                                          scale=(scale_min, 1.0),
-                                          cropping_mode="resample")
-            except TypeError:
-                rrc = K.RandomResizedCrop(size=(crop_size, crop_size),
-                                          scale=(scale_min, 1.0))
+        scale_min = crop_size / float(min_original_size)
+        try:
+            rrc = K.RandomResizedCrop(size=(crop_size, crop_size),
+                                        scale=(scale_min, 1.0),
+                                        cropping_mode="resample")
+        except TypeError:
+            rrc = K.RandomResizedCrop(size=(crop_size, crop_size),
+                                        scale=(scale_min, 1.0))
 
-            ops = [
-                rrc,
-                K.RandomHorizontalFlip(p=0.5),
-                K.RandomSharpness(0.3, p=0.4),
-                K.RandomAffine(degrees=30, translate=0.1, p=0.8, padding_mode="border"),
-                K.RandomPerspective(0.2, p=0.4),
-                K.ColorJitter(hue=0.01, saturation=0.01, p=0.7),
-            ]
+        ops = [
+            rrc,
+            K.RandomHorizontalFlip(p=0.5),
+            K.RandomSharpness(0.3, p=0.4),
+            K.RandomAffine(degrees=30, translate=0.1, p=0.8, padding_mode="border"),
+            K.RandomPerspective(0.2, p=0.4),
+            K.ColorJitter(hue=0.01, saturation=0.01, p=0.7),
+        ]
 
-            self.augs_single = K.AugmentationSequential(
-                *ops, data_keys=["input"], same_on_batch=False, random_apply=False
-            )
-            self.augs_paired = K.AugmentationSequential(
-                *ops, data_keys=["input", "input"], same_on_batch=False, random_apply=False
-            )
+        self.augs_single = K.AugmentationSequential(
+            *ops, data_keys=["input"], same_on_batch=False, random_apply=False
+        )
+        self.augs_paired = K.AugmentationSequential(
+            *ops, data_keys=["input", "input"], same_on_batch=False, random_apply=False
+        )
 
     def _repeat(self, x: torch.Tensor) -> torch.Tensor:
         x = _ensure_nchw3(x)
         return x.repeat(self.num_augs, 1, 1, 1).contiguous(memory_format=torch.channels_last)
 
     def single(self, image: torch.Tensor) -> torch.Tensor:
-        if self.use_fixed_crops:
-            # Use balanced approach: fixed coverage + some random crops
-            fixed = _fixed_coverage_crops(image, self.crop_size, include_edges=True)
-            
-            # Add some random crops if augmentation pipeline is available
-            if hasattr(self, 'augs_single'):
-                x_rep = self._repeat(image)
-                rand = self.augs_single(x_rep)[:self.extra_random_crops]  # Add configurable random crops
-                crops = torch.cat([fixed, rand], dim=0)
-            else:
-                crops = fixed
-            
-            # Repeat if needed to match num_augs
-            if crops.shape[0] < self.num_augs:
-                repeat_factor = (self.num_augs + crops.shape[0] - 1) // crops.shape[0]
-                crops = crops.repeat(repeat_factor, 1, 1, 1)
-            return crops[:self.num_augs]
-        else:
-            # Fallback to random crops
-            x_rep = self._repeat(image)
-            x_aug = self.augs_single(x_rep)
-            if self.noise > 0:
-                facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
-                x_aug = x_aug + facs * torch.randn_like(x_aug)
-            return x_aug
+        x_rep = self._repeat(image)
+        x_aug = self.augs_single(x_rep)
+        if self.noise > 0:
+            facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
+            x_aug = x_aug + facs * torch.randn_like(x_aug)
+        return x_aug
 
     def paired(self, image: torch.Tensor, target: torch.Tensor):
-        if self.use_fixed_crops:
-            # Use balanced approach: fixed coverage + some random crops for both images
-            fixed_x = _fixed_coverage_crops(image, self.crop_size, include_edges=True)
-            fixed_y = _fixed_coverage_crops(target, self.crop_size, include_edges=True)
-            
-            # Add some random crops if augmentation pipeline is available
-            if hasattr(self, 'augs_paired'):
-                x_rep = self._repeat(image)
-                y_rep = self._repeat(target)
-                rand_x, rand_y = self.augs_paired(x_rep, y_rep)
-                rand_x, rand_y = rand_x[:self.extra_random_crops], rand_y[:self.extra_random_crops]  # Add configurable random crops
-                x_crops = torch.cat([fixed_x, rand_x], dim=0)
-                y_crops = torch.cat([fixed_y, rand_y], dim=0)
+        x_rep = self._repeat(image)
+        y_rep = self._repeat(target)
+        x_aug, y_aug = self.augs_paired(x_rep, y_rep)
+        if self.noise > 0:
+            facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
+            eps  = torch.randn_like(x_aug)
+            if self.paired_noise:
+                x_aug = x_aug + facs * eps
+                y_aug = y_aug + facs * eps
             else:
-                x_crops = fixed_x
-                y_crops = fixed_y
-            
-            # Ensure same number of crops
-            min_crops = min(x_crops.shape[0], y_crops.shape[0])
-            x_crops = x_crops[:min_crops]
-            y_crops = y_crops[:min_crops]
-            
-            # Repeat if needed to match num_augs
-            if min_crops < self.num_augs:
-                repeat_factor = (self.num_augs + min_crops - 1) // min_crops
-                x_crops = x_crops.repeat(repeat_factor, 1, 1, 1)
-                y_crops = y_crops.repeat(repeat_factor, 1, 1, 1)
-            
-            return x_crops[:self.num_augs], y_crops[:self.num_augs]
-        else:
-            # Fallback to random crops
-            x_rep = self._repeat(image)
-            y_rep = self._repeat(target)
-            x_aug, y_aug = self.augs_paired(x_rep, y_rep)
-            if self.noise > 0:
-                facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
-                eps  = torch.randn_like(x_aug)
-                if self.paired_noise:
-                    x_aug = x_aug + facs * eps
-                    y_aug = y_aug + facs * eps
-                else:
-                    x_aug = x_aug + facs * eps
-                    y_aug = y_aug + facs * torch.randn_like(y_aug)
-            return x_aug, y_aug
+                x_aug = x_aug + facs * eps
+                y_aug = y_aug + facs * torch.randn_like(y_aug)
+        return x_aug, y_aug
 
 
 class RNTrunk(nn.Module):
@@ -277,8 +181,6 @@ class CLIPLoss(nn.Module):
         conv_layer_weights = (0.0, 1.0, 1.0, 1.0, 1.0),
         use_arcsin_transform: bool = True,
         margin: float = 0.1,
-        use_fixed_crops: bool = True,
-        extra_random_crops: int = 4,      # additional random crops for balanced coverage
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -309,8 +211,6 @@ class CLIPLoss(nn.Module):
             min_original_size=480, 
             noise=0.0, 
             paired_noise=True,
-            use_fixed_crops=use_fixed_crops,
-            extra_random_crops=int(extra_random_crops)
         ).to(self.device)
 
         # CLIP mean/std buffers

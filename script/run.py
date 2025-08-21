@@ -67,13 +67,11 @@ def main():
 
         # ViT-B/32, RN50
         clip_loss = CLIPLoss(
-            clip_model_name="ViT-B/32",
+            clip_model_name="ViT-L/14",
             clip_rn_model_name="RN50",
             device=device,
             positive_prompts=["x ray of human skeleton"],   # or "x ray of human skeleton"
             pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
-            extra_random_crops=10,
-            use_fixed_crops=False,
         )
 
         # note that width and height are targets and not absolute
