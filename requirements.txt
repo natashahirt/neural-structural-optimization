@@ -40,5 +40,4 @@ tqdm>=4.64.0
 ftfy>=6.0.0
 regex>=2021.0.0
 kornia>=0.6.0
-open-clip-torch>=2.20.0
-git+https://github.com/openai/CLIP.git
+open-clip-torch>=2.20.0git+https://github.com/openai/CLIP.git

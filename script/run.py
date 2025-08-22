@@ -72,11 +72,10 @@ def main():
 
         # ViT-B/32, RN50
         clip_loss = CLIPLoss(
-            clip_model_name="ViT-B/32",
+            clip_model_name="ViT-B/32", 
             clip_rn_model_name="RN50",
             device=device,
-            positive_prompts=["x ray of human skeleton"],   # or "x ray of human skeleton"
-            negative_prompts=["blurry", "low quality", "cartoon"],  # Multiple negatives
+            positive_prompts=["monarch butterfly wings", "pattern"],   # or "x ray of human skeleton"
             pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
         )
 
@@ -106,7 +105,7 @@ def main():
 
         # Example 2: CNNModel with L-BFGS optimization
         model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        trainer = ProgressiveTrainer(model, max_iterations, resize_num=1)
+        trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
         ds_history = trainer.train(LBFGS_Optimizer)
 
         # # Example 3: CNNModel with pixel refinement using PixelRefineTrainer

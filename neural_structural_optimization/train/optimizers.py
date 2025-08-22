@@ -68,7 +68,7 @@ class LBFGS_Optimizer(BaseOptimizer):
     def __init__(self, model, max_iterations: int, save_intermediate_designs: bool = True,
                  lr: float = 1.0, history_size: int = 100, line_search: str = 'strong_wolfe',
                  tol_rel: float = 1e-3, tol_abs: float = 1e-2, patience: int = 5, 
-                 min_steps: int = 10, coarse_start: bool = True):
+                 min_steps: int = 20, coarse_start: bool = True):
         super().__init__(model, max_iterations, save_intermediate_designs)
         self.lr = lr
         self.history_size = history_size
