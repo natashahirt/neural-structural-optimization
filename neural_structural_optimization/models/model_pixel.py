@@ -59,67 +59,54 @@ class PixelModel(Model):
         eps: float = DEFAULT_EPSILON, 
         void_density: float = DEFAULT_VOID_DENSITY
     ) -> None:
-        """Upsample the design to higher resolution."""
-    
-        z_coarse = self.z.detach()
-        _, H_coarse, W_coarse = self.shape
+        """Upsample the design to higher resolution, preserving LOGITS in self.z."""
+        # self.z MUST be logits when we enter
+        z_coarse_log = self.z.detach()                 # logits at coarse res
+        _, Hc, Wc = self.shape
 
-        # Get coarse mask and compute target mean
-        mask_coarse = self._get_mask_3d(H_coarse, W_coarse)
-        x_coarse = (z_coarse * mask_coarse).clamp(0.0, 1.0)
+        # image at coarse res (for stats only)
+        x_coarse = torch.sigmoid(z_coarse_log)
+        mask_coarse = self._get_mask_3d(Hc, Wc)
+        x_coarse = (x_coarse * mask_coarse).clamp(0.0, 1.0)
         target_mean = (x_coarse.sum() / mask_coarse.sum().clamp_min(1)).item()
-        
-        # Update structural parameters for new resolution
+
+        # bump resolution
         self._update_structural_params(scale=scale)
-        _, H_fine, W_fine = self.shape
-        mask_fine = self._get_mask_3d(H_fine, W_fine)
+        _, Hf, Wf = self.shape
+        mask_fine = self._get_mask_3d(Hf, Wf)
 
-        # Prepare coarse design for upsampling
+        # build a coarse image with void filled, then go back to logits
         x_coarse_full = x_coarse + void_density * (1.0 - mask_coarse)
-        z_log_coarse = torch.logit(x_coarse_full.clamp(eps, 1-eps))
+        z_coarse_full_log = torch.logit(x_coarse_full.clamp(eps, 1 - eps))
 
-        # Upsample using bilinear interpolation
-        z_log_fine = F.interpolate(
-            z_log_coarse.unsqueeze(0), 
-            size=(H_fine, W_fine), 
-            mode='bilinear', 
-            align_corners=False
+        # upsample in LOGIT space
+        z_fine_log = F.interpolate(
+            z_coarse_full_log.unsqueeze(0), size=(Hf, Wf), mode='bilinear', align_corners=False
         ).squeeze(0)
-        
-        # Handle void regions
+
+        # set void logits explicitly
         void_logit = torch.logit(
-            torch.tensor(void_density, dtype=z_coarse.dtype, device=z_coarse.device).clamp(eps, 1-eps)
+            torch.tensor(void_density, dtype=z_fine_log.dtype, device=z_fine_log.device).clamp(eps, 1 - eps)
         )
-        z_log_fine = torch.where(
-            mask_fine > 0, 
-            z_log_fine, 
-            torch.full_like(z_log_fine, void_logit)
-        )
+        z_fine_log = torch.where(mask_fine > 0, z_fine_log, torch.full_like(z_fine_log, void_logit))
 
-        # Preserve mean density if requested
-        b = 0.0
+        # optionally preserve mean by shifting logits by a scalar b (no extra sigmoid here)
         if preserve_mean:
-            # Try analytical first, fall back to Newton if needed
-            current_mean = (torch.sigmoid(z_log_fine) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
-            
-            if abs(current_mean - target_mean) > DEFAULT_MEAN_TOLERANCE:  # only if significant difference
-                for _ in range(DEFAULT_MAX_NEWTON_ITERATIONS):  # max iterations
-                    m = (torch.sigmoid(z_log_fine + b) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
-                    if abs(m - target_mean) < DEFAULT_MEAN_CONVERGENCE:
-                        break
-                    sigmoid_b = torch.sigmoid(z_log_fine + b)
-                    dm_db = (sigmoid_b * (1 - sigmoid_b) * mask_fine).sum() / mask_fine.sum().clamp_min(1)
-                    step = (target_mean - m) / (dm_db + 1e-8)
-                    b += step
-                    if abs(step) < DEFAULT_STEP_TOLERANCE:
-                        break
-        
-        z_log_fine = z_log_fine + b
-     
-        # Apply temperature scaling and final processing
-        z_fine = torch.sigmoid(z_log_fine / DEFAULT_TEMPERATURE)  # Apply temperature scaling
-        z_fine = z_fine * mask_fine + void_density * (1.0 - mask_fine)
+            b = 0.0
+            denom = mask_fine.sum().clamp_min(1)
+            for _ in range(DEFAULT_MAX_NEWTON_ITERATIONS):
+                x = torch.sigmoid(z_fine_log + b)
+                m = (x * mask_fine).sum() / denom
+                dm_db = (x * (1 - x) * mask_fine).sum() / denom
+                step = ((target_mean - m) / (dm_db + 1e-8)).item()
+                b += step
+                if abs(step) < DEFAULT_STEP_TOLERANCE or abs((m - target_mean).item()) < DEFAULT_MEAN_CONVERGENCE:
+                    break
+            z_fine_log = z_fine_log + b
 
-        # Update analysis settings and parameters
+        # DO NOT sigmoid here; keep logits in the parameter.
+        # If you want "temperature", apply it when converting logits->image in forward(), not here.
+        # (E.g., image = torch.sigmoid(self.z / DEFAULT_TEMPERATURE))
         self._set_analysis_factor(max_dim=max_dim)
-        self.z = torch.nn.Parameter(z_fine, requires_grad=True)
+        z_fine_log = z_fine_log.clamp_(-6, 6)          # healthy gradient range
+        self.z = torch.nn.Parameter(z_fine_log, requires_grad=True)

@@ -56,6 +56,20 @@ def image_from_design(
     imaged_designs.append(design.isel(x=slice(None, None, -1)))
   return image_from_array(xarray.concat(imaged_designs, dim='x').data)
 
+
+def image_from_design_array(
+    design: xarray.DataArray, problem: problems.Problem,
+) -> np.ndarray:
+  """Convert a design and problem into a numpy array (optimized version)."""
+  assert design.dims == ('y', 'x'), design.dims
+  imaged_designs = []
+  if problem.mirror_left:
+    imaged_designs.append(design.isel(x=slice(None, None, -1)))
+  imaged_designs.append(design)
+  if problem.mirror_right:
+    imaged_designs.append(design.isel(x=slice(None, None, -1)))
+  return xarray.concat(imaged_designs, dim='x').data
+
 def dynamic_depth_kwargs(params, max_upsamples=float('inf'), kernel_size=(5,5), padding=1):
   """Calculate dynamic depth parameters for CNN architectures."""
   base_h = params.height

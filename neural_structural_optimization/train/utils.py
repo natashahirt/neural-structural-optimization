@@ -54,3 +54,29 @@ def ensure_array_size(x: np.ndarray, expected_size: int, name: str = "array") ->
             if x.size < expected_size:
                 x = np.pad(x, (0, expected_size - x.size), mode='edge')
     return x
+
+def match_mean_std_in_logit_space(z, ref_img):
+    """
+    Match mean and std of current image to reference image in logit space.
+    
+    Args:
+        z: Current logits tensor to adjust
+        ref_img: Reference image tensor (already in [0,1] range)
+    """
+    # Get reference statistics (ensure ref_img is in [0,1] range)
+    ref_img = ref_img.clamp(0, 1)
+    m_ref, s_ref = ref_img.mean(), ref_img.std().clamp_min(1e-6)
+    
+    # Get current statistics after sigmoid
+    cur_img = torch.sigmoid(z)
+    m_cur, s_cur = cur_img.mean(), cur_img.std().clamp_min(1e-6)
+    
+    # Compute affine transformation parameters
+    # b: shift parameter (difference in logit means)
+    b = torch.logit(m_ref.clamp(1e-6, 1-1e-6)) - torch.logit(m_cur.clamp(1e-6, 1-1e-6))
+    
+    # a: scale parameter (ratio of standard deviations)
+    a = (s_ref / s_cur).clamp(0.25, 4.0)  # Prevent extreme scaling
+    
+    # Apply transformation: z_new = a * z + b
+    z.mul_(a).add_(b).clamp_(-6, 6)  # Clamp to reasonable logit range

@@ -140,14 +140,6 @@ def _gaussian_blur(img: torch.Tensor, sigma: float) -> torch.Tensor:
     img = F.conv2d(img, kx.expand(C, 1, 1, k), padding=(0, pad), groups=C)
     return img
 
-def _contrast_regularization(x_img: torch.Tensor) -> torch.Tensor:
-    """Encourage black/white extremes by penalizing middle-gray values."""
-    return (1.0 - torch.abs(x_img - 0.5)).mean()
-
-def _to_clip_rgb(x_gray: torch.Tensor) -> torch.Tensor:
-    """Convert single channel to RGB for CLIP."""
-    return x_gray.repeat(1, 3, 1, 1)
-
 @torch.no_grad()
 def _load_clip_model(clip_model_name, device):
     clip_model, transforms = clip.load(clip_model_name, device=device, jit=False)
@@ -210,6 +202,7 @@ def _preprocess_image_for_clip(imgs: torch.Tensor, input_res: int, mean: torch.T
     imgs = _to_clip_rgb(imgs)  # Convert to RGB right before CLIP
     if imgs.shape[-2] != input_res or imgs.shape[-1] != input_res:
         imgs = F.interpolate(imgs, size=(input_res, input_res), mode='bilinear', align_corners=False)
+    imgs = imgs.clamp(0.0, 1.0)
     imgs = imgs.to(mean.device, non_blocking=True)
     return (imgs.sub_(mean).div_(std)).float()
 
@@ -245,12 +238,10 @@ def _combine_weighted_prompts(embeds: torch.Tensor, weights: torch.Tensor) -> to
     return F.normalize((w * embeds).sum(dim=0, keepdim=True), dim=-1)[0]
 
 class PairedCrops(nn.Module):
-    def __init__(self, crop_size, num_augs, min_original_size=480, noise=0.0, paired_noise=True):
+    def __init__(self, crop_size, num_augs, min_original_size=480):
         super().__init__()
         self.crop_size = int(crop_size)
         self.num_augs = int(num_augs)
-        self.noise = float(noise)
-        self.paired_noise = bool(paired_noise)
 
         scale_min = crop_size / float(min_original_size)
         try:
@@ -284,24 +275,12 @@ class PairedCrops(nn.Module):
     def single(self, image: torch.Tensor) -> torch.Tensor:
         x_rep = self._repeat(image)
         x_aug = self.augs_single(x_rep)
-        if self.noise > 0:
-            facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
-            x_aug = x_aug + facs * torch.randn_like(x_aug)
         return x_aug
 
     def paired(self, image: torch.Tensor, target: torch.Tensor):
         x_rep = self._repeat(image)
         y_rep = self._repeat(target)
         x_aug, y_aug = self.augs_paired(x_rep, y_rep)
-        if self.noise > 0:
-            facs = x_aug.new_empty([self.num_augs, 1, 1, 1]).uniform_(0, self.noise)
-            eps  = torch.randn_like(x_aug)
-            if self.paired_noise:
-                x_aug = x_aug + facs * eps
-                y_aug = y_aug + facs * eps
-            else:
-                x_aug = x_aug + facs * eps
-                y_aug = y_aug + facs * torch.randn_like(y_aug)
         return x_aug, y_aug
 
 
@@ -363,11 +342,11 @@ class CLIPLoss(nn.Module):
         # multi-patch pyramid and tiling controls
         use_patch_pyramid: bool = True,
         patch_fracs: Tuple[float,...] = (1.00, 0.75, 0.50),   # relative to min(H,W)
-        crops_per_frac: Tuple[int,...] = (4, 8, 16),
+        crops_per_frac: Tuple[int,...] = (8, 8, 16),
         min_patch_px: int = 96,
         hard_mining_frac: float = 0.25,     # weight top-k hardest patches more
-        fixed_grid_at_highres: bool = True,  # switch to fixed tiling for large images
-        tiled_min_res: int = 450,            # if min(H,W) >= this, enable tiling
+        fixed_grid_at_highres: bool = False,  # switch to fixed tiling for large images
+        tiled_min_res: int = 1e9,            # if min(H,W) >= this, enable tiling
         tile_px: int = 336,                   # tile size at input scale
         tile_overlap: float = 0.33,           # 0..0.9
         tile_jitter_frac: float = 0.05,       # small jitter for tiles
@@ -378,8 +357,8 @@ class CLIPLoss(nn.Module):
         num_global_views: int = 2,
         # low frequency regularization (fade out as resolution increases)
         use_lowfreq_reg: bool = True,
-        lowfreq_sigma: float = 5.0,
-        lowfreq_weight_max: float = 0.5,
+        lowfreq_sigma: float = 2.5,
+        lowfreq_weight_max: float = 0.2,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -432,9 +411,7 @@ class CLIPLoss(nn.Module):
         self.cropper = PairedCrops(
             self.clip_input_res, 
             self.num_augs, 
-            min_original_size=480, 
-            noise=0.0, 
-            paired_noise=True,
+            min_original_size=480,
         ).to(self.device)
 
         # CLIP mean/std buffers
@@ -652,7 +629,7 @@ class CLIPLoss(nn.Module):
             if self.use_global_path:
                 n_global = 2 + (1 if (self.num_global_views >= 3 and self.center_crop_frac < 1.0) else 0)
                 # Global weight ramps from ~2.5 at low res down to ~1.0 at high res
-                t = float(mn - 256) / float(max(1024 - 256, 1))
+                t = float(mn - 128) / float(max(512 - 128, 1))
                 t = max(0.0, min(1.0, t))
                 global_w = 2.5 - 1.5 * t
                 weights[offset:offset + n_global] = global_w
@@ -697,16 +674,13 @@ class CLIPLoss(nn.Module):
         L_low = z_img.new_tensor(0.0)
         if self.use_lowfreq_reg:
             # Stronger when small, fades as resolution grows
-            t = float(mn - 256) / float(max(1024 - 256, 1))
+            t = float(mn - 128) / float(max(512 - 128, 1))
             t = max(0.0, min(1.0, t))
             w_low = (1.0 - t) * self.lowfreq_weight_max
             if w_low > 0:
                 L_low = F.l1_loss(x, _gaussian_blur(x, sigma=self.lowfreq_sigma)) * w_low
 
-        # ---------- CONTRAST REGULARIZER (encourage black/white extremes) ----------
-        L_contrast = _contrast_regularization(x) * self.contrast_weight if hasattr(self, 'use_contrast_reg') and self.use_contrast_reg else z_img.new_tensor(0.0)
-
-        return L_pos + L_neg + L_low + L_contrast
+        return L_pos + L_neg + L_low
 
     def forward(self, logits: torch.Tensor):
         input_image = torch.sigmoid(logits)

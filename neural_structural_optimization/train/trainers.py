@@ -20,6 +20,7 @@ import torch
 import xarray
 
 from neural_structural_optimization.models import PixelModel, CNNModel
+from .utils import match_mean_std_in_logit_space
 
 
 class ProgressiveTrainer:
@@ -57,7 +58,6 @@ class ProgressiveTrainer:
         elif isinstance(self.model, CNNModel):
             self.model.upsample(scale=2, freeze_transferred=True)
 
-
 class PixelRefineTrainer(ProgressiveTrainer):
     """Handles progressive training with pixel refinement (CNN to PixelModel transition)."""
     
@@ -85,6 +85,10 @@ class PixelRefineTrainer(ProgressiveTrainer):
                 with torch.no_grad():
                     cnn_logits = model.forward()
                     pixel_model.z.data.copy_(cnn_logits)
+                    
+                    # Match statistics to ensure smooth transition
+                    ref_img = torch.sigmoid(cnn_logits)
+                    match_mean_std_in_logit_space(pixel_model.z, ref_img)
                 
                 model = pixel_model
                 self.model = model  # Update the trainer's model reference
@@ -104,3 +108,57 @@ class PixelRefineTrainer(ProgressiveTrainer):
                 self._upsample_model()
         
         return ds_history
+
+
+class HybridTrainer(ProgressiveTrainer):
+    """Handles progressive training with pixel refinement (CNN to PixelModel transition)."""
+    
+    def __init__(self, model, max_iterations: int, resize_num: int = 2, 
+                 save_intermediate_designs: bool = True, switch_threshold: int = 200, coarse_start: bool = True):
+        super().__init__(model, max_iterations, resize_num, save_intermediate_designs)
+        self.switch_threshold = switch_threshold
+        self.coarse_start = coarse_start
+    
+    def train(self, optimizer_class: Callable, **optimizer_kwargs) -> List[xarray.Dataset]:
+        """Run progressive training with pixel refinement."""
+        ds_history = []
+        model = self.model
+        
+        for stage in range(self.resize_num):
+            # Switch to PixelModel if CNN resolution exceeds threshold
+            if isinstance(model, CNNModel) and max(model.shape[1], model.shape[2]) > self.switch_threshold:
+                print(f"\nSwitching to PixelModel at resolution: {model.shape[1]}x{model.shape[2]}")
+                pixel_model = PixelModel(
+                    structural_params=model.structural_params,
+                    clip_loss=model.clip_loss,
+                    seed=model.seed
+                )
+                
+                with torch.no_grad():
+                    cnn_logits = model.forward()
+                    pixel_model.z.data.copy_(cnn_logits)
+                    
+                    # Match statistics to ensure smooth transition
+                    ref_img = torch.sigmoid(cnn_logits)
+                    match_mean_std_in_logit_space(pixel_model.z, ref_img)
+                
+                model = pixel_model
+                self.model = model  # Update the trainer's model reference
+
+            print(f"\nTraining stage {stage + 1}/{self.resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
+            print(f"Using coarse_start={self.coarse_start}")
+            
+            # Use the optimizer with the specified coarse_start setting
+            optimizer_kwargs.setdefault('coarse_start', self.coarse_start)
+            optimizer = optimizer_class(model, self.max_iterations, 
+                                      save_intermediate_designs=self.save_intermediate_designs, 
+                                      **optimizer_kwargs)
+            ds = optimizer.optimize()
+            ds_history.append(ds)
+            
+            if stage < self.resize_num - 1:
+                self._upsample_model()
+        
+        return ds_history
+
+

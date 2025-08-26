@@ -45,7 +45,7 @@ def create_filename_suffix(suffix_str):
     suffix = suffix.replace('/', '_').replace('\\', '_')
     suffix = suffix.replace(':', '_').replace(';', '_')
 
-    suffix = re.sub(r'[^a-zA-Z0-9_]', '', suffix)
+    suffix = re.sub(r'[<>:"/\\|?*]', '_', suffix)
 
     print(f"Using filename suffix: {suffix}")
     
@@ -59,6 +59,10 @@ def main():
 
     suffix_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
     filename_suffix = create_filename_suffix(suffix_str)        
+    
+    # Ensure output directory exists
+    import os
+    os.makedirs('script/test_results_pytorch', exist_ok=True)
     
     try:
         # Create problem
@@ -75,7 +79,7 @@ def main():
             clip_model_name="ViT-B/32", 
             clip_rn_model_name="RN50",
             device=device,
-            positive_prompts=["monarch butterfly wings", "pattern"],   # or "x ray of human skeleton"
+            positive_prompts=["jaguar", "jungle leaves"],   # or "x ray of human skeleton"
             pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
         )
 
@@ -104,14 +108,14 @@ def main():
         # ds_history = trainer.train(LBFGS_Optimizer)
 
         # Example 2: CNNModel with L-BFGS optimization
-        model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
-        ds_history = trainer.train(LBFGS_Optimizer)
+        # model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        # trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
+        # ds_history = trainer.train(LBFGS_Optimizer)
 
         # # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
-        # model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        # trainer = PixelRefineTrainer(model, max_iterations, resize_num=4, switch_threshold=200, coarse_start = False)
-        # ds_history = trainer.train(LBFGS_Optimizer)
+        model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        trainer = PixelRefineTrainer(model, max_iterations, resize_num=4, switch_threshold=200, coarse_start = False)
+        ds_history = trainer.train(LBFGS_Optimizer)
 
         if not isinstance(ds_history, (list, np.ndarray)):
             ds_history = [ds_history]
@@ -126,83 +130,81 @@ def main():
         print(f"\nOptimization completed!")
         print(f"Number of stages: {len(ds_history)}")
 
-        # Create and save all plots first
+        # Create and save all plots efficiently
         print("\nCreating and saving plots...")
         
-        # Create loss comparison plot
+        # Create loss comparison plot efficiently
         print("Creating loss comparison plot...")
-        plt.figure(figsize=(10, 6))
+        fig_loss, ax_loss = plt.subplots(figsize=(10, 6))
+        
+        # Process all datasets at once to reduce memory overhead
         for i, ds in enumerate(ds_history):
-            ds = ds.rename({'step': 'iteration'})
-            loss_df = ds.loss.to_pandas().T
-            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.sizes['y']}x{ds.sizes['x']}")
-        plt.ylabel("Loss")
-        plt.xlabel("Optimization Step")
-        plt.title("Loss Comparison Across Stages")
-        plt.grid(True)
-        plt.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
+            # Rename step to iteration for consistency
+            ds_renamed = ds.rename({'step': 'iteration'})
+            loss_df = ds_renamed.loss.to_pandas().T
+            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.sizes['y']}x{ds.sizes['x']}", ax=ax_loss)
+            # Clear reference to reduce memory usage
+            del ds_renamed, loss_df
+        
+        ax_loss.set_ylabel("Loss")
+        ax_loss.set_xlabel("Optimization Step")
+        ax_loss.set_title("Loss Comparison Across Stages")
+        ax_loss.grid(True)
+        ax_loss.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
         seaborn.despine()
         plt.tight_layout()
+        
+        # Save and display loss plot
         loss_plot_path = f'script/test_results_pytorch/optimization_comparison_loss{filename_suffix}.png'
         plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
-        plt.close()  # Close the figure to free memory
+        plt.show()  # Display directly without saving/loading
+        plt.close(fig_loss)
 
-        # Create final designs comparison plot
+        # Create final designs comparison plot efficiently
         print("Creating final designs plot...")
-        fig, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
+        fig_designs, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
         
         if not isinstance(axes, (list, np.ndarray)):
             axes = [axes]
-        fig.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
+        fig_designs.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
 
-        # Get problem object for proper rendering
+        # Get problem object for proper rendering (cache to avoid repeated lookups)
         problem = problems.PROBLEMS_BY_NAME.get(params.problem_name)
         
-        for i, (ax, ds) in enumerate(zip(axes, ds_history)):
+        # Pre-compute final designs to reduce repeated computation
+        final_designs = []
+        for ds in ds_history:
             final_design = ds.design.isel(step=ds.loss.argmin())
-            
+            final_designs.append(final_design)
+        
+        for i, (ax, final_design) in enumerate(zip(axes, final_designs)):
             if problem:
-                # Use pipeline_utils for proper design rendering
-                image = pipeline_utils.image_from_design(final_design, problem)
-                ax.imshow(np.array(image))
+                # Use optimized numpy array version for better performance
+                try:
+                    design_array = pipeline_utils.image_from_design_array(final_design, problem)
+                    # Invert the image for proper visualization (material = white, void = black)
+                    ax.imshow(1.0 - design_array, cmap='gray')
+                except:
+                    # Fallback to original PIL version if needed
+                    image = pipeline_utils.image_from_design(final_design, problem)
+                    # Invert the image for proper visualization
+                    ax.imshow(1.0 - np.array(image), cmap='gray')
             else:
-                # Fallback to direct plotting
-                ax.imshow(final_design.values, cmap='gray')
+                # Direct plotting for fallback with inversion
+                ax.imshow(1.0 - final_design.values, cmap='gray')
             
-            ax.set_title(f'Stage {i+1}: {ds.sizes["y"]}x{ds.sizes["x"]}')
+            ax.set_title(f'Stage {i+1}: {ds_history[i].sizes["y"]}x{ds_history[i].sizes["x"]}')
             ax.axis('off')
 
         plt.tight_layout()
+        
+        # Save designs plot
         designs_plot_path = f'script/test_results_pytorch/final_designs{filename_suffix}.png'
         plt.savefig(designs_plot_path, dpi=150, bbox_inches='tight')
-        plt.close()  # Close the figure to free memory
+        plt.show()  # Display directly without saving/loading
+        plt.close(fig_designs)
         
-        print("All plots saved successfully!")
-        
-        # Now display the saved plots
-        print("\nDisplaying saved plots...")
-        
-        # Display loss comparison plot
-        loss_img = plt.imread(loss_plot_path)
-        plt.figure(figsize=(10, 6))
-        plt.imshow(loss_img)
-        plt.axis('off')
-        plt.title("Loss Comparison Across Stages")
-        plt.show()
-
-        # Display final designs plot
-        designs_img = plt.imread(designs_plot_path)
-        plt.figure(figsize=(4*len(ds_history), 6))
-        plt.imshow(designs_img)
-        plt.axis('off')
-        plt.title(f'Final Designs: {params.problem_name}')
-        plt.show()
-
-        # Save results
-        print(f"\nSaving results...")
-        for i, ds in enumerate(ds_history):
-            ds.to_netcdf(f'script/test_results_pytorch/stage_{i+1}_results{filename_suffix}.nc')
-        
+        print("All plots saved and displayed successfully!")
         print(f"Results saved to script/test_results_pytorch/")
         print(f"Files saved with suffix: {filename_suffix}")
 

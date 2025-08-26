@@ -196,6 +196,6 @@ class Model(nn.Module):
         
     def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute total loss (currently just physics loss)."""
-        structural_loss = 0 #self.get_structural_loss(logits)
-        semantic_loss = self.get_semantic_loss(logits)
+        structural_loss = self.get_structural_loss(logits)
+        semantic_loss = 0 #self.get_semantic_loss(logits)
         return structural_loss + semantic_loss
