@@ -71,7 +71,8 @@ class Model(nn.Module):
             if 'clip_loss' in self._modules:
                 del self._modules['clip_loss']
             object.__setattr__(self, "clip_loss", clip_loss)
-        
+            self.clip_R = 0.9
+
     def forward(self) -> torch.Tensor:
         """Forward pass - must be implemented by subclasses."""
         raise NotImplementedError
@@ -197,5 +198,5 @@ class Model(nn.Module):
     def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute total loss (currently just physics loss)."""
         structural_loss = self.get_structural_loss(logits)
-        semantic_loss = 0 #self.get_semantic_loss(logits)
+        semantic_loss = self.get_semantic_loss(logits)
         return structural_loss + semantic_loss

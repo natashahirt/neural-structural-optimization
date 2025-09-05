@@ -25,7 +25,7 @@ from neural_structural_optimization import models
 from neural_structural_optimization.models import PixelModel, CNNModel
 
 from .base import BaseOptimizer
-from .utils import cosine_warmup, get_variables, constrained_logits, ensure_array_size
+from .utils import cosine_warmup, get_variables, constrained_logits, ensure_array_size, calibrate_lambda_clip
 
 
 class Adam_Optimizer(BaseOptimizer):
@@ -78,6 +78,7 @@ class LBFGS_Optimizer(BaseOptimizer):
         self.patience = patience
         self.min_steps = min_steps
         self.coarse_start = coarse_start
+        self._lam_clip = None
     
     def optimize(self) -> xarray.Dataset:
         """Run L-BFGS optimization."""
@@ -102,11 +103,22 @@ class LBFGS_Optimizer(BaseOptimizer):
             
             if isinstance(self.model, CNNModel) and step > 15:
                 self.model._unfreeze_all()
+
+            with torch.no_grad():
+                logits_probe = self.model()
+            if self._lam_clip is None or step == 0 or step % 10 == 0:
+                self._lam_clip = calibrate_lambda_clip(self.model, logits_probe, R=self.model.clip_R, ortho=True)
             
             def closure():
                 opt.zero_grad(set_to_none=True)
                 logits = self.model()
-                loss = self.model.get_total_loss(logits)
+                if self._lam_clip is None:
+                    loss = self.model.get_semantic_loss(logits)
+                    loss.backward()
+                    return loss
+                loss_structural = self.model.get_structural_loss(logits)
+                loss_semantic = self.model.get_semantic_loss(logits)
+                loss = loss_structural + loss_semantic * self._lam_clip
                 loss.backward()
                 return loss
             

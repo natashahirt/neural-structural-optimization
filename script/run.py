@@ -14,7 +14,7 @@
 
 import sys
 import re
-import argparse
+import os
 from PIL import Image
 import seaborn
 import matplotlib.pyplot as plt
@@ -51,6 +51,42 @@ def create_filename_suffix(suffix_str):
     
     return f"_{suffix}"
 
+def load_initial_image(image_path: str, target_shape: tuple = None) -> torch.Tensor:
+    """Load and preprocess an initial image for model initialization."""
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Initial image not found: {image_path}")
+    
+    print(f"Loading initial image from: {image_path}")
+    
+    # Load image using PIL
+    with Image.open(image_path) as img:
+        # Convert to grayscale if needed
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Convert to numpy array and normalize to [0, 1]
+        img_array = np.array(img, dtype=np.float32) / 255.0
+        
+        # Add channel dimension if needed (C, H, W)
+        if img_array.ndim == 2:
+            img_array = img_array[np.newaxis, :, :]
+        
+        # Convert to torch tensor
+        img_tensor = torch.from_numpy(img_array)
+        
+        # Resize if target shape is provided
+        if target_shape is not None:
+            target_h, target_w = target_shape
+            img_tensor = torch.nn.functional.interpolate(
+                img_tensor.unsqueeze(0),  # Add batch dimension
+                size=(target_h, target_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # Remove batch dimension
+        
+        print(f"Initial image shape: {img_tensor.shape}")
+        return img_tensor
+
 def main():
     """Main function with error handling and progress reporting."""
     print("=" * 60)
@@ -79,7 +115,7 @@ def main():
             clip_model_name="ViT-B/32", 
             clip_rn_model_name="RN50",
             device=device,
-            positive_prompts=["jaguar", "jungle leaves"],   # or "x ray of human skeleton"
+            positive_prompts=["butterfly wing silhouette"],   # or "x ray of human skeleton"
             pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
         )
 
@@ -92,7 +128,9 @@ def main():
             num_stories=5,
         )
 
-        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)      
+        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)   
+
+        INITIAL_IMAGE_PATH = "butterfly_wings.jpg"
 
         print("Dynamic kwargs:")
         for key, value in dynamic_kwargs.items():
@@ -112,9 +150,28 @@ def main():
         # trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
         # ds_history = trainer.train(LBFGS_Optimizer)
 
-        # # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
+        # Load initial image if provided
+        initial_image = None
+        if INITIAL_IMAGE_PATH:
+            try:
+                # Load and preprocess the initial image
+                initial_image = load_initial_image(INITIAL_IMAGE_PATH)
+                print(f"Successfully loaded initial image: {INITIAL_IMAGE_PATH}")
+            except Exception as e:
+                print(f"Warning: Failed to load initial image '{INITIAL_IMAGE_PATH}': {e}")
+                print("Continuing without initial image...")
+                initial_image = None
+
+        # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
         model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        trainer = PixelRefineTrainer(model, max_iterations, resize_num=4, switch_threshold=200, coarse_start = False)
+        trainer = PixelRefineTrainer(
+            model, 
+            max_iterations, 
+            resize_num=4, 
+            switch_threshold=500, 
+            coarse_start=True,
+            initial_image=initial_image
+        )
         ds_history = trainer.train(LBFGS_Optimizer)
 
         if not isinstance(ds_history, (list, np.ndarray)):
@@ -215,6 +272,8 @@ def main():
         return 1
 
     return 0
+
+
 
 if __name__ == "__main__":
     exit(main())

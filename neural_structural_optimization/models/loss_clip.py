@@ -238,7 +238,7 @@ def _combine_weighted_prompts(embeds: torch.Tensor, weights: torch.Tensor) -> to
     return F.normalize((w * embeds).sum(dim=0, keepdim=True), dim=-1)[0]
 
 class PairedCrops(nn.Module):
-    def __init__(self, crop_size, num_augs, min_original_size=480):
+    def __init__(self, crop_size, num_augs, min_original_size=480, degrees=30, translate=0.1, p=0.8):
         super().__init__()
         self.crop_size = int(crop_size)
         self.num_augs = int(num_augs)
@@ -256,7 +256,7 @@ class PairedCrops(nn.Module):
             rrc,
             K.RandomHorizontalFlip(p=0.5),
             K.RandomSharpness(0.3, p=0.4),
-            K.RandomAffine(degrees=30, translate=0.1, p=0.8, padding_mode="border"),
+            K.RandomAffine(degrees=degrees, translate=translate, p=p, padding_mode="border"),
             K.RandomPerspective(0.2, p=0.4),
             K.ColorJitter(hue=0.01, saturation=0.01, p=0.7),
         ]
@@ -626,6 +626,7 @@ class CLIPLoss(nn.Module):
 
             # Give global views extra weight (appended first)
             offset = 0
+            n_global = 0  # Initialize n_global
             if self.use_global_path:
                 n_global = 2 + (1 if (self.num_global_views >= 3 and self.center_crop_frac < 1.0) else 0)
                 # Global weight ramps from ~2.5 at low res down to ~1.0 at high res
@@ -687,4 +688,4 @@ class CLIPLoss(nn.Module):
         loss = (self.evaluate_image_to_image(input_image, self.image_prompt) 
                 if self.image_prompt is not None 
                 else self.evaluate_image_to_text(input_image, self.use_arcsin_transform))
-        return 100.0 * (loss + _seamless_edges_loss(input_image) * 0.15)
+        return (loss + _seamless_edges_loss(input_image) * 0.15) * 100

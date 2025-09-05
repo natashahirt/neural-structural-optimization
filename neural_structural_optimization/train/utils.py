@@ -80,3 +80,34 @@ def match_mean_std_in_logit_space(z, ref_img):
     
     # Apply transformation: z_new = a * z + b
     z.mul_(a).add_(b).clamp_(-6, 6)  # Clamp to reasonable logit range
+
+def calibrate_lambda_clip(model, logits, R=0.9, lam_bounds=(1e-3, 10.0), ortho=True):
+    """
+    Pick λ_clip so that ||∂L_struct/∂logits|| ≈ R · ||λ_clip ∂L_clip/∂logits||.
+    R=0.9 gives semantics almost as much 'update energy' as structure (more dramatic).
+    """
+    if R is None:
+        return None
+
+    # Ensure we can take grads w.r.t. logits
+    needs_req = not logits.requires_grad
+    if needs_req: logits.requires_grad_(True)
+
+    Ls = model.get_structural_loss(logits)
+    gS, = torch.autograd.grad(Ls, logits, retain_graph=True)
+
+    Lc = model.get_semantic_loss(logits)
+    gC, = torch.autograd.grad(Lc, logits)
+
+    if ortho:
+        # Use only CLIP's component independent of structural direction
+        denom = gS.norm().pow(2) + 1e-12
+        gC = gC - (gC * gS).sum() / denom * gS
+
+    nS = gS.norm().item()
+    nC = gC.norm().item()
+    lam = (nS / (nC + 1e-12)) * R
+    lam = float(max(lam_bounds[0], min(lam_bounds[1], lam)))
+
+    if needs_req: logits.requires_grad_(False)
+    return lam
