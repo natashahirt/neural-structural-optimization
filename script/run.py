@@ -133,13 +133,14 @@ def save_loss_plot(ds_history, filename_suffix: str) -> Path:
     seaborn.despine()
     plt.tight_layout()
 
-    plot_path = OUTPUT_DIR / f"optimization_comparison_loss_{filename_suffix}.png"
+    # Use classic Python string formatting to avoid curly brackets in filename
+    plot_path = OUTPUT_DIR / ("optimization_comparison_loss_%s.png" % filename_suffix)
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return plot_path
 
 
-def save_final_designs_plot(ds_history, params, filename_suffix: str) -> Path:
+def save_final_designs_plot(ds_history, params, filename_suffix: str, force_legacy: bool = True) -> Path:
     """Plot final designs for each stage."""
     fig, axes = plt.subplots(1, len(ds_history), figsize=(4 * len(ds_history), 6))
     if not isinstance(axes, (list, np.ndarray)):
@@ -154,12 +155,16 @@ def save_final_designs_plot(ds_history, params, filename_suffix: str) -> Path:
 
     for i, (ax, final_design) in enumerate(zip(axes, final_designs)):
         if problem:
-            try:
-                design_array = pipeline_utils.image_from_design_array(final_design, problem)
-                ax.imshow(1.0 - design_array, cmap="gray")
-            except Exception:
+            if force_legacy:
                 image = pipeline_utils.image_from_design(final_design, problem)
                 ax.imshow(1.0 - np.array(image), cmap="gray")
+            else:
+                try:
+                    design_array = pipeline_utils.image_from_design_array(final_design, problem)
+                    ax.imshow(1.0 - design_array, cmap="gray")
+                except Exception:
+                    image = pipeline_utils.image_from_design(final_design, problem)
+                    ax.imshow(1.0 - np.array(image), cmap="gray")
         else:
             ax.imshow(1.0 - final_design.values, cmap="gray")
 
@@ -167,7 +172,7 @@ def save_final_designs_plot(ds_history, params, filename_suffix: str) -> Path:
         ax.axis("off")
 
     plt.tight_layout()
-    plot_path = OUTPUT_DIR / f"final_designs_{filename_suffix}.png"
+    plot_path = OUTPUT_DIR / ("final_designs_%s.png" % filename_suffix)
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -189,6 +194,7 @@ def main(suffix_str: str | None = None) -> int:
 
         # Enable CLIP by toggling this flag to True
         use_clip = True
+        force_legacy_rendering = False
         clip_loss = None
         if use_clip:
             clip_loss = CLIPLoss(
@@ -224,6 +230,12 @@ def main(suffix_str: str | None = None) -> int:
             height=100,
             density=0.3,
             num_stories=5,
+            # Grow across stages: start at 0.25px and reach the standard 2.0px by Stage 4.
+            rmin=0.25,
+            # Stay fluid within stages: start blurry (2 * rmin) and shrink to rmin.
+            filter_width="linear",
+            # Sharpen within stages: start fluid (beta=1.0) and lock in (beta=4.0).
+            beta="linear" 
         )
         params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)
 
@@ -261,7 +273,7 @@ def main(suffix_str: str | None = None) -> int:
 
         print("\nCreating and saving plots...")
         loss_plot_path = save_loss_plot(ds_history, filename_suffix)
-        designs_plot_path = save_final_designs_plot(ds_history, params, filename_suffix)
+        designs_plot_path = save_final_designs_plot(ds_history, params, filename_suffix, force_legacy=force_legacy_rendering)
 
         print("All plots saved successfully!")
         print(f"Loss plot: {loss_plot_path}")

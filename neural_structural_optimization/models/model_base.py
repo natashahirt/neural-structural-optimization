@@ -122,8 +122,18 @@ class Model(nn.Module):
         if scale is not None:
             new_params['width'] = int(self.structural_params.width * scale)
             new_params['height'] = int(self.structural_params.height * scale)
-            new_params['rmin'] = self.structural_params.rmin * scale
-            new_params['filter_width'] = self.structural_params.filter_width * scale
+            
+            # Only scale numeric parameters
+            if isinstance(self.structural_params.rmin, (int, float)):
+                new_params['rmin'] = self.structural_params.rmin * scale
+            if isinstance(self.structural_params.filter_width, (int, float)):
+                new_params['filter_width'] = self.structural_params.filter_width * scale
+            
+            # Beta usually doesn't scale with resolution unless explicitly requested
+            # but we'll preserve its value/schedule
+            new_params['beta'] = self.structural_params.beta
+            new_params['heavyside'] = self.structural_params.heavyside
+            new_params['eta'] = self.structural_params.eta
         
         self.structural_params = self.structural_params.copy(**new_params)
         problem = self.structural_params.get_problem()

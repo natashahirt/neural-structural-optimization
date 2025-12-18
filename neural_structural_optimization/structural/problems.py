@@ -577,12 +577,12 @@ class StructuralParams:
     density: float = 0.5
     
     # filtering parameters
-    filter_width: float = 1.5  # filter width for density filtering
+    filter_width: Union[float, str] = 1.5  # filter width for density filtering
     rmin: float = 1.5  # minimum radius for density filtering
     
     # projection parameters
     heavyside: bool = True  # use heaviside projection?
-    beta: float = 2.0       # heaviside sharpness
+    beta: Union[float, str] = 2.0       # heaviside sharpness
     eta: float = 0.5        # heaviside threshold
     
     # for beam and cantilever
@@ -630,9 +630,9 @@ class StructuralParams:
                 raise ValueError(f"{param_name} must be between 0 and 1, got {value}")
         
         # Validate filtering parameters
-        if self.filter_width <= 0.0:
+        if isinstance(self.filter_width, (int, float)) and self.filter_width <= 0.0:
             raise ValueError(f"filter_width must be positive, got {self.filter_width}")
-        if self.rmin <= 0.0:
+        if isinstance(self.rmin, (int, float)) and self.rmin <= 0.0:
             raise ValueError(f"rmin must be positive, got {self.rmin}")
         
         # Validate special cases
