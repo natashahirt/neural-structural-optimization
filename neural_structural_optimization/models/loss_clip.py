@@ -339,6 +339,7 @@ class CLIPLoss(nn.Module):
         conv_layer_weights = (0.2, 0.4, 0.6, 0.8, 0.2),
         use_arcsin_transform: bool = True,
         margin: float = 0.1,
+        preblur_sigma: float = 0.0,
         # multi-patch pyramid and tiling controls
         use_patch_pyramid: bool = True,
         patch_fracs: Tuple[float,...] = (1.00, 0.75, 0.50),   # relative to min(H,W)
@@ -368,6 +369,7 @@ class CLIPLoss(nn.Module):
         self.use_arcsin_transform = bool(use_arcsin_transform)
         self.margin = float(margin)
         self.use_pairwise_spread = True
+        self.preblur_sigma = max(0.0, float(preblur_sigma))
         self.consistency_weight = 0.03
 
         # Multi-patch pyramid and tiling parameters
@@ -685,7 +687,8 @@ class CLIPLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor):
         input_image = torch.sigmoid(logits)
-        loss = (self.evaluate_image_to_image(input_image, self.image_prompt) 
+        clip_image = _gaussian_blur(input_image, sigma=self.preblur_sigma) if self.preblur_sigma > 0 else input_image
+        loss = (self.evaluate_image_to_image(clip_image, self.image_prompt) 
                 if self.image_prompt is not None 
-                else self.evaluate_image_to_text(input_image, self.use_arcsin_transform))
+                else self.evaluate_image_to_text(clip_image, self.use_arcsin_transform))
         return (loss + _seamless_edges_loss(input_image) * 0.15) * 100

@@ -14,14 +14,14 @@
 
 import sys
 import re
-import os
+from pathlib import Path
 from PIL import Image
 import seaborn
 import matplotlib.pyplot as plt
-import xarray
-import pandas as pd
 import numpy as np
 import torch
+
+OUTPUT_DIR = Path("script/test_results_pytorch")
 
 # Enable performance optimizations for modern NVIDIA GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -31,12 +31,12 @@ torch.backends.cudnn.benchmark = True
 from neural_structural_optimization.structural import utils as pipeline_utils
 from neural_structural_optimization.structural import problems
 from neural_structural_optimization import models
-from neural_structural_optimization.structural import api as topo_api
-from neural_structural_optimization.train import ProgressiveTrainer, PixelRefineTrainer, LBFGS_Optimizer
+from neural_structural_optimization.train import PixelRefineTrainer, LBFGS_Optimizer
 from neural_structural_optimization.structural.problems import StructuralParams
 from neural_structural_optimization.models.loss_clip import CLIPLoss
 
-def create_filename_suffix(suffix_str):
+def create_filename_suffix(suffix_str: str | None) -> str:
+    """Normalize user-provided suffix for safe filenames."""
     if not suffix_str:
         return ""
 
@@ -51,86 +51,150 @@ def create_filename_suffix(suffix_str):
     
     return f"_{suffix}"
 
-def load_initial_image(image_path: str, target_shape: tuple = None) -> torch.Tensor:
+def load_initial_image(image_path: str | Path, target_shape: tuple[int, int] | None = None) -> torch.Tensor:
     """Load and preprocess an initial image for model initialization."""
-    if not os.path.exists(image_path):
+    image_path = Path(image_path)
+    if not image_path.exists():
         raise FileNotFoundError(f"Initial image not found: {image_path}")
     
     print(f"Loading initial image from: {image_path}")
     
-    # Load image using PIL
     with Image.open(image_path) as img:
-        # Convert to grayscale if needed
         if img.mode != 'L':
             img = img.convert('L')
         
-        # Convert to numpy array and normalize to [0, 1]
         img_array = np.array(img, dtype=np.float32) / 255.0
         
-        # Add channel dimension if needed (C, H, W)
         if img_array.ndim == 2:
             img_array = img_array[np.newaxis, :, :]
         
-        # Convert to torch tensor
         img_tensor = torch.from_numpy(img_array)
         
-        # Resize if target shape is provided
         if target_shape is not None:
             target_h, target_w = target_shape
             img_tensor = torch.nn.functional.interpolate(
-                img_tensor.unsqueeze(0),  # Add batch dimension
+                img_tensor.unsqueeze(0),
                 size=(target_h, target_w),
                 mode='bilinear',
-                align_corners=False
-            ).squeeze(0)  # Remove batch dimension
+                align_corners=False,
+            ).squeeze(0)
         
         print(f"Initial image shape: {img_tensor.shape}")
         return img_tensor
 
-def main():
+
+def ensure_output_dir(path: Path = OUTPUT_DIR) -> None:
+    """Create output directory if missing."""
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_history(ds_history):
+    """Ensure history is a list with a step dimension."""
+    if not isinstance(ds_history, (list, np.ndarray)):
+        ds_history = [ds_history]
+
+    normalized = []
+    for ds in ds_history:
+        if "step" not in ds.design.dims:
+            ds = ds.expand_dims(step=[0])
+        normalized.append(ds)
+    return normalized
+
+
+def save_loss_plot(ds_history, filename_suffix: str) -> Path:
+    """Plot cumulative losses across stages."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, ds in enumerate(ds_history):
+        loss_df = ds.rename({"step": "iteration"}).loss.to_pandas().T
+        loss_df.cummin().plot(
+            linewidth=2,
+            label=f"Stage {i+1}: {ds.sizes['y']}x{ds.sizes['x']}",
+            ax=ax,
+        )
+
+    ax.set_ylabel("Loss")
+    ax.set_xlabel("Optimization Step")
+    ax.set_title("Loss Comparison Across Stages")
+    ax.grid(True)
+    ax.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc="upper left")
+    seaborn.despine()
+    plt.tight_layout()
+
+    plot_path = OUTPUT_DIR / f"optimization_comparison_loss{filename_suffix}.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
+
+
+def save_final_designs_plot(ds_history, params, filename_suffix: str) -> Path:
+    """Plot final designs for each stage."""
+    fig, axes = plt.subplots(1, len(ds_history), figsize=(4 * len(ds_history), 6))
+    if not isinstance(axes, (list, np.ndarray)):
+        axes = [axes]
+    fig.suptitle(f"Final Designs: {params.problem_name}", fontsize=16)
+
+    problem = problems.PROBLEMS_BY_NAME.get(params.problem_name)
+
+    final_designs = []
+    for ds in ds_history:
+        final_designs.append(ds.design.isel(step=ds.loss.argmin()))
+
+    for i, (ax, final_design) in enumerate(zip(axes, final_designs)):
+        if problem:
+            try:
+                design_array = pipeline_utils.image_from_design_array(final_design, problem)
+                ax.imshow(1.0 - design_array, cmap="gray")
+            except Exception:
+                image = pipeline_utils.image_from_design(final_design, problem)
+                ax.imshow(1.0 - np.array(image), cmap="gray")
+        else:
+            ax.imshow(1.0 - final_design.values, cmap="gray")
+
+        ax.set_title(f"Stage {i+1}: {ds_history[i].sizes['y']}x{ds_history[i].sizes['x']}")
+        ax.axis("off")
+
+    plt.tight_layout()
+    plot_path = OUTPUT_DIR / f"final_designs{filename_suffix}.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
+
+def main(suffix_str: str | None = None) -> int:
     """Main function with error handling and progress reporting."""
     print("=" * 60)
     print("Neural Structural Optimization - Multi-Method Comparison")
     print("=" * 60)
 
-    suffix_str = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
-    filename_suffix = create_filename_suffix(suffix_str)        
-    
-    # Ensure output directory exists
-    import os
-    os.makedirs('script/test_results_pytorch', exist_ok=True)
-    
+    user_suffix = suffix_str if suffix_str is not None else " ".join(sys.argv[1:])
+    filename_suffix = create_filename_suffix(user_suffix)
+    ensure_output_dir()
+
     try:
-        # Create problem
         max_iterations = 200
-
-        # Run all optimization methods
-        print("\nStarting optimization...")
-
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        print(f"\nStarting optimization on device: {device}")
 
-        # ViT-B/32, RN50
-        clip_loss = CLIPLoss(
-            clip_model_name="ViT-B/32", 
-            clip_rn_model_name="RN50",
-            device=device,
-            positive_prompts=["butterfly wing silhouette"],   # or "x ray of human skeleton"
-            pos_weights=None,                                   # or [1.0, 0.3, ...] matching the prompts
-        )
+        # Enable CLIP by toggling this flag to True
+        use_clip = True
+        clip_loss = None
+        if use_clip:
+            clip_loss = CLIPLoss(
+                clip_model_name="ViT-B/32",
+                clip_rn_model_name="RN50",
+                device=device,
+                positive_prompts=["butterfly wing silhouette"],
+                pos_weights=None,
+            )
 
-        # note that width and height are targets and not absolute
         params = StructuralParams(
-            problem_name = "multistory_building",
-            width=50, # 50
-            height=100, # 40
+            problem_name="multistory_building",
+            width=50,
+            height=100,
             density=0.3,
             num_stories=5,
         )
-
-        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)   
-
-        INITIAL_IMAGE_PATH = "butterfly_wings.jpg"
+        params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)
 
         print("Dynamic kwargs:")
         for key, value in dynamic_kwargs.items():
@@ -140,130 +204,26 @@ def main():
         print(f"Dimensions: {params.width}x{params.height}")
         print(f"Max iterations: {max_iterations}")
 
-        # Example 1: PixelModel with L-BFGS optimization 
-        # model = models.PixelModel(structural_params=params, clip_loss=clip_loss)
-        # trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
-        # ds_history = trainer.train(LBFGS_Optimizer)
-
-        # Example 2: CNNModel with L-BFGS optimization
-        # model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
-        # trainer = ProgressiveTrainer(model, max_iterations, resize_num=3)
-        # ds_history = trainer.train(LBFGS_Optimizer)
-
-        # Load initial image if provided
-        initial_image = None
-        if INITIAL_IMAGE_PATH:
-            try:
-                # Load and preprocess the initial image
-                initial_image = load_initial_image(INITIAL_IMAGE_PATH)
-                print(f"Successfully loaded initial image: {INITIAL_IMAGE_PATH}")
-            except Exception as e:
-                print(f"Warning: Failed to load initial image '{INITIAL_IMAGE_PATH}': {e}")
-                print("Continuing without initial image...")
-                initial_image = None
-
-        # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
-        model = models.CNNModel(structural_params=params, clip_loss=None, **dynamic_kwargs)
+        model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
         trainer = PixelRefineTrainer(
-            model, 
-            max_iterations, 
-            resize_num=4, 
-            switch_threshold=500, 
+            model,
+            max_iterations,
+            resize_num=4,
+            switch_threshold=500,
             coarse_start=True,
-            initial_image=initial_image
+            initial_image=None,
         )
-        ds_history = trainer.train(LBFGS_Optimizer)
+        ds_history = normalize_history(trainer.train(LBFGS_Optimizer))
 
-        if not isinstance(ds_history, (list, np.ndarray)):
-            ds_history = [ds_history]
-            
-        # Ensure each dataset has a step dimension for design
-        for i, ds in enumerate(ds_history):
-            if 'step' not in ds.design.dims:
-                # Add step dimension to design if it doesn't exist
-                ds = ds.expand_dims(step=[0])
-                ds_history[i] = ds
-            
-        print(f"\nOptimization completed!")
-        print(f"Number of stages: {len(ds_history)}")
+        print(f"\nOptimization completed! Stages: {len(ds_history)}")
 
-        # Create and save all plots efficiently
         print("\nCreating and saving plots...")
-        
-        # Create loss comparison plot efficiently
-        print("Creating loss comparison plot...")
-        fig_loss, ax_loss = plt.subplots(figsize=(10, 6))
-        
-        # Process all datasets at once to reduce memory overhead
-        for i, ds in enumerate(ds_history):
-            # Rename step to iteration for consistency
-            ds_renamed = ds.rename({'step': 'iteration'})
-            loss_df = ds_renamed.loss.to_pandas().T
-            loss_df.cummin().plot(linewidth=2, label=f"Stage {i+1}: {ds.sizes['y']}x{ds.sizes['x']}", ax=ax_loss)
-            # Clear reference to reduce memory usage
-            del ds_renamed, loss_df
-        
-        ax_loss.set_ylabel("Loss")
-        ax_loss.set_xlabel("Optimization Step")
-        ax_loss.set_title("Loss Comparison Across Stages")
-        ax_loss.grid(True)
-        ax_loss.legend(title="Resolution", bbox_to_anchor=(1.05, 1), loc='upper left')
-        seaborn.despine()
-        plt.tight_layout()
-        
-        # Save and display loss plot
-        loss_plot_path = f'script/test_results_pytorch/optimization_comparison_loss{filename_suffix}.png'
-        plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
-        plt.show()  # Display directly without saving/loading
-        plt.close(fig_loss)
+        loss_plot_path = save_loss_plot(ds_history, filename_suffix)
+        designs_plot_path = save_final_designs_plot(ds_history, params, filename_suffix)
 
-        # Create final designs comparison plot efficiently
-        print("Creating final designs plot...")
-        fig_designs, axes = plt.subplots(1, len(ds_history), figsize=(4*len(ds_history), 6))
-        
-        if not isinstance(axes, (list, np.ndarray)):
-            axes = [axes]
-        fig_designs.suptitle(f'Final Designs: {params.problem_name}', fontsize=16)
-
-        # Get problem object for proper rendering (cache to avoid repeated lookups)
-        problem = problems.PROBLEMS_BY_NAME.get(params.problem_name)
-        
-        # Pre-compute final designs to reduce repeated computation
-        final_designs = []
-        for ds in ds_history:
-            final_design = ds.design.isel(step=ds.loss.argmin())
-            final_designs.append(final_design)
-        
-        for i, (ax, final_design) in enumerate(zip(axes, final_designs)):
-            if problem:
-                # Use optimized numpy array version for better performance
-                try:
-                    design_array = pipeline_utils.image_from_design_array(final_design, problem)
-                    # Invert the image for proper visualization (material = white, void = black)
-                    ax.imshow(1.0 - design_array, cmap='gray')
-                except:
-                    # Fallback to original PIL version if needed
-                    image = pipeline_utils.image_from_design(final_design, problem)
-                    # Invert the image for proper visualization
-                    ax.imshow(1.0 - np.array(image), cmap='gray')
-            else:
-                # Direct plotting for fallback with inversion
-                ax.imshow(1.0 - final_design.values, cmap='gray')
-            
-            ax.set_title(f'Stage {i+1}: {ds_history[i].sizes["y"]}x{ds_history[i].sizes["x"]}')
-            ax.axis('off')
-
-        plt.tight_layout()
-        
-        # Save designs plot
-        designs_plot_path = f'script/test_results_pytorch/final_designs{filename_suffix}.png'
-        plt.savefig(designs_plot_path, dpi=150, bbox_inches='tight')
-        plt.show()  # Display directly without saving/loading
-        plt.close(fig_designs)
-        
-        print("All plots saved and displayed successfully!")
-        print(f"Results saved to script/test_results_pytorch/")
-        print(f"Files saved with suffix: {filename_suffix}")
+        print("All plots saved successfully!")
+        print(f"Loss plot: {loss_plot_path}")
+        print(f"Designs plot: {designs_plot_path}")
 
     except Exception as e:
         print(f"Error during optimization: {e}")

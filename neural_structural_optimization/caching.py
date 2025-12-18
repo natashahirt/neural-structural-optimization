@@ -36,7 +36,17 @@ class _WrappedArray:
   def __hash__(self):
     # Something that can be calculated quickly -- we won't have many collisions.
     # Hash collisions just mean that that __eq__ needs to be checked.
-    # https://stackoverflow.com/questions/16589791/most-efficient-property-to-hash-for-numpy-array
+    # For large arrays, repr() is very slow. We use metadata + a few samples.
+    if self.value.size > 1000:
+        # Use more samples to reduce collisions in optimization loops
+        samples = [
+            self.value.flat[0],
+            self.value.flat[-1],
+            self.value.flat[self.value.size // 2],
+            self.value.flat[self.value.size // 4],
+            self.value.flat[3 * self.value.size // 4]
+        ]
+        return hash((self.value.shape, self.value.dtype, tuple(samples)))
     return hash(repr(self.value.ravel()))
 
 

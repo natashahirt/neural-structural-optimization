@@ -100,29 +100,20 @@ class Problem:
     # Area ratio for force scaling
     area_ratio = (self.width * self.height) / (new_width * new_height)
 
-    for i in range(new_width + 1):
-        for j in range(new_height + 1):
-            # Map new node (i, j) to original grid
-            orig_i = int(round(i * self.width / new_width))
-            orig_j = int(round(j * self.height / new_height))
-
-            # Clamp to bounds
-            orig_i = min(max(orig_i, 0), self.width)
-            orig_j = min(max(orig_j, 0), self.height)
-
-            new_normals[i, j, :] = self.normals[orig_i, orig_j, :]
-            new_forces[i, j, :] = self.forces[orig_i, orig_j, :] * area_ratio
+    # Vectorized resizing using nearest neighbor mapping
+    orig_i = np.round(np.arange(new_width + 1) * self.width / new_width).astype(int).clip(0, self.width)
+    orig_j = np.round(np.arange(new_height + 1) * self.height / new_height).astype(int).clip(0, self.height)
+    
+    # Use meshgrid or advanced indexing to get the new arrays
+    new_normals = self.normals[np.ix_(orig_i, orig_j)]
+    new_forces = self.forces[np.ix_(orig_i, orig_j)] * area_ratio
 
     # Resize mask
     if isinstance(self.mask, np.ndarray):
-        new_mask = np.ones((new_height, new_width), dtype=self.mask.dtype)
-        for i in range(new_width):
-            for j in range(new_height):
-                orig_i = int(round(i * self.width / new_width))
-                orig_j = int(round(j * self.height / new_height))
-                orig_i = min(max(orig_i, 0), self.width - 1)
-                orig_j = min(max(orig_j, 0), self.height - 1)
-                new_mask[j, i] = self.mask[orig_j, orig_i]
+        # Mask is (height, width). Match original loop scaling exactly.
+        orig_mi = np.round(np.arange(new_width) * self.width / new_width).astype(int).clip(0, self.width - 1)
+        orig_mj = np.round(np.arange(new_height) * self.height / new_height).astype(int).clip(0, self.height - 1)
+        new_mask = self.mask[np.ix_(orig_mj, orig_mi)]
     else:
         new_mask = self.mask
 

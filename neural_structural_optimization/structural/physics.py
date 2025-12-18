@@ -121,13 +121,32 @@ def get_stiffness_matrix(young, poisson):
                               ])
 
 
+@caching.ndarray_safe_lru_cache(8)
+def get_k_indices(nely, nelx):
+  # Precompute indices for sparse matrix assembly.
+  ely, elx = np.meshgrid(range(nely), range(nelx))  # x, y coords
+  ely, elx = ely.reshape(-1, 1), elx.reshape(-1, 1)
+
+  n1 = (nely+1)*(elx+0) + (ely+0)
+  n2 = (nely+1)*(elx+1) + (ely+0)
+  n3 = (nely+1)*(elx+1) + (ely+1)
+  n4 = (nely+1)*(elx+0) + (ely+1)
+  edof = np.array([2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1, 2*n4, 2*n4+1])
+  edof = edof.T[0]
+
+  x_list = np.repeat(edof, 8)  # rows (repeat for each column)
+  y_list = np.tile(edof, 8).flatten()  # columns (tile for each row)
+  return x_list, y_list
+
+
 @caching.ndarray_safe_lru_cache(1)
-def _get_dof_indices(freedofs, fixdofs, k_xlist, k_ylist):
+def _get_dof_indices(nely, nelx, freedofs, fixdofs):
+  k_xlist, k_ylist = get_k_indices(nely, nelx)
   index_map = autograd.inverse_permutation(
       np.concatenate([freedofs, fixdofs]))
   keep = np.isin(k_xlist, freedofs) & np.isin(k_ylist, freedofs)
-  i = index_map[k_ylist][keep]
-  j = index_map[k_xlist][keep]
+  i = index_map[k_xlist][keep]
+  j = index_map[k_ylist][keep]
   return index_map, keep, np.stack([i, j])
 
 
@@ -136,10 +155,13 @@ def displace(x_phys, ke, forces, freedofs, fixdofs, *,
   # Displaces the load x using finite element techniques. The spsolve here
   # occupies the majority of this entire simulation's runtime.
   stiffness = young_modulus(x_phys, e_0, e_min, p=penal)
-  k_entries, k_ylist, k_xlist = get_k(stiffness, ke)
+  nely, nelx = stiffness.shape
+  
+  # Get precomputed indices
+  k_entries = (stiffness.T.reshape(-1, 1, 1) * ke).flatten()
 
   index_map, keep, indices = _get_dof_indices(
-      freedofs, fixdofs, k_ylist, k_xlist
+      nely, nelx, freedofs, fixdofs
   )
   u_nonzero = autograd.solve_coo(k_entries[keep], indices, forces[freedofs],
                                      sym_pos=True)
@@ -151,24 +173,11 @@ def displace(x_phys, ke, forces, freedofs, fixdofs, *,
 def get_k(stiffness, ke):
   # Constructs a sparse stiffness matrix, k, for use in the displace function.
   nely, nelx = stiffness.shape
+  x_list, y_list = get_k_indices(nely, nelx)
 
-  # get position of the nodes of each element in the stiffness matrix
-  ely, elx = np.meshgrid(range(nely), range(nelx))  # x, y coords
-  ely, elx = ely.reshape(-1, 1), elx.reshape(-1, 1)
-
-  n1 = (nely+1)*(elx+0) + (ely+0)
-  n2 = (nely+1)*(elx+1) + (ely+0)
-  n3 = (nely+1)*(elx+1) + (ely+1)
-  n4 = (nely+1)*(elx+0) + (ely+1)
-  edof = np.array([2*n1, 2*n1+1, 2*n2, 2*n2+1, 2*n3, 2*n3+1, 2*n4, 2*n4+1])
-  edof = edof.T[0]
-
-  x_list = np.repeat(edof, 8)  # flat list pointer of each node in an element
-  y_list = np.tile(edof, 8).flatten()  # flat list pointer of each node in elem
-
-  # make the stiffness matrix
+  # make the stiffness matrix entries
   kd = stiffness.T.reshape(nelx*nely, 1, 1)
-  value_list = (kd * np.tile(ke, kd.shape)).flatten()
+  value_list = (kd * ke).flatten()
   return value_list, y_list, x_list
 
 

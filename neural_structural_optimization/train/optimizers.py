@@ -34,12 +34,16 @@ class Adam_Optimizer(BaseOptimizer):
     
     def __init__(self, model, max_iterations: int, lr_init: float = 1e-2, lr_final: float = 3e-3,
                  warmup_frac: float = 0.1, save_intermediate_designs: bool = True, 
-                 grad_clip: Optional[float] = None):
+                 grad_clip: Optional[float] = None,
+                 clip_weight_max: float = 1.0,
+                 clip_warmup_steps: int = 0):
         super().__init__(model, max_iterations, save_intermediate_designs)
         self.lr_init = lr_init
         self.lr_final = lr_final
         self.warmup_frac = warmup_frac
         self.grad_clip = grad_clip
+        self.clip_weight_max = float(clip_weight_max)
+        self.clip_warmup_steps = int(clip_warmup_steps)
     
     def optimize(self) -> xarray.Dataset:
         """Run Adam optimization."""
@@ -47,11 +51,17 @@ class Adam_Optimizer(BaseOptimizer):
         
         for i in tqdm(range(self.max_iterations + 1), desc="Adam Optimizer"):
             lr = cosine_warmup(i, self.max_iterations, self.warmup_frac, self.lr_init, self.lr_final)
+            cw = 0.0
+            if self.model.clip_loss is not None and self.clip_weight_max > 0:
+                if self.clip_warmup_steps > 0:
+                    cw = self.clip_weight_max * min(1.0, (i + 1) / float(self.clip_warmup_steps))
+                else:
+                    cw = self.clip_weight_max
             
             optimizer.param_groups[0]['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
             logits = self.model()
-            loss = self.model.get_total_loss(logits)
+            loss = self.model.get_total_loss(logits, clip_weight=cw)
             
             loss.backward()
             if self.grad_clip is not None:
@@ -69,7 +79,9 @@ class LBFGS_Optimizer(BaseOptimizer):
     def __init__(self, model, max_iterations: int, save_intermediate_designs: bool = True,
                  lr: float = 1.0, history_size: int = 100, line_search: str = 'strong_wolfe',
                  tol_rel: float = 1e-3, tol_abs: float = 1e-2, patience: int = 5, 
-                 min_steps: int = 20, coarse_start: bool = True):
+                 min_steps: int = 20, coarse_start: bool = True,
+                 clip_weight_max: float = 1.0,
+                 clip_warmup_steps: int = 0):
         super().__init__(model, max_iterations, save_intermediate_designs)
         self.lr = lr
         self.history_size = history_size
@@ -80,6 +92,8 @@ class LBFGS_Optimizer(BaseOptimizer):
         self.min_steps = min_steps
         self.coarse_start = coarse_start
         self._lam_clip = None
+        self.clip_weight_max = float(clip_weight_max)
+        self.clip_warmup_steps = int(clip_warmup_steps)
     
     def optimize(self) -> xarray.Dataset:
         """Run L-BFGS optimization."""
@@ -115,6 +129,13 @@ class LBFGS_Optimizer(BaseOptimizer):
                     self.model.clip_R = 1.0
                 self._lam_clip = calibrate_lambda_clip(self.model, logits_probe, R=self.model.clip_R, ortho=True)
             
+            if self.model.clip_loss is None or self.clip_weight_max <= 0:
+                clip_weight = 0.0
+            elif self.clip_warmup_steps > 0:
+                clip_weight = self.clip_weight_max * min(1.0, (step + 1) / float(self.clip_warmup_steps))
+            else:
+                clip_weight = self.clip_weight_max
+            
             def closure():
                 opt.zero_grad(set_to_none=True)
                 logits = self.model()
@@ -123,12 +144,12 @@ class LBFGS_Optimizer(BaseOptimizer):
                     if self.model.clip_loss is None:
                         loss = self.model.get_structural_loss(logits)
                     else:
-                        loss = self.model.get_semantic_loss(logits)
+                        loss = self.model.get_semantic_loss(logits) * clip_weight
                     loss.backward()
                     return loss
                 loss_structural = self.model.get_structural_loss(logits)
                 loss_semantic = self.model.get_semantic_loss(logits)
-                loss = loss_structural + loss_semantic * self._lam_clip
+                loss = loss_structural + loss_semantic * self._lam_clip * clip_weight
                 loss.backward()
                 return loss
             

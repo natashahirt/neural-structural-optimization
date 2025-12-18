@@ -84,24 +84,30 @@ def _cone_filter_matrix(nelx, nely, radius, mask):
   cols = []
   values = []
   r_bound = int(np.ceil(radius))
+  
+  # Precompute relative offsets and weights
+  offsets = []
   for dx in range(-r_bound, r_bound+1):
     for dy in range(-r_bound, r_bound+1):
-      weight = np.maximum(0, radius - np.sqrt(dx**2 + dy**2))
-      row = x + nelx * y
-      column = x + dx + nelx * (y + dy)
-      value = np.broadcast_to(weight, x.shape)
+      d2 = dx**2 + dy**2
+      if d2 < radius**2:
+        offsets.append((dx, dy, radius - np.sqrt(d2)))
 
-      # exclude cells beyond the boundary
-      valid = (
-          (mask > 0) &
-          ((x+dx) >= 0) &
-          ((x+dx) < nelx) &
-          ((y+dy) >= 0) &
-          ((y+dy) < nely)
-      )
-      rows.append(row[valid])
-      cols.append(column[valid])
-      values.append(value[valid])
+  for dx, dy, weight in offsets:
+    row = x + nelx * y
+    column = x + dx + nelx * (y + dy)
+    
+    # exclude cells beyond the boundary
+    valid = (
+        (np.broadcast_to(mask, x.shape) > 0) &
+        ((x+dx) >= 0) &
+        ((x+dx) < nelx) &
+        ((y+dy) >= 0) &
+        ((y+dy) < nely)
+    )
+    rows.append(row[valid])
+    cols.append(column[valid])
+    values.append(np.full(row[valid].shape, weight))
 
   data = np.concatenate(values)
   i = np.concatenate(rows)

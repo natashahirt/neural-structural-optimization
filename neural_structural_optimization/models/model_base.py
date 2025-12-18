@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neural_structural_optimization.structural.problems import StructuralParams
-from .loss_structural import StructuralLoss, torch_structural_loss
+from .loss_structural import StructuralLoss
 from .loss_clip import CLIPLoss
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
@@ -60,6 +60,7 @@ class Model(nn.Module):
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         object.__setattr__(self, "clip_loss", None)  # placeholder
+        self.clip_weight_default = 1.0
         if clip_loss is not None:
             clip_loss.clip_model = (
                 clip_loss.clip_model.to(self.device).eval().requires_grad_(False)
@@ -187,11 +188,8 @@ class Model(nn.Module):
             z = self._downfactor_logits(logits)
             env = self.analysis_env
 
-        # Prefer torch-native structural loss; fallback to NumPy bridge if needed.
-        try:
-            return torch_structural_loss(z, env).mean()
-        except Exception:
-            return StructuralLoss.apply(z, env).mean()
+        # Use NumPy/HIPS-autograd bridge (faster/stable on CPU)
+        return StructuralLoss.apply(z, env).mean()
 
     def get_semantic_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute clip-based semantic loss."""
@@ -200,8 +198,23 @@ class Model(nn.Module):
         # Convert logits to images using sigmoid for CLIP loss
         return self.clip_loss(logits)
         
-    def get_total_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute total loss (currently just physics loss)."""
+    def get_total_loss(
+        self, 
+        logits: torch.Tensor, 
+        clip_weight: Optional[float] = None
+    ) -> torch.Tensor:
+        """
+        Compute combined loss with an optional semantic weight.
+        
+        Args:
+            logits: Raw design logits.
+            clip_weight: Scalar multiplier for semantic loss. If None, uses
+                `self.clip_weight_default` (defaults to 1.0). Ignored when
+                `clip_loss` is absent.
+        """
         structural_loss = self.get_structural_loss(logits)
         semantic_loss = self.get_semantic_loss(logits)
-        return structural_loss + semantic_loss
+        if self.clip_loss is None:
+            return structural_loss
+        w = self.clip_weight_default if clip_weight is None else float(clip_weight)
+        return structural_loss + semantic_loss * w
