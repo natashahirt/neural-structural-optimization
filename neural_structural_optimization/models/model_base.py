@@ -201,7 +201,9 @@ class Model(nn.Module):
     def get_total_loss(
         self, 
         logits: torch.Tensor, 
-        clip_weight: Optional[float] = None
+        clip_weight: Optional[float] = None,
+        dynamic_clip_alpha: Optional[float] = None,
+        compliance_weight: Optional[float] = None
     ) -> torch.Tensor:
         """
         Compute combined loss with an optional semantic weight.
@@ -211,10 +213,23 @@ class Model(nn.Module):
             clip_weight: Scalar multiplier for semantic loss. If None, uses
                 `self.clip_weight_default` (defaults to 1.0). Ignored when
                 `clip_loss` is absent.
+            dynamic_clip_alpha: If provided, scales the semantic CLIP loss weight
+                proportionally to the current structural loss via
+                `effective_weight = dynamic_clip_alpha * structural_loss.detach()`.
+                Overrides `clip_weight` when not None.
+            compliance_weight: Optional scalar to scale the structural loss term,
+                and to determine the dynamic CLIP weight when `dynamic_clip_alpha`
+                is provided (i.e., weight is based on the scaled structural loss).
         """
         structural_loss = self.get_structural_loss(logits)
+        structural_loss_eff = structural_loss if compliance_weight is None else (structural_loss * float(compliance_weight))
         semantic_loss = self.get_semantic_loss(logits)
         if self.clip_loss is None:
-            return structural_loss
-        w = self.clip_weight_default if clip_weight is None else float(clip_weight)
-        return structural_loss + semantic_loss * w
+            return structural_loss_eff
+        base_w = self.clip_weight_default if clip_weight is None else float(clip_weight)
+        if dynamic_clip_alpha is not None:
+            # Couple CLIP guidance to current (optionally scaled) compliance
+            w_eff = float(dynamic_clip_alpha) * structural_loss_eff.detach()
+        else:
+            w_eff = base_w
+        return structural_loss_eff + semantic_loss * w_eff

@@ -37,7 +37,7 @@ class PixelModel(Model):
             self.shape
         )
         self.z = nn.Parameter(
-            torch.tensor(z_init, dtype=torch.float64), 
+            torch.as_tensor(z_init, dtype=torch.float32, device=self.device), 
             requires_grad=True
         )
 

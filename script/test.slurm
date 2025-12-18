@@ -3,7 +3,7 @@
 #SBATCH --job-name=neo-run
 #SBATCH -c 8                      # CPUs per task
 #SBATCH --mem=32G                 # adjust if needed
-#SBATCH --time=00:15:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/neo-%j.out
 #SBATCH --error=logs/neo-%j.err
 

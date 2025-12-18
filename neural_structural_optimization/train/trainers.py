@@ -135,7 +135,7 @@ class PixelRefineTrainer(ProgressiveTrainer):
                     if stage == 2:
                         model.clip_loss.crops_per_frac = (6, 10, 12)
                         model.clip_loss.min_patch_px = max(96, min(model.shape[1], model.shape[2]) // 4)
-                        model.use_pairwise_spread = True
+                        model.clip_loss.use_pairwise_spread = True
                         model.clip_R = 2.0
                     if stage == 3:
                         model.clip_loss.patch_fracs = (0.75, 0.5, 0.25)
@@ -172,7 +172,7 @@ class PixelRefineTrainer(ProgressiveTrainer):
             ds = optimizer.optimize()
             ds_history.append(ds)
             
-            if stage < self.resize_num - 1 and stage != 1:
+            if stage < self.resize_num - 1:
                 self._upsample_model()
         
         return ds_history

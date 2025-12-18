@@ -686,7 +686,8 @@ class CLIPLoss(nn.Module):
         return L_pos + L_neg + L_low
 
     def forward(self, logits: torch.Tensor):
-        input_image = torch.sigmoid(logits)
+        # Ensure NCHW before any spatial ops like blur
+        input_image = _ensure_nchw(torch.sigmoid(logits))
         clip_image = _gaussian_blur(input_image, sigma=self.preblur_sigma) if self.preblur_sigma > 0 else input_image
         loss = (self.evaluate_image_to_image(clip_image, self.image_prompt) 
                 if self.image_prompt is not None 

@@ -580,6 +580,11 @@ class StructuralParams:
     filter_width: float = 1.5  # filter width for density filtering
     rmin: float = 1.5  # minimum radius for density filtering
     
+    # projection parameters
+    heavyside: bool = True  # use heaviside projection?
+    beta: float = 2.0       # heaviside sharpness
+    eta: float = 0.5        # heaviside threshold
+    
     # for beam and cantilever
     force_position: float = 0.5 # 0. is top, 1. is bottom
     support_position: float = 0.25 # for 2-point cantilevers

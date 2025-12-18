@@ -161,7 +161,7 @@ class CNNModel(Model):
                 x = (1.0 - self._warm_tau) * x + self._warm_tau * self._rho_hi_logit[None, None]
 
         # Convert to float64 for physics computation
-        return x[:, 0, :, :].to(torch.float64)
+        return x[:, 0, :, :].to(torch.float32)
 
     def loss(self, logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute the total loss including physics and distillation losses."""

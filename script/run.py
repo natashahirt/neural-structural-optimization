@@ -14,6 +14,7 @@
 
 import sys
 import re
+import os
 from pathlib import Path
 from PIL import Image
 import seaborn
@@ -27,6 +28,7 @@ OUTPUT_DIR = Path("script/test_results_pytorch")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 from neural_structural_optimization.structural import utils as pipeline_utils
 from neural_structural_optimization.structural import problems
@@ -50,6 +52,16 @@ def create_filename_suffix(suffix_str: str | None) -> str:
     print(f"Using filename suffix: {suffix}")
     
     return f"_{suffix}"
+
+def slurm_tag() -> str:
+    """Return a SLURM-based identifier like '{7322721}' if available, else ''."""
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if job_id:
+        return f"{{{job_id}}}"
+    job_name = os.environ.get("SLURM_JOB_NAME")
+    if job_name:
+        return f"{{{job_name}}}"
+    return ""
 
 def load_initial_image(image_path: str | Path, target_shape: tuple[int, int] | None = None) -> torch.Tensor:
     """Load and preprocess an initial image for model initialization."""
@@ -121,7 +133,7 @@ def save_loss_plot(ds_history, filename_suffix: str) -> Path:
     seaborn.despine()
     plt.tight_layout()
 
-    plot_path = OUTPUT_DIR / f"optimization_comparison_loss{filename_suffix}.png"
+    plot_path = OUTPUT_DIR / f"optimization_comparison_loss_{filename_suffix}.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -155,7 +167,7 @@ def save_final_designs_plot(ds_history, params, filename_suffix: str) -> Path:
         ax.axis("off")
 
     plt.tight_layout()
-    plot_path = OUTPUT_DIR / f"final_designs{filename_suffix}.png"
+    plot_path = OUTPUT_DIR / f"final_designs_{filename_suffix}.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return plot_path
@@ -167,11 +179,11 @@ def main(suffix_str: str | None = None) -> int:
     print("=" * 60)
 
     user_suffix = suffix_str if suffix_str is not None else " ".join(sys.argv[1:])
-    filename_suffix = create_filename_suffix(user_suffix)
+    filename_suffix = f"{create_filename_suffix(user_suffix)}{slurm_tag()}"
     ensure_output_dir()
 
     try:
-        max_iterations = 200
+        max_iterations = 100
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"\nStarting optimization on device: {device}")
 
@@ -183,8 +195,27 @@ def main(suffix_str: str | None = None) -> int:
                 clip_model_name="ViT-B/32",
                 clip_rn_model_name="RN50",
                 device=device,
-                positive_prompts=["butterfly wing silhouette"],
-                pos_weights=None,
+                positive_prompts=[
+                    "butterfly wing silhouette",
+                    "black and white",
+                    "high contrast",
+                    "minimal",
+                    "outline",
+                ],
+                negative_prompts=[
+                    "photograph",
+                    "texture",
+                    "shading",
+                    "noise",
+                    "background",
+                    "multiple objects",
+                    "text",
+                    "watermark",
+                ],
+                num_augs=24,
+                preblur_sigma=0.7,
+                num_global_views=1,
+                center_crop_frac=0.90,
             )
 
         params = StructuralParams(
@@ -205,6 +236,7 @@ def main(suffix_str: str | None = None) -> int:
         print(f"Max iterations: {max_iterations}")
 
         model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        # Do not compile the CNN during progressive resizing; it interferes with upsampling
         trainer = PixelRefineTrainer(
             model,
             max_iterations,
@@ -213,7 +245,17 @@ def main(suffix_str: str | None = None) -> int:
             coarse_start=True,
             initial_image=None,
         )
-        ds_history = normalize_history(trainer.train(LBFGS_Optimizer))
+        # Match pasted-script-style parameters:
+        #   - clip_alpha: scales semantic CLIP by current compliance (detached)
+        #   - compliance_weight: scales the structural/compliance loss
+        ds_history = normalize_history(trainer.train(
+            LBFGS_Optimizer,
+            clip_alpha=1e-2,
+            compliance_weight=1.0,
+            # You can still use warmup/static weighting if clip_alpha=None
+            clip_weight_max=1.0,
+            clip_warmup_steps=0,
+        ))
 
         print(f"\nOptimization completed! Stages: {len(ds_history)}")
 

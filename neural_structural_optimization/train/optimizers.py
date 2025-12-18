@@ -21,6 +21,8 @@ import numpy as np
 import torch
 import xarray
 from tqdm import tqdm
+from pathlib import Path
+from PIL import Image
 
 from neural_structural_optimization import models
 from neural_structural_optimization.models import PixelModel, CNNModel
@@ -36,7 +38,9 @@ class Adam_Optimizer(BaseOptimizer):
                  warmup_frac: float = 0.1, save_intermediate_designs: bool = True, 
                  grad_clip: Optional[float] = None,
                  clip_weight_max: float = 1.0,
-                 clip_warmup_steps: int = 0):
+                 clip_warmup_steps: int = 0,
+                 clip_alpha: Optional[float] = None,
+                 compliance_weight: Optional[float] = None):
         super().__init__(model, max_iterations, save_intermediate_designs)
         self.lr_init = lr_init
         self.lr_final = lr_final
@@ -44,6 +48,12 @@ class Adam_Optimizer(BaseOptimizer):
         self.grad_clip = grad_clip
         self.clip_weight_max = float(clip_weight_max)
         self.clip_warmup_steps = int(clip_warmup_steps)
+        self.clip_alpha = clip_alpha
+        self.compliance_weight = compliance_weight
+        # baseline structural loss for normalized inverse coupling
+        self._baseline_Ls = None
+        # cap for dynamic CLIP weight to avoid late domination
+        self._clip_dynamic_w_max = 2000.0
     
     def optimize(self) -> xarray.Dataset:
         """Run Adam optimization."""
@@ -61,7 +71,24 @@ class Adam_Optimizer(BaseOptimizer):
             optimizer.param_groups[0]['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
             logits = self.model()
-            loss = self.model.get_total_loss(logits, clip_weight=cw)
+            if self.clip_alpha is not None:
+                # Inverse-normalized, capped dynamic coupling
+                Ls = self.model.get_structural_loss(logits)
+                Lc = self.model.get_semantic_loss(logits) if self.model.clip_loss is not None else Ls.new_tensor(0.0)
+                Ls_eff = Ls if self.compliance_weight is None else (Ls * float(self.compliance_weight))
+                if self._baseline_Ls is None:
+                    self._baseline_Ls = float(Ls_eff.detach())
+                denom = max(self._baseline_Ls if self._baseline_Ls is not None else 1.0, 1e-8)
+                # weight grows as compliance shrinks; clamp to safe cap
+                raw_w = float(self.clip_alpha) * (self._baseline_Ls / (float(Ls_eff.detach()) + 1e-8))
+                w_eff = min(raw_w, self._clip_dynamic_w_max)
+                loss = Ls_eff + Lc * w_eff
+            else:
+                loss = self.model.get_total_loss(
+                    logits,
+                    clip_weight=cw,
+                    compliance_weight=self.compliance_weight,
+                )
             
             loss.backward()
             if self.grad_clip is not None:
@@ -81,7 +108,9 @@ class LBFGS_Optimizer(BaseOptimizer):
                  tol_rel: float = 1e-3, tol_abs: float = 1e-2, patience: int = 5, 
                  min_steps: int = 20, coarse_start: bool = True,
                  clip_weight_max: float = 1.0,
-                 clip_warmup_steps: int = 0):
+                 clip_warmup_steps: int = 0,
+                 clip_alpha: Optional[float] = None,
+                 compliance_weight: Optional[float] = None):
         super().__init__(model, max_iterations, save_intermediate_designs)
         self.lr = lr
         self.history_size = history_size
@@ -94,6 +123,10 @@ class LBFGS_Optimizer(BaseOptimizer):
         self._lam_clip = None
         self.clip_weight_max = float(clip_weight_max)
         self.clip_warmup_steps = int(clip_warmup_steps)
+        self.clip_alpha = clip_alpha
+        self.compliance_weight = compliance_weight
+        self._baseline_Ls = None
+        self._clip_dynamic_w_max = 2000.0
     
     def optimize(self) -> xarray.Dataset:
         """Run L-BFGS optimization."""
@@ -121,7 +154,7 @@ class LBFGS_Optimizer(BaseOptimizer):
 
             with torch.no_grad():
                 logits_probe = self.model()
-            if self.model.clip_loss is None:
+            if self.model.clip_loss is None or self.clip_alpha is not None:
                 self._lam_clip = None
             elif self._lam_clip is None or step == 0 or step % 10 == 0:
                 # clip_R is used only when clip_loss exists
@@ -139,24 +172,68 @@ class LBFGS_Optimizer(BaseOptimizer):
             def closure():
                 opt.zero_grad(set_to_none=True)
                 logits = self.model()
+                if self.clip_alpha is not None:
+                    # Inverse-normalized, capped dynamic coupling
+                    Ls = self.model.get_structural_loss(logits)
+                    Lc = self.model.get_semantic_loss(logits) if self.model.clip_loss is not None else Ls.new_tensor(0.0)
+                    Ls_eff = Ls if self.compliance_weight is None else (Ls * float(self.compliance_weight))
+                    if self._baseline_Ls is None:
+                        self._baseline_Ls = float(Ls_eff.detach())
+                    denom = max(self._baseline_Ls if self._baseline_Ls is not None else 1.0, 1e-8)
+                    raw_w = float(self.clip_alpha) * (self._baseline_Ls / (float(Ls_eff.detach()) + 1e-8))
+                    w_eff = min(raw_w, self._clip_dynamic_w_max)
+                    loss = Ls_eff + Lc * w_eff
+                    loss.backward()
+                    # Ensure grads are contiguous for LBFGS (it uses view(-1) on grads)
+                    for p in self.model.parameters():
+                        if p.grad is not None and not p.grad.is_contiguous():
+                            p.grad = p.grad.contiguous()
+                    return loss
                 if self._lam_clip is None:
                     # No semantic loss configured; fall back to structural-only if clip_loss is absent.
                     if self.model.clip_loss is None:
-                        loss = self.model.get_structural_loss(logits)
+                        if self.compliance_weight is None:
+                            loss = self.model.get_structural_loss(logits)
+                        else:
+                            loss = self.model.get_structural_loss(logits) * float(self.compliance_weight)
                     else:
                         loss = self.model.get_semantic_loss(logits) * clip_weight
                     loss.backward()
+                    for p in self.model.parameters():
+                        if p.grad is not None and not p.grad.is_contiguous():
+                            p.grad = p.grad.contiguous()
                     return loss
                 loss_structural = self.model.get_structural_loss(logits)
                 loss_semantic = self.model.get_semantic_loss(logits)
+                if self.compliance_weight is not None:
+                    loss_structural = loss_structural * float(self.compliance_weight)
                 loss = loss_structural + loss_semantic * self._lam_clip * clip_weight
                 loss.backward()
+                for p in self.model.parameters():
+                    if p.grad is not None and not p.grad.is_contiguous():
+                        p.grad = p.grad.contiguous()
                 return loss
             
             loss = opt.step(closure)
             loss_val = float(loss.detach())
             
             self.tracker.add_step(loss_val, self.model().detach().cpu().numpy())
+
+            # Save a progress image every 10 iterations to script/test_results_pytorch/progress.png
+            if (step + 1) % 10 == 0:
+                try:
+                    with torch.no_grad():
+                        logits_now = self.model()
+                        design_prob = torch.sigmoid(logits_now)
+                        design_2d = design_prob.squeeze().detach().cpu().numpy()
+                        design_2d = np.clip(1.0 - design_2d, 0.0, 1.0)
+                        img = (design_2d * 255.0).astype(np.uint8)
+                        out_dir = Path("script/test_results_pytorch")
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        Image.fromarray(img, mode='L').save(out_dir / "progress.png")
+                except Exception:
+                    # Do not interrupt optimization if saving fails
+                    pass
             
             if prev_loss is not None:
                 d = loss_val - prev_loss
