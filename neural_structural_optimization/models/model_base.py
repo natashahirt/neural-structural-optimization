@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neural_structural_optimization.structural.problems import StructuralParams
-from .loss_structural import StructuralLoss
+from .loss_structural import StructuralLoss, torch_structural_loss
 from .loss_clip import CLIPLoss
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
@@ -181,12 +181,17 @@ class Model(nn.Module):
         if not hasattr(self, 'analysis_factor'):
             self._set_analysis_factor()
             
-        if getattr(self, 'analysis_factor', 1) == 1:
-            return StructuralLoss.apply(logits, self.env).mean()
-            
-        # Use downfactored structural grid
-        z = self._downfactor_logits(logits)
-        return StructuralLoss.apply(z, self.analysis_env).mean()
+        env = self.env
+        z = logits
+        if getattr(self, 'analysis_factor', 1) != 1:
+            z = self._downfactor_logits(logits)
+            env = self.analysis_env
+
+        # Prefer torch-native structural loss; fallback to NumPy bridge if needed.
+        try:
+            return torch_structural_loss(z, env).mean()
+        except Exception:
+            return StructuralLoss.apply(z, env).mean()
 
     def get_semantic_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute clip-based semantic loss."""

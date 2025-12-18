@@ -37,7 +37,7 @@ import autograd
 import autograd.core
 import autograd.extend
 import autograd.numpy as anp
-from neural_structural_optimization import caching
+import neural_structural_optimization.caching as caching
 import numpy as np
 import scipy.ndimage
 import scipy.sparse

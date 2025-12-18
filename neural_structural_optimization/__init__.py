@@ -13,19 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Core modules
-from . import models
-from . import train
-from . import pipeline
-from . import caching
-from . import structural
-
-
-# CLIP integration (optional - only if CLIP is available)
-try:
-    from .models.loss_clip import CLIPLoss
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-
+# Keep __init__ lightweight to avoid circular imports; import submodules explicitly where needed.
 __version__ = "0.1.0"
+
+# Optional CLIP availability flag
+try:
+    from .models.loss_clip import CLIPLoss  # type: ignore
+    CLIP_AVAILABLE = True
+except Exception:
+    CLIP_AVAILABLE = False

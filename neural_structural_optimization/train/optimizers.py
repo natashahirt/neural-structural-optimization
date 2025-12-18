@@ -16,6 +16,7 @@
 """Optimization algorithms for neural structural optimization."""
 
 from typing import Optional
+import logging
 import numpy as np
 import torch
 import xarray
@@ -106,14 +107,23 @@ class LBFGS_Optimizer(BaseOptimizer):
 
             with torch.no_grad():
                 logits_probe = self.model()
-            if self._lam_clip is None or step == 0 or step % 10 == 0:
+            if self.model.clip_loss is None:
+                self._lam_clip = None
+            elif self._lam_clip is None or step == 0 or step % 10 == 0:
+                # clip_R is used only when clip_loss exists
+                if not hasattr(self.model, "clip_R"):
+                    self.model.clip_R = 1.0
                 self._lam_clip = calibrate_lambda_clip(self.model, logits_probe, R=self.model.clip_R, ortho=True)
             
             def closure():
                 opt.zero_grad(set_to_none=True)
                 logits = self.model()
                 if self._lam_clip is None:
-                    loss = self.model.get_semantic_loss(logits)
+                    # No semantic loss configured; fall back to structural-only if clip_loss is absent.
+                    if self.model.clip_loss is None:
+                        loss = self.model.get_structural_loss(logits)
+                    else:
+                        loss = self.model.get_semantic_loss(logits)
                     loss.backward()
                     return loss
                 loss_structural = self.model.get_structural_loss(logits)
@@ -167,6 +177,7 @@ class MMA_Optimizer(BaseOptimizer):
     def optimize(self) -> xarray.Dataset:
         """Run MMA optimization."""
         import nlopt  # pylint: disable=g-import-not-at-top
+        import autograd  # pylint: disable=g-import-not-at-top
         
         env = self.model.env
         if self.init_model is None:

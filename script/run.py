@@ -163,7 +163,7 @@ def main():
                 initial_image = None
 
         # Example 3: CNNModel with pixel refinement using PixelRefineTrainer
-        model = models.CNNModel(structural_params=params, clip_loss=clip_loss, **dynamic_kwargs)
+        model = models.CNNModel(structural_params=params, clip_loss=None, **dynamic_kwargs)
         trainer = PixelRefineTrainer(
             model, 
             max_iterations, 

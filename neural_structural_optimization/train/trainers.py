@@ -121,24 +121,25 @@ class PixelRefineTrainer(ProgressiveTrainer):
             self._initialize_model_with_image(model)
         
         for stage in range(self.resize_num):
-            if stage == 0:
-                model.clip_loss.use_patch_pyramid = True
-                model.clip_loss.global_downside = 100
-                model.clip_loss.use_pairwise_spread = False
-                model.clip_R = 7.0
-            elif stage == 1:
-                model.clip_loss.use_patch_pyramid = False
-                model.clip_R = 2.0
-            else:
-                model.clip_loss.use_patch_pyramid = True
-                if stage == 2:
-                    model.clip_loss.crops_per_frac = (6, 10, 12)
-                    model.clip_loss.min_patch_px = max(96, min(model.shape[1], model.shape[2]) // 4)
-                    model.use_pairwise_spread = True
+            if model.clip_loss is not None:
+                if stage == 0:
+                    model.clip_loss.use_patch_pyramid = True
+                    model.clip_loss.global_downside = 100
+                    model.clip_loss.use_pairwise_spread = False
+                    model.clip_R = 7.0
+                elif stage == 1:
+                    model.clip_loss.use_patch_pyramid = False
                     model.clip_R = 2.0
-                if stage == 3:
-                    model.clip_loss.patch_fracs = (0.75, 0.5, 0.25)
-                    model.clip_loss.crops_per_frac = (8, 16, 24)
+                else:
+                    model.clip_loss.use_patch_pyramid = True
+                    if stage == 2:
+                        model.clip_loss.crops_per_frac = (6, 10, 12)
+                        model.clip_loss.min_patch_px = max(96, min(model.shape[1], model.shape[2]) // 4)
+                        model.use_pairwise_spread = True
+                        model.clip_R = 2.0
+                    if stage == 3:
+                        model.clip_loss.patch_fracs = (0.75, 0.5, 0.25)
+                        model.clip_loss.crops_per_frac = (8, 16, 24)
 
             # Switch to PixelModel if CNN resolution exceeds threshold
             if isinstance(model, CNNModel) and max(model.shape[1], model.shape[2]) > self.switch_threshold:
