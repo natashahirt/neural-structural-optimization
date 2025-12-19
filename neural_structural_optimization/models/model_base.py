@@ -159,9 +159,18 @@ class Model(nn.Module):
         analysis_dict = {
             'width': int(round(W / f)),
             'height': int(round(H / f)),
-            'rmin': self.structural_params.rmin / f,
-            'filter_width': self.structural_params.filter_width / f
         }
+
+        # Only scale if numeric
+        if isinstance(self.structural_params.rmin, (int, float)):
+            analysis_dict['rmin'] = self.structural_params.rmin / f
+        else:
+            analysis_dict['rmin'] = self.structural_params.rmin
+
+        if isinstance(self.structural_params.filter_width, (int, float)):
+            analysis_dict['filter_width'] = self.structural_params.filter_width / f
+        else:
+            analysis_dict['filter_width'] = self.structural_params.filter_width
 
         analysis_params = self.structural_params.copy(**analysis_dict)
         analysis_problem = analysis_params.get_problem()

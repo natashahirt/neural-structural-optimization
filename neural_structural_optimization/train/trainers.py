@@ -39,6 +39,12 @@ class ProgressiveTrainer:
         ds_history = []
         
         for stage in range(self.resize_num):
+            is_first = (stage == 0)
+            is_last = (stage == self.resize_num - 1)
+            
+            if not (is_first or is_last):
+                continue
+
             print(f"\nTraining stage {stage + 1}/{self.resize_num} at resolution: {self.model.shape[1]}x{self.model.shape[2]}")
             
             optimizer = optimizer_class(self.model, self.max_iterations, 
@@ -47,17 +53,18 @@ class ProgressiveTrainer:
             ds = optimizer.optimize()
             ds_history.append(ds)
             
-            if stage < self.resize_num - 1:
-                self._upsample_model()
+            if is_first and self.resize_num > 1:
+                jump_scale = 2 ** (self.resize_num - 1)
+                self._upsample_model(scale=jump_scale)
         
         return ds_history
     
-    def _upsample_model(self):
+    def _upsample_model(self, scale: int = 2):
         """Upsample the model for next stage."""
         if isinstance(self.model, PixelModel):
-            self.model.upsample(scale=2, max_dim=500)
+            self.model.upsample(scale=scale, max_dim=500)
         elif isinstance(self.model, CNNModel):
-            self.model.upsample(scale=2, freeze_transferred=True)
+            self.model.upsample(scale=scale, freeze_transferred=True)
 
 class PixelRefineTrainer(ProgressiveTrainer):
     """Handles progressive training with pixel refinement (CNN to PixelModel transition)."""
@@ -110,56 +117,62 @@ class PixelRefineTrainer(ProgressiveTrainer):
                     # Set the model's initial state to produce something close to the image
                     # This might require model-specific initialization logic
                     pass
+
+    def _switch_to_pixel_model(self):
+        """Switch current model from CNNModel to PixelModel at the same resolution."""
+        if not isinstance(self.model, CNNModel):
+            return
+            
+        print(f"\nSwitching to PixelModel at resolution: {self.model.shape[1]}x{self.model.shape[2]}")
+        pixel_model = PixelModel(
+            structural_params=self.model.structural_params,
+            clip_loss=self.model.clip_loss,
+            seed=self.model.seed
+        )
+        
+        with torch.no_grad():
+            cnn_logits = self.model.forward()
+            pixel_model.z.data.copy_(cnn_logits)
+            
+            # Match statistics to ensure smooth transition
+            ref_img = torch.sigmoid(cnn_logits)
+            match_mean_std_in_logit_space(pixel_model.z, ref_img)
+        
+        self.model = pixel_model
     
     def train(self, optimizer_class: Callable, **optimizer_kwargs) -> List[xarray.Dataset]:
         """Run progressive training with pixel refinement."""
         ds_history = []
-        model = self.model
         
         # Initialize model with image if provided
         if self.initial_image is not None:
-            self._initialize_model_with_image(model)
+            self._initialize_model_with_image(self.model)
         
         for stage in range(self.resize_num):
+            is_first = (stage == 0)
+            is_last = (stage == self.resize_num - 1)
+            
+            if not (is_first or is_last):
+                continue
+
+            # Switch to PixelModel if CNN resolution exceeds threshold (early switch)
+            if isinstance(self.model, CNNModel) and max(self.model.shape[1], self.model.shape[2]) > self.switch_threshold:
+                self._switch_to_pixel_model()
+
+            model = self.model
             if model.clip_loss is not None:
                 if stage == 0:
                     model.clip_loss.use_patch_pyramid = True
                     model.clip_loss.global_downside = 100
                     model.clip_loss.use_pairwise_spread = False
                     model.clip_R = 7.0
-                elif stage == 1:
-                    model.clip_loss.use_patch_pyramid = False
-                    model.clip_R = 2.0
-                else:
+                elif stage == self.resize_num - 1: # Use final stage logic
                     model.clip_loss.use_patch_pyramid = True
-                    if stage == 2:
-                        model.clip_loss.crops_per_frac = (6, 10, 12)
-                        model.clip_loss.min_patch_px = max(96, min(model.shape[1], model.shape[2]) // 4)
-                        model.clip_loss.use_pairwise_spread = True
-                        model.clip_R = 2.0
-                    if stage == 3:
-                        model.clip_loss.patch_fracs = (0.75, 0.5, 0.25)
-                        model.clip_loss.crops_per_frac = (8, 16, 24)
-
-            # Switch to PixelModel if CNN resolution exceeds threshold
-            if isinstance(model, CNNModel) and max(model.shape[1], model.shape[2]) > self.switch_threshold:
-                print(f"\nSwitching to PixelModel at resolution: {model.shape[1]}x{model.shape[2]}")
-                pixel_model = PixelModel(
-                    structural_params=model.structural_params,
-                    clip_loss=model.clip_loss,
-                    seed=model.seed
-                )
-                
-                with torch.no_grad():
-                    cnn_logits = model.forward()
-                    pixel_model.z.data.copy_(cnn_logits)
-                    
-                    # Match statistics to ensure smooth transition
-                    ref_img = torch.sigmoid(cnn_logits)
-                    match_mean_std_in_logit_space(pixel_model.z, ref_img)
-                
-                model = pixel_model
-                self.model = model  # Update the trainer's model reference
+                    model.clip_loss.patch_fracs = (0.75, 0.5, 0.25)
+                    model.clip_loss.crops_per_frac = (8, 16, 24)
+                    model.clip_loss.min_patch_px = max(96, min(model.shape[1], model.shape[2]) // 4)
+                    model.clip_loss.use_pairwise_spread = True
+                    model.clip_R = 2.0
 
             print(f"\nTraining stage {stage + 1}/{self.resize_num} at resolution: {model.shape[1]}x{model.shape[2]}")
             print(f"Using coarse_start={self.coarse_start}")
@@ -172,7 +185,20 @@ class PixelRefineTrainer(ProgressiveTrainer):
             ds = optimizer.optimize()
             ds_history.append(ds)
             
-            if stage < self.resize_num - 1:
-                self._upsample_model()
+            # AFTER coarsest level converges, if it's CNN, switch to Pixel and re-run at SAME resolution
+            if is_first and isinstance(self.model, CNNModel):
+                print(f"\nRefining coarsest stage with PixelModel...")
+                self._switch_to_pixel_model()
+                model = self.model # update local ref
+                
+                optimizer = optimizer_class(model, self.max_iterations,
+                                          save_intermediate_designs=self.save_intermediate_designs,
+                                          **optimizer_kwargs)
+                ds = optimizer.optimize()
+                ds_history.append(ds)
+
+            if is_first and self.resize_num > 1:
+                jump_scale = 2 ** (self.resize_num - 1)
+                self._upsample_model(scale=jump_scale)
         
         return ds_history
