@@ -1,12 +1,6 @@
-"""Test suite for neural structural optimization."""
+"""Test suite for neural structural optimization.
 
-# Import test modules for easy access
-from . import test_autograd
-from . import test_physics
-from . import test_pipeline
-
-__all__ = [
-    'test_autograd',
-    'test_physics', 
-    'test_pipeline'
-]
+Deliberately does not import the test modules. Eager imports here mean a single
+missing optional dependency (for example apache_beam, used only by
+test_pipeline) aborts collection for every other test module as well.
+"""

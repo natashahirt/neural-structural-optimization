@@ -119,15 +119,20 @@ class TopoPhysicsTest(absltest.TestCase):
   def test_run_toposim(self):
     # test that the full simulation runs without error
     args, coeffs, ke, u = get_mini_problem()
-    args['maxloop'] = 5  # short test run
+    args['opt_steps'] = 5  # short test run; run_toposim reads opt_steps
 
-    l, x, frames = physics.run_toposim(
+    # With loss_only=False the first element is the full loss trajectory.
+    losses, x, frames = physics.run_toposim(
         args=args, loss_only=False, verbose=False)
-    
+
     # Check that we got reasonable results
-    assert l > 0  # loss should be positive
+    assert len(losses) == args['opt_steps']
+    assert losses[-1] > 0  # loss should be positive
     assert x.shape == coeffs.shape  # output shape should match input
-    assert physics.mean_density(x, args) <= args['volfrac']  # density constraint
+    # Density constraint, with a tolerance: the constraint is met to ~1e-15, but
+    # the last ulp differs between the CHOLMOD and SuperLU solver backends, so an
+    # exact <= makes this test depend on which one happens to be installed.
+    assert physics.mean_density(x, args) <= args['volfrac'] + 1e-9
 
 if __name__ == '__main__':
   absltest.main()

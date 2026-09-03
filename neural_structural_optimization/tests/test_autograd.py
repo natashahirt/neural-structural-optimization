@@ -15,18 +15,20 @@
 
 # pylint: disable=g-complex-comprehension
 
-import autograd.numpy
+import autograd.numpy as anp
 from autograd.test_util import check_grads
-from neural_structural_optimization.structural import autograd
+# Aliased: this package ships its own module named `autograd`, which otherwise
+# shadows the third-party `autograd` imported above.
+from neural_structural_optimization.structural import autograd as topo_autograd
 import numpy as np
 from absl.testing import absltest
 
-cone_filter = autograd.cone_filter
-gaussian_filter = autograd.gaussian_filter
-scatter1d = autograd.scatter1d
-solve_coo = autograd.solve_coo
-inverse_permutation = autograd.inverse_permutation
-find_root = autograd.find_root
+cone_filter = topo_autograd.cone_filter
+gaussian_filter = topo_autograd.gaussian_filter
+scatter1d = topo_autograd.scatter1d
+solve_coo = topo_autograd.solve_coo
+inverse_permutation = topo_autograd.inverse_permutation
+find_root = topo_autograd.find_root
 
 
 class AutogradLibTest(absltest.TestCase):
@@ -75,7 +77,7 @@ class AutogradLibTest(absltest.TestCase):
     np.testing.assert_allclose(result, np.sqrt(2))
 
   def test_find_root_grad(self):
-    f = lambda x, y: y ** 2 - abs(autograd.numpy.mean(x))
+    f = lambda x, y: y ** 2 - abs(anp.mean(x))
     x0 = np.random.RandomState(0).randn(3)
     check_grads(lambda x: find_root(f, x, 0, 10, 1e-12), modes=['rev'])(x0)
 

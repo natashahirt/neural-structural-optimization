@@ -50,12 +50,4 @@ __all__ = [
     # Trainers
     'ProgressiveTrainer',
     'PixelRefineTrainer',
-    
-    # Legacy functions (deprecated but still available)
-    'train_adam',
-    'train_lbfgs',
-    'method_of_moving_asymptotes',
-    'optimality_criteria',
-    'train_progressive',
-    'train_pixel_refine',
 ]
