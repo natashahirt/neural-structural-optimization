@@ -132,8 +132,37 @@ class DiscretizationParityTest(absltest.TestCase):
         compliance, _PARITY_COMPLIANCE_NO_VC, rtol=_PARITY_RTOL, atol=_PARITY_ATOL)
 
 
+def _design_region_mean(density, args):
+  """Mean density over the design region only.
+
+  `density.mean()` is NOT the volume fraction on a masked problem: it averages
+  the zeroed non-design elements in too. On `l_shape` at volfrac 0.7 the two
+  differ by 0.25, so a test that uses the plain mean passes only because the
+  default problem's mask happens to be all ones.
+  """
+  mask = npo.broadcast_to(args['mask'], density.shape)
+  return float((density * mask).sum() / mask.sum())
+
+
 class VolumeUnderProjectionTest(absltest.TestCase):
-  """Gate 2: with heavyside=True, mean density must match volfrac."""
+  """Gate 2: with heavyside=True, the design region's mean must equal volfrac.
+
+  Swept OFF the volfrac == eta diagonal and over masked problems, because both
+  are places the constraint could fail invisibly. At volfrac == eta the
+  projection is mean-neutral, so a test pinned there cannot see a projection
+  that shifts the mean; and on a masked problem the plain array mean is wrong
+  by up to 0.25 regardless of whether the constraint holds.
+  """
+
+  _PROBLEMS = ('cantilever_beam_full', 'mbb_beam', 'l_shape',
+               'multistory_building')
+  _TOLERANCE = 1e-9
+
+  def _args(self, problem_name, volfrac, beta, eta):
+    params = StructuralParams(
+        problem_name=problem_name, width=60, height=60, density=volfrac,
+        heavyside=True, beta=beta, eta=eta)
+    return topo_api.specified_task(params.get_problem())
 
   def test_mean_density_matches_volfrac_across_beta(self):
     args = _default_structural_args()
@@ -147,7 +176,86 @@ class VolumeUnderProjectionTest(absltest.TestCase):
         density = physics.physical_density(
             logits, trial, volume_constraint=True)
         self.assertAlmostEqual(
-            float(density.mean()), trial['volfrac'], delta=1e-9)
+            _design_region_mean(density, trial), trial['volfrac'],
+            delta=self._TOLERANCE)
+
+  def test_mean_density_matches_volfrac_off_the_eta_diagonal(self):
+    for volfrac in (0.1, 0.3, 0.7):
+      for eta in (0.3, 0.7):
+        for beta in (4.0, 16.0):
+          with self.subTest(volfrac=volfrac, eta=eta, beta=beta):
+            args = self._args('cantilever_beam_full', volfrac, beta, eta)
+            logits = npo.random.RandomState(0).randn(
+                args['nely'], args['nelx']) * 2.0
+            density = physics.physical_density(
+                logits, args, volume_constraint=True)
+            self.assertAlmostEqual(
+                _design_region_mean(density, args), volfrac,
+                delta=self._TOLERANCE)
+
+  def test_mean_density_matches_volfrac_on_masked_problems(self):
+    for problem_name in self._PROBLEMS:
+      for beta in (4.0, 16.0):
+        with self.subTest(problem=problem_name, beta=beta):
+          args = self._args(problem_name, 0.3, beta, 0.5)
+          logits = npo.random.RandomState(0).randn(
+              args['nely'], args['nelx']) * 2.0
+          density = physics.physical_density(
+              logits, args, volume_constraint=True)
+          self.assertAlmostEqual(
+              _design_region_mean(density, args), 0.3, delta=self._TOLERANCE)
+
+  def test_no_density_bleeds_outside_the_design_region(self):
+    for problem_name in self._PROBLEMS:
+      with self.subTest(problem=problem_name):
+        args = self._args(problem_name, 0.3, 4.0, 0.5)
+        mask = npo.broadcast_to(args['mask'], (args['nely'], args['nelx']))
+        if mask.min() >= 1:
+          continue  # trivial mask, nothing to bleed into
+        logits = npo.random.RandomState(0).randn(
+            args['nely'], args['nelx']) * 2.0
+        density = physics.physical_density(
+            logits, args, volume_constraint=True)
+        self.assertEqual(float(npo.abs(density * (1 - mask)).max()), 0.0)
+
+  def test_plain_array_mean_is_not_the_volume_fraction(self):
+    """Pins WHY the helper exists, so nobody simplifies it back to .mean()."""
+    args = self._args('l_shape', 0.7, 16.0, 0.5)
+    logits = npo.random.RandomState(0).randn(
+        args['nely'], args['nelx']) * 2.0
+    density = physics.physical_density(logits, args, volume_constraint=True)
+    self.assertAlmostEqual(
+        _design_region_mean(density, args), 0.7, delta=self._TOLERANCE)
+    self.assertGreater(abs(float(density.mean()) - 0.7), 0.2)
+
+
+class VolumeWithoutProjectionTest(absltest.TestCase):
+  """The legacy path misses volfrac, and it always has -- pinned as a bound.
+
+  With projection off, the volume offset is solved on the raw sigmoid and the
+  cone filter is applied afterwards. The filter is not mean-preserving, so the
+  finished density misses volfrac by a small amount. This is PRE-EXISTING
+  behavior, not a regression from the density-chain reordering, and stage 3's
+  Venice reproduction depends on it staying exactly as it is -- hence a bound
+  rather than an equality. Enabling projection moves enforcement to the end of
+  the chain and drives this to ~1e-14.
+  """
+
+  _OBSERVED_MAX_ERROR = 1.1e-4
+
+  def test_legacy_path_misses_volfrac_by_a_bounded_amount(self):
+    for problem_name in ('cantilever_beam_full', 'multistory_building'):
+      for volfrac in (0.1, 0.3, 0.5, 0.7):
+        with self.subTest(problem=problem_name, volfrac=volfrac):
+          params = StructuralParams(
+              problem_name=problem_name, width=60, height=60, density=volfrac)
+          args = topo_api.specified_task(params.get_problem())
+          logits = npo.random.RandomState(0).randn(
+              args['nely'], args['nelx']) * 2.0
+          density = physics.physical_density(
+              logits, args, volume_constraint=True)
+          error = abs(_design_region_mean(density, args) - volfrac)
+          self.assertLess(error, self._OBSERVED_MAX_ERROR)
 
 
 class ParameterPropagationTest(absltest.TestCase):
