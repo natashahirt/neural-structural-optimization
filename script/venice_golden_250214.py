@@ -59,6 +59,19 @@ GOLDEN_IMAGE_PATH = (
     REPO_ROOT / 'script' / 'resources' / 'input_images' / 'dSketches'
     / 'thick_outer_lins.png')
 
+# Venice's own final design image, copied out of the same commit for the same
+# reason. The golden JSON records only scalars, so this is the reference run's
+# only surviving record of what it actually built, and it is what the design
+# comparison in `tests/test_venice_parity.py` is pinned against. It is the
+# design parameter resized to `img_width` and then clamped and inverted -- see
+# `attach_final_raw_design`.
+GOLDEN_FINAL_IMAGE_PATH = (
+    REPO_ROOT / 'script' / 'resources' / 'results'
+    / '250214_skeleton_loss_test_balanced_dynamic' / '2_final'
+    / ('0_final-P_multistory_building-M_Ada-T_skeletons-W_128-H_256-V_0.30'
+       '-LR_0.20-CW_10-ID_01-CompL_74.00-ClipL_0.38-VA_0.31'
+       '-balanced_dynamic.jpg'))
+
 
 @dataclass(frozen=True)
 class VeniceGoldenConfig:
@@ -143,6 +156,8 @@ GOLDEN_FINAL = {
     'clip_loss_raw': 0.3829488754272461,
     'clip_weight': 739.9691670938864,
     'total': 357.75022597425567,
+    # params['volume_actual'], i.e. `venice_volume_ratio` of the final design.
+    'volume_actual': 0.3148193359375,
 }
 
 
@@ -284,7 +299,9 @@ def run(
 
     The returned dataset carries the per-step term breakdown (`compliance`,
     `clip_loss`, `clip_loss_raw`, `clip_weight`) beside the scalar `loss`, so a
-    replay can be compared against the reference log field by field.
+    replay can be compared against the reference log field by field. It also
+    carries `final_design_raw`, the design parameter as the run left it -- see
+    :func:`attach_final_raw_design`.
 
     Args:
         config: the run configuration.
@@ -306,7 +323,112 @@ def run(
     model = build_model(clip_loss, config)
     seed_everything(config.seed)
 
-    return build_optimizer(model, config, max_iterations).optimize()
+    ds = build_optimizer(model, config, max_iterations).optimize()
+    return attach_final_raw_design(ds, model)
+
+
+def attach_final_raw_design(
+    ds: xarray.Dataset,
+    model: AdaptivePixelModel,
+) -> xarray.Dataset:
+    """Record the design parameter as the run left it, unrendered.
+
+    `ds['design']` holds the RENDERED design -- `Environment.render` applies the
+    volume constraint, which bounds it to [0, 1]. Two of the reference run's
+    artifacts are functions of the raw parameter instead, and neither can be
+    recovered from the rendered field:
+
+    * `params['volume_actual']` is Venice's `get_volume_ratio`, the fraction of
+      the raw parameter above 0.9 (`models.py` line 837).
+    * the final image is the raw parameter resized to `img_width`, THEN clamped
+      to [0, 1], then inverted (`models.py` line 815). That order matters, and
+      `tests/test_venice_parity._venice_display_field` reproduces it.
+
+    The raw parameter is unbounded -- the reference run's spans -11.78 to 13.12
+    -- so clamping and rendering are different operations and the distinction
+    matters. Its own dimensions are used because it lives on whichever stage
+    grid the run ended on, which is the final grid only when the resolution
+    schedule ran to completion.
+
+    Args:
+        ds: the run's dataset; modified in place.
+        model: the model the run left behind, holding the post-step parameter.
+
+    Returns:
+        `ds`, for chaining.
+    """
+    raw = model.z.detach().cpu().numpy()[0]
+    ds['final_design_raw'] = (('raw_y', 'raw_x'), raw)
+    return ds
+
+
+def venice_volume_ratio(field, threshold: float = 0.9) -> float:
+    """Venice's `get_volume_ratio`: the fraction of `field` above `threshold`.
+
+    A transcription of `models.py` line 837, and deliberately not a mean
+    density: it is a strict-inequality COUNT over the raw parameter, divided by
+    the element count. On a field that is not saturated the two disagree badly
+    -- the reference run logged a volume ratio of 0.3148 for a rendered mean
+    density that the volume constraint holds at 0.30 by construction, so
+    substituting the mean would turn this pin into a restatement of `volfrac`.
+
+    Args:
+        field: the raw design parameter, as an array or tensor.
+        threshold: the density a pixel must exceed to count as filled.
+
+    Returns:
+        The filled fraction, in [0, 1].
+    """
+    values = np.asarray(field)
+    return float((values > threshold).sum()) / values.size
+
+
+def save_replay_images(ds: xarray.Dataset, output_dir: Path) -> tuple[Path, Path]:
+    """Write the replay design next to Venice's own final image.
+
+    The replay is shown the way Venice saved it: resize the raw unbounded
+    parameter's short edge to `img_width`, then clamp to [0, 1], then invert
+    so material is black. That is the same round trip the parity harness uses,
+    so the PNG is a visual of the tensor the tests actually compare -- not a
+    second, prettier rendering of the volume-constrained field.
+
+    Args:
+        ds: a dataset that has already gone through `attach_final_raw_design`.
+        output_dir: `script/test_results_pytorch/` in a normal replay.
+
+    Returns:
+        `(replay_path, comparison_path)`.
+    """
+    from PIL import Image, ImageDraw
+
+    from neural_structural_optimization.models.loss_clip import _resize_short_side
+
+    raw = np.ascontiguousarray(ds['final_design_raw'].values, dtype=np.float32)
+    resized = _resize_short_side(
+        torch.as_tensor(raw)[None, None], GOLDEN.clip_resize_short_side,
+    ).clamp(0.0, 1.0)
+    replay = Image.fromarray(
+        (255.0 * (1.0 - resized[0, 0].cpu().numpy())).clip(0, 255).astype(np.uint8),
+        mode='L',
+    )
+    replay_path = output_dir / 'venice_golden_250214_replay.png'
+    replay.save(replay_path)
+
+    reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
+    if replay.size != reference.size:
+        replay = replay.resize(reference.size, Image.Resampling.NEAREST)
+
+    gap, label_h = 16, 28
+    width, height = reference.size
+    canvas = Image.new('L', (width * 2 + gap, height + label_h), 255)
+    canvas.paste(reference, (0, label_h))
+    canvas.paste(replay, (width + gap, label_h))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((8, 6), 'Venice 250214 (reference)', fill=0)
+    draw.text((width + gap + 8, 6), 'Hardfork replay', fill=0)
+    comparison_path = output_dir / 'venice_golden_250214_comparison.png'
+    canvas.save(comparison_path)
+    return replay_path, comparison_path
 
 
 def trajectory(ds: xarray.Dataset) -> dict:
@@ -314,6 +436,7 @@ def trajectory(ds: xarray.Dataset) -> dict:
     return {
         'converged': bool(ds.attrs['converged']),
         'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
+        'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
         'compliance_loss': [float(v) for v in ds['compliance'].values],
         'clip_loss': [float(v) for v in ds['clip_loss'].values],
         'clip_loss_raw': [float(v) for v in ds['clip_loss_raw'].values],
@@ -326,10 +449,14 @@ def main() -> int:
     """Replay the golden run and print its final point beside the reference."""
     ds = run()
 
-    output_path = REPO_ROOT / 'script' / 'test_results_pytorch' / REPLAY_FILENAME
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / REPLAY_FILENAME
     output_path.write_text(json.dumps(trajectory(ds), indent=2))
     print(f'\nWrote replay trajectory to {output_path}')
+    replay_image, comparison_image = save_replay_images(ds, output_dir)
+    print(f'Wrote replay design to {replay_image}')
+    print(f'Wrote side-by-side comparison to {comparison_image}')
 
     steps = int(ds.sizes['step'])
     print(f'\nStopped after {steps} steps '
@@ -343,6 +470,7 @@ def main() -> int:
         'clip_loss_raw': float(ds['clip_loss_raw'][-1]),
         'clip_weight': float(ds['clip_weight'][-1]),
         'total': float(ds['loss'][-1]),
+        'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
     }
     print(f'{"term":<16}{"replay":>18}{"reference":>18}{"rel. diff":>14}')
     for name, reference in GOLDEN_FINAL.items():
