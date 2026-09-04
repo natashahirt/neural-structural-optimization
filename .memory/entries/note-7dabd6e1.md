@@ -13,7 +13,7 @@ success: 'null'
 files: neural_structural_optimization/train/utils.py@d6106bb
 session_id: sess-bfd66d57
 created_at: '2026-09-04T00:06:13.645758+00:00'
-updated_at: '2026-09-04T00:06:13.645758+00:00'
+updated_at: '2026-09-04T18:32:58.355934+00:00'
 results: '[{"metric": "handoff_volume_error", "value": -7.5, "unit": "%", "split":
   "multistory_building volfrac=0.3 beta=4", "criterion": "should equal volfrac", "source":
   "stage-1-critic-pass-2"}, {"metric": "handoff_volume_error", "value": 8.5, "unit":
@@ -23,6 +23,7 @@ results: '[{"metric": "handoff_volume_error", "value": -7.5, "unit": "%", "split
   equal volfrac", "source": "stage-1-critic-pass-2"}, {"metric": "handoff_volume_error",
   "value": 11.2, "unit": "%", "split": "crane volfrac=0.3 beta=16", "criterion": "should
   equal volfrac", "source": "stage-1-critic-pass-2"}]'
+related_to: expe-38a0e2f4
 ---
 Found by adversarial review during stage 1. Deferred here by user decision rather than fixed, because it only bites when Heaviside projection is enabled (opt-in, off by default) and the handoff is redesigned in this stage anyway.
 
