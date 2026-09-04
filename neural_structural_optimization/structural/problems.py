@@ -27,6 +27,7 @@ overview:
 """
 
 import inspect
+import warnings
 from typing import Optional, Union
 
 import dataclasses
@@ -34,8 +35,144 @@ import dataclasses
 import numpy as np
 import skimage.draw
 
+from neural_structural_optimization.structural import physics
+
 
 X, Y = 0, 1
+
+# Discretization fields threaded into physics via Problem / specified_task.
+DISCRETIZATION_FIELDS = (
+    'filter_width',
+    'rmin',
+    'beta',
+    'heavyside',
+    'eta',
+)
+
+# Physics-compatible defaults (must match specified_task / legacy Venice runs).
+PHYSICS_DISCRETIZATION_DEFAULTS = {
+    'filter_width': 2.0,
+    'rmin': 2.0,
+    'beta': 2.0,
+    'heavyside': False,
+    'eta': 0.5,
+}
+
+# Values that the 'linear' keyword resolves to. There is no schedule behind
+# them: continuation is deliberately deferred until it can be designed
+# properly, so 'linear' currently just names these fixed starting points.
+_FILTER_WIDTH_LINEAR_FACTOR = 2.0  # blurry radius, 2 * rmin
+_BETA_LINEAR_VALUE = 1.0  # fluid projection sharpness
+
+
+def _resolve_filter_width(
+    value: Union[float, str, None],
+    rmin: float,
+) -> float:
+  """Resolve a filter_width field to a concrete radius, without validating it."""
+  if value is None:
+    return float(PHYSICS_DISCRETIZATION_DEFAULTS['filter_width'])
+  if not isinstance(value, str):
+    return float(value)
+  if value != 'linear':
+    raise ValueError(f"Unknown schedule {value!r} for 'filter_width'")
+  return float(_FILTER_WIDTH_LINEAR_FACTOR * rmin)
+
+
+def resolve_discretization_value(
+    name: str,
+    value: Union[float, str, bool, None],
+    *,
+    rmin: float,
+    nelx: Optional[int] = None,
+    nely: Optional[int] = None,
+) -> Union[float, bool]:
+  """Resolve a discretization parameter to a concrete float or bool for physics.
+
+  `nelx`/`nely` are the grid the radius will be applied to; pass them wherever
+  they are known so `check_filter_width` can bound the radius from above too.
+  """
+  if name == 'filter_width':
+    return physics.check_filter_width(
+        _resolve_filter_width(value, rmin), nelx=nelx, nely=nely)
+  if value is None:
+    return PHYSICS_DISCRETIZATION_DEFAULTS[name]
+  if name == 'heavyside':
+    return bool(value)
+  if not isinstance(value, str):
+    return float(value)
+  if value == 'linear':
+    if name == 'beta':
+      return float(_BETA_LINEAR_VALUE)
+    raise ValueError(
+        f"Unsupported linear schedule for {name!r}; only filter_width and "
+        "beta accept 'linear'."
+    )
+  raise ValueError(f"Unknown schedule {value!r} for {name!r}")
+
+
+def _effective_rmin(rmin: Union[float, str, None]) -> float:
+  """Return the concrete rmin used when resolving other schedules."""
+  if rmin is None:
+    return float(PHYSICS_DISCRETIZATION_DEFAULTS['rmin'])
+  if isinstance(rmin, str):
+    raise ValueError(f"rmin schedule strings are not supported; got {rmin!r}")
+  return float(rmin)
+
+
+def resolve_analysis_filter_width(
+    value: Union[float, str, None],
+    *,
+    rmin: Union[float, str, None],
+    nelx: Optional[int] = None,
+    nely: Optional[int] = None,
+) -> float:
+  """Resolve a filter radius for a DERIVED analysis grid, clamping if unusable.
+
+  The analysis grid is an internal downsampling of the design grid, so dividing
+  the radius by the analysis factor can drive it below the degeneracy threshold
+  through no fault of the user's configuration -- and it happens after a stage
+  has trained. `physics.clamp_filter_width` therefore warns and clamps where
+  `resolve_discretization_value` would raise.
+  """
+  return physics.clamp_filter_width(
+      _resolve_filter_width(value, _effective_rmin(rmin)),
+      nelx=nelx,
+      nely=nely,
+  )
+
+
+def apply_discretization_params(
+    problem: 'Problem',
+    params: 'StructuralParams',
+) -> None:
+  """Attach resolved discretization parameters from StructuralParams onto a Problem.
+
+  Fields left at None keep the `Problem` default, which makes `rmin` inert on
+  its own: it only reaches the filter radius through
+  ``filter_width='linear'``. Setting `rmin` alone is therefore warned about
+  rather than silently discarded.
+  """
+  rmin = _effective_rmin(params.rmin)
+  if params.rmin is not None and params.filter_width is None:
+    warnings.warn(
+        f'rmin={params.rmin} does not set the filter radius on its own; '
+        f'filter_width stays at {problem.filter_width}. Pass '
+        "filter_width='linear' to use 2 * rmin, or set filter_width "
+        'explicitly.',
+        stacklevel=3)
+  for name in DISCRETIZATION_FIELDS:
+    raw = getattr(params, name)
+    if raw is None:
+      continue
+    setattr(
+        problem,
+        name,
+        resolve_discretization_value(
+            name, raw, rmin=rmin, nelx=problem.width, nely=problem.height),
+    )
+  if params.rmin is not None:
+    problem.rmin = rmin
 
 
 @dataclasses.dataclass
@@ -67,6 +204,11 @@ class Problem:
   height: int = dataclasses.field(init=False)
   mirror_left: bool = dataclasses.field(init=False)
   mirror_right: bool = dataclasses.field(init=False)
+  filter_width: float = PHYSICS_DISCRETIZATION_DEFAULTS['filter_width']
+  rmin: float = PHYSICS_DISCRETIZATION_DEFAULTS['rmin']
+  beta: float = PHYSICS_DISCRETIZATION_DEFAULTS['beta']
+  heavyside: bool = PHYSICS_DISCRETIZATION_DEFAULTS['heavyside']
+  eta: float = PHYSICS_DISCRETIZATION_DEFAULTS['eta']
 
   def __post_init__(self):
     self.width = self.normals.shape[0] - 1
@@ -117,7 +259,18 @@ class Problem:
     else:
         new_mask = self.mask
 
-    return Problem(new_normals, new_forces, new_density, new_mask, new_name)    
+    return Problem(
+        new_normals,
+        new_forces,
+        new_density,
+        new_mask,
+        new_name,
+        filter_width=self.filter_width,
+        rmin=self.rmin,
+        beta=self.beta,
+        heavyside=self.heavyside,
+        eta=self.eta,
+    )
 
 
 def mbb_beam(width=60, height=20, density=0.5):
@@ -576,14 +729,23 @@ class StructuralParams:
     height: int = 60
     density: float = 0.5
     
-    # filtering parameters
-    filter_width: Union[float, str] = 1.5  # filter width for density filtering
-    rmin: float = 1.5  # minimum radius for density filtering
+    # filtering parameters (None → physics defaults in get_problem)
+    # rmin is inert unless filter_width='linear' asks for it (2 * rmin);
+    # setting rmin alone leaves the radius at the Problem default and warns.
+    filter_width: Union[float, str, None] = None
+    rmin: Union[float, str, None] = None
     
-    # projection parameters
-    heavyside: bool = True  # use heaviside projection?
-    beta: Union[float, str] = 2.0       # heaviside sharpness
-    eta: float = 0.5        # heaviside threshold
+    # projection parameters (None → physics defaults in get_problem)
+    # heavyside is EXPERIMENTAL: with the Heaviside projection enabled, the
+    # rendered/saved design does NOT satisfy the volume constraint that the
+    # objective enforces. Only the objective's view of the density is driven to
+    # `density`; the render runs heavy, and increasingly so the further
+    # `density` sits from `eta` (at density=0.3, eta=0.5, beta=16 the render is
+    # ~37% over). The gap is pinned by
+    # `HeavysideVolumeGapCharacterizationTest` and tracked for a later stage.
+    heavyside: Optional[bool] = None
+    beta: Union[float, str, None] = None
+    eta: Optional[float] = None
     
     # for beam and cantilever
     force_position: float = 0.5 # 0. is top, 1. is bottom
@@ -629,12 +791,43 @@ class StructuralParams:
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{param_name} must be between 0 and 1, got {value}")
         
-        # Validate filtering parameters
-        if isinstance(self.filter_width, (int, float)) and self.filter_width <= 0.0:
-            raise ValueError(f"filter_width must be positive, got {self.filter_width}")
-        if isinstance(self.rmin, (int, float)) and self.rmin <= 0.0:
-            raise ValueError(f"rmin must be positive, got {self.rmin}")
-        
+        # Validate filtering parameters. Schedule strings are resolved against
+        # rmin in get_problem(), which validates the resolved radius there.
+        if isinstance(self.filter_width, (int, float)) and not isinstance(
+            self.filter_width, bool
+        ):
+            physics.check_filter_width(
+                self.filter_width, nelx=self.width, nely=self.height)
+        if self.rmin is not None and isinstance(
+            self.rmin, (int, float)
+        ) and not isinstance(self.rmin, bool):
+            if not np.isfinite(self.rmin):
+                raise ValueError(
+                    f"rmin must be finite, got {self.rmin}. A non-finite rmin "
+                    "passes every one-sided comparison and only fails once "
+                    "filter_width='linear' turns it into a cone-filter radius.")
+            if self.rmin <= 0.0:
+                raise ValueError(f"rmin must be positive, got {self.rmin}")
+
+        # Validate projection parameters
+        if isinstance(self.beta, (int, float)) and not isinstance(self.beta, bool):
+            if not np.isfinite(self.beta):
+                raise ValueError(
+                    f"beta must be finite, got {self.beta}. Every comparison "
+                    "against a NaN beta is False, so it reaches the Heaviside "
+                    "projection and NaNs the whole density field; the first "
+                    "symptom is a Cholmod failure in the FEA solve.")
+            if self.beta <= 0.0:
+                raise ValueError(
+                    f"beta must be positive, got {self.beta}. The Heaviside "
+                    "projection is even in beta, so a negative value is not a "
+                    "weaker projection; use heavyside=False to disable it.")
+        if self.eta is not None and not 0.0 <= self.eta <= 1.0:
+            raise ValueError(
+                f"eta must lie in [0, 1], got {self.eta}. Outside that range "
+                "the Heaviside projection denominator cancels to zero and the "
+                "density field becomes NaN.")
+
         # Validate special cases
         if self.problem_name == "hoop" and 2 * self.width != self.height:
             raise ValueError("hoop problems require height = 2 * width")
@@ -694,8 +887,14 @@ class StructuralParams:
             raise ValueError(f"No problem found with the name {self.problem_name}.")
 
         sig = inspect.signature(problem_function)
-        filtered_params = {k: v for k, v in self.to_dict().items() if k in sig.parameters}
-        return problem_function(**filtered_params)
+        skip = set(DISCRETIZATION_FIELDS) | {'problem_name'}
+        filtered_params = {
+            k: v for k, v in self.to_dict().items()
+            if k in sig.parameters and k not in skip
+        }
+        problem = problem_function(**filtered_params)
+        apply_discretization_params(problem, self)
+        return problem
 
 # pylint: disable=line-too-long
 PROBLEMS_BY_CATEGORY = {

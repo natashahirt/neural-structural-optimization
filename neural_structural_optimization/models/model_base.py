@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from neural_structural_optimization.structural.problems import StructuralParams
+from neural_structural_optimization.structural.problems import (
+    StructuralParams,
+    resolve_analysis_filter_width,
+)
 from .loss_structural import StructuralLoss
 from .loss_clip import CLIPLoss
 from .config import DEFAULT_MAX_ANALYSIS_DIM
@@ -32,10 +35,9 @@ class Model(nn.Module):
                 self.structural_params = StructuralParams(**structural_params)
             else:
                 self.structural_params = structural_params
-                
+
             if args is None:
-                problem = self.structural_params.get_problem()
-                args = topo_api.specified_task(problem)
+                args = self._build_physics_args()
         else:
             self.structural_params = None
 
@@ -115,6 +117,16 @@ class Model(nn.Module):
             
         return mask
 
+    def _build_physics_args(self) -> dict:
+        """Build physics args with discretization schedules resolved to concrete values."""
+        return topo_api.specified_task(self.structural_params.get_problem())
+
+    def _refresh_physics_environment(self) -> None:
+        """Rebuild env/args after structural or discretization parameters change."""
+        new_args = self._build_physics_args()
+        self.env = topo_api.Environment(new_args)
+        self.args = new_args
+
     def _update_structural_params(self, scale: Optional[float] = None) -> None:
         """Update structural parameters, typically for upsampling."""
         new_params = {}
@@ -134,18 +146,23 @@ class Model(nn.Module):
             new_params['beta'] = self.structural_params.beta
             new_params['heavyside'] = self.structural_params.heavyside
             new_params['eta'] = self.structural_params.eta
-        
+
         self.structural_params = self.structural_params.copy(**new_params)
-        problem = self.structural_params.get_problem()
-        new_args = topo_api.specified_task(problem)
-        self.env = topo_api.Environment(new_args)
-        self.args = new_args
+        self._refresh_physics_environment()
         
         # Update mask for new structural parameters
         self.mask = torch.as_tensor(self.args['mask'], dtype=torch.float64)
 
     def _set_analysis_factor(self, max_dim: int = DEFAULT_MAX_ANALYSIS_DIM, reset: bool = False) -> None:
-        """Set analysis factor for downsampling during physics computation."""
+        """Set analysis factor for downsampling during physics computation.
+
+        The analysis grid divides both the grid and the filter radius by the
+        analysis factor, so the derived radius can fall below the degeneracy
+        threshold for a configuration that is perfectly valid on the design
+        grid. This runs after a stage has finished training (`PixelModel.
+        upsample` calls it), so `resolve_analysis_filter_width` clamps such a
+        radius with a warning instead of raising and discarding the stage.
+        """
         _, H, W = self.shape
         f = max(1, max((H + max_dim - 1) // max_dim, (W + max_dim - 1) // max_dim))
         self.analysis_factor = f
@@ -168,13 +185,21 @@ class Model(nn.Module):
             analysis_dict['rmin'] = self.structural_params.rmin
 
         if isinstance(self.structural_params.filter_width, (int, float)):
-            analysis_dict['filter_width'] = self.structural_params.filter_width / f
+            scaled_filter_width = self.structural_params.filter_width / f
         else:
-            analysis_dict['filter_width'] = self.structural_params.filter_width
+            scaled_filter_width = self.structural_params.filter_width
+
+        # Resolve to a concrete radius here so the clamp applies to the value
+        # physics will actually use, rather than to an unresolved schedule.
+        analysis_dict['filter_width'] = resolve_analysis_filter_width(
+            scaled_filter_width,
+            rmin=analysis_dict['rmin'],
+            nelx=analysis_dict['width'],
+            nely=analysis_dict['height'],
+        )
 
         analysis_params = self.structural_params.copy(**analysis_dict)
-        analysis_problem = analysis_params.get_problem()
-        analysis_args = topo_api.specified_task(analysis_problem)
+        analysis_args = topo_api.specified_task(analysis_params.get_problem())
         analysis_args['volfrac'] = self.args.get('volfrac', analysis_args.get('volfrac', 0.5))
 
         self.analysis_env = topo_api.Environment(analysis_args)

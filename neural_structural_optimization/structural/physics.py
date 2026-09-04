@@ -38,6 +38,8 @@ http://www.topopt.mek.dtu.dk/Apps-and-software/Efficient-topology-optimization-i
 # pylint: disable=invalid-name
 # pylint: disable=superfluous-parens
 
+import warnings
+
 import autograd
 import autograd.numpy as np
 from neural_structural_optimization.structural import autograd as topo_autograd
@@ -64,17 +66,53 @@ MIN_PROJECTION_BETA = 1e-8
 # exactly the identity and all checkerboard control is silently lost.
 MIN_FILTER_WIDTH = 1.0
 
+# Smallest radius a derived (analysis-grid) width is clamped up to. Anything in
+# (1.0, sqrt(2)] admits the same 5-point stencil, but the neighbour weight is
+# `radius - 1`, so a radius just above 1.0 is still the identity to within
+# floating point. At 1.5 the full 3x3 stencil is in range and the neighbours
+# carry real weight (centre 1.5 against 0.5 per edge neighbour).
+MIN_EFFECTIVE_FILTER_WIDTH = 1.5
 
-def check_filter_width(filter_width):
-  """Return `filter_width` as a float, rejecting degenerate cone-filter radii.
 
-  `_cone_filter_matrix` keeps the offsets satisfying ``dx**2 + dy**2 <
-  radius**2``, so a radius of at most 1.0 keeps only the element itself and
-  row normalization then divides that single weight back out. The resulting
-  identity filter is indistinguishable from a working one at the call site,
-  which is why this raises rather than warns.
+def max_filter_width(nelx, nely):
+  """Return the largest cone-filter radius that still resolves local structure.
+
+  Once the radius reaches the grid diagonal every element's cone covers the
+  whole domain, so the row-normalized filter is a global weighted average: the
+  design is smeared away exactly as thoroughly as `MIN_FILTER_WIDTH` leaves it
+  untouched, and `_cone_filter_matrix` pays O(radius**2) to do it.
+  """
+  return float(_np.hypot(float(nelx), float(nely)))
+
+
+def check_filter_width(filter_width, *, nelx=None, nely=None):
+  """Return `filter_width` as a float, rejecting unusable cone-filter radii.
+
+  Both ends of the range destroy the design silently, so both raise:
+
+  * `_cone_filter_matrix` keeps the offsets satisfying ``dx**2 + dy**2 <
+    radius**2``, so a radius of at most `MIN_FILTER_WIDTH` keeps only the
+    element itself and row normalization divides that single weight back out.
+    The resulting identity filter is indistinguishable from a working one at
+    the call site.
+  * A radius past the grid diagonal turns the filter into a global average
+    (see `max_filter_width`), which is just as destructive and additionally
+    costs O(radius**2) to assemble.
+
+  Non-finite radii are rejected here too. They pass every one-sided comparison
+  and only surface much later, as `cannot convert float NaN to integer` (or an
+  `OverflowError`) from ``int(np.ceil(radius))`` inside `_cone_filter_matrix`.
+
+  The upper bound is only applied when the grid is known; pass `nelx`/`nely`
+  wherever they are available.
   """
   width = float(filter_width)
+  if not _np.isfinite(width):
+    raise ValueError(
+        f'filter_width resolves to {width}, which is not a finite radius. '
+        '`_cone_filter_matrix` rounds the radius to an integer offset bound, '
+        'so this fails later and far from its cause. Pass a finite radius '
+        'greater than 1.0; 2.0 is the standard choice.')
   if width <= MIN_FILTER_WIDTH:
     raise ValueError(
         f'filter_width resolves to {width}, which degenerates the cone filter '
@@ -83,7 +121,51 @@ def check_filter_width(filter_width):
         'radius greater than 1.0; 2.0 is the standard choice. With '
         "filter_width='linear' the radius is 2 * rmin, so rmin must exceed 0.5."
     )
+  if nelx is not None and nely is not None:
+    limit = max_filter_width(nelx, nely)
+    if width > limit:
+      raise ValueError(
+          f'filter_width resolves to {width}, which exceeds the '
+          f'{int(nelx)}x{int(nely)} grid diagonal of {limit:.4g}. Every cone '
+          'then covers the whole domain, so the filter is a global average '
+          'that erases the design. Use a radius below the grid diagonal; 2.0 '
+          "is the standard choice. With filter_width='linear' the radius is "
+          '2 * rmin.')
   return width
+
+
+def clamp_filter_width(filter_width, *, nelx=None, nely=None):
+  """Clamp a DERIVED filter radius into the range `check_filter_width` accepts.
+
+  Analysis grids are produced by dividing the design grid (and its radius) by
+  an integer factor, so their radius is a quotient nobody authored and the
+  division alone can push it below `MIN_FILTER_WIDTH`. Raising there would
+  abort a run mid-flight -- the factor is set after a stage has finished
+  training -- so an unsatisfiable derived radius is clamped with a warning
+  instead. User-authored configuration still goes through `check_filter_width`,
+  where failing fast is the right answer.
+
+  Non-finite radii are still rejected: division never produces them, so they
+  can only come from a bad parameter that clamping would hide.
+  """
+  width = float(filter_width)
+  if not _np.isfinite(width):
+    raise ValueError(
+        f'filter_width resolves to {width} on the analysis grid, which is not '
+        'a finite radius. Downsampling cannot produce this, so it comes from a '
+        'non-finite rmin or filter_width upstream.')
+  clamped = max(width, MIN_EFFECTIVE_FILTER_WIDTH)
+  if nelx is not None and nely is not None:
+    clamped = min(clamped, max_filter_width(nelx, nely))
+  if clamped != width:
+    warnings.warn(
+        f'Analysis-grid filter_width of {width} is outside the usable range; '
+        f'clamping to {clamped}. The analysis grid is a downsampling of the '
+        'design grid, so its radius is the design radius divided by the '
+        'analysis factor; raise rmin (or filter_width) if you want the '
+        'analysis grid to filter as widely as the design grid does.',
+        stacklevel=2)
+  return clamped
 
 
 def default_args():
@@ -112,9 +194,12 @@ def default_args():
           'forces': forces,
           'mask': 1,
           'penal': 3.0,
-          'rmin': 1.5,
+          # filter_width is the radius physics actually uses; rmin is carried
+          # alongside it and must stay consistent with the 2 * rmin relation
+          # that filter_width='linear' resolves through.
+          'rmin': 1.0,
           'opt_steps': 50,
-          'filter_width': 2,
+          'filter_width': 2.0,
           'step_size': 0.5,
           'name': 'truss'}
 
@@ -122,16 +207,30 @@ def default_args():
 def projection_params(args):
   """Return (beta, eta) if Heaviside projection is enabled, else None.
 
+  EXPERIMENTAL. Enabling the projection breaks the volume constraint on the
+  rendered/saved design: only the objective's view of the density is driven to
+  `volfrac`, and the two diverge sharply away from ``volfrac == eta`` (at
+  volfrac=0.3, eta=0.5, beta=16 the render comes out ~37% heavy). This is a
+  known gap, pinned by `HeavysideVolumeGapCharacterizationTest`, and is tracked
+  for a later stage.
+
   Rejects the parameter values that make `heavyside_projection` meaningless:
   `eta` outside [0, 1] drives its normalizing denominator to zero (NaN-ing the
-  whole density field), and a non-positive `beta` is not a softer projection
-  but an ill-posed one. Both are validated in `StructuralParams` as well; this
-  is the backstop for args dicts assembled by hand.
+  whole density field), and a `beta` that is non-positive or non-finite is not
+  a softer projection but an ill-posed one. Both are validated in
+  `StructuralParams` as well; this is the backstop for args dicts assembled by
+  hand.
   """
   if not args.get('heavyside', False):
     return None
   beta = float(args.get('beta', 2.0))
   eta = float(args.get('eta', 0.5))
+  if not _np.isfinite(beta):
+    raise ValueError(
+        f'beta must be finite, got {beta}. Every comparison against a NaN beta '
+        'is False, so it reaches heavyside_projection and NaNs the whole '
+        'density field; the first symptom is a Cholmod failure in the FEA '
+        'solve, which reads as a physics problem rather than a bad parameter.')
   if beta <= 0.0:
     raise ValueError(
         f'beta must be positive, got {beta}. The Heaviside projection is even '
@@ -151,8 +250,12 @@ def physical_density(x, args, volume_constraint=False, cone_filter=True):
   """Map raw design variables onto physical densities.
 
   Runs the standard SIMP chain: sigmoid, mask, density filter, optional
-  Heaviside projection, then volume enforcement. The filter radius comes from
-  args['filter_width'], which upstream already resolves from args['rmin'].
+  Heaviside projection, then volume enforcement. The filter radius is
+  args['filter_width'] and nothing else. args['rmin'] only reaches it when the
+  caller asked for it: `resolve_discretization_value` turns
+  ``filter_width='linear'`` into ``2 * rmin``, but a `StructuralParams` that
+  sets `rmin` without `filter_width` leaves the radius at the `Problem`
+  default, and `apply_discretization_params` warns when it sees that.
 
   Neither stage after the sigmoid preserves the mean -- the cone filter is
   row-normalized rather than sum-preserving, and the projection deliberately
@@ -161,11 +264,20 @@ def physical_density(x, args, volume_constraint=False, cone_filter=True):
   result, so it switches on exactly when it is needed (whenever projection is
   enabled) and can be forced either way with args['enforce_volume_last'].
 
+  Heaviside projection (args['heavyside']) is EXPERIMENTAL: with it enabled the
+  rendered/saved design does not satisfy the volume constraint the objective
+  enforces. See `projection_params` and
+  `HeavysideVolumeGapCharacterizationTest`.
+
   The volume offset is always solved against the filtered density, whatever
-  `cone_filter` asks for here. Callers that pass cone_filter=False want the
-  unfiltered view of the design the objective sees -- Environment.render and
-  the CNN-to-pixel handoff both do -- and solving a second offset against the
-  unfiltered residual would hand them a different design instead.
+  `cone_filter` asks for here, so cone_filter=False returns the pre-filter view
+  of the SAME design rather than a second design whose offset was re-solved
+  against the unfiltered residual. That is what `Environment.render` and the
+  CNN-to-pixel handoff want. Note that this makes them agree with the objective
+  only for a given `args`: `Model.get_structural_loss` evaluates the objective
+  on `analysis_env` whenever `analysis_factor != 1`, while `train/base.py`
+  renders through `model.env`, so above the analysis-dimension cap the render
+  and the objective use a different grid and a different radius.
   """
   shape = (args['nely'], args['nelx'])
   assert x.shape == shape or x.ndim == 1
@@ -175,7 +287,8 @@ def physical_density(x, args, volume_constraint=False, cone_filter=True):
   volume_last = volume_constraint and args.get(
       'enforce_volume_last', projection is not None)
   if cone_filter or volume_last:
-    check_filter_width(args['filter_width'])
+    check_filter_width(
+        args['filter_width'], nelx=args['nelx'], nely=args['nely'])
 
   def filter_and_project(x_full, apply_filter):
     if apply_filter:

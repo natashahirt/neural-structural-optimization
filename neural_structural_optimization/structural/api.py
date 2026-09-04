@@ -107,17 +107,19 @@ def _args_to_numpy(args: Dict[str, Any]) -> Dict[str, Any]:
 def _coerce_discretization_args(problem) -> Dict[str, Union[float, bool]]:
     """Ensure discretization fields on *problem* are concrete floats/bools."""
     rmin = float(problem.rmin)
+    nelx, nely = int(problem.width), int(problem.height)
     coerced = {}
     for name in ("filter_width", "rmin", "beta", "heavyside", "eta"):
         raw = getattr(problem, name)
         if isinstance(raw, str):
-            coerced[name] = resolve_discretization_value(name, raw, rmin=rmin)
+            coerced[name] = resolve_discretization_value(
+                name, raw, rmin=rmin, nelx=nelx, nely=nely)
         elif name == "heavyside":
             coerced[name] = bool(raw)
         else:
             coerced[name] = float(raw)
     # Problem fields can be set directly, bypassing resolve_discretization_value.
-    physics.check_filter_width(coerced["filter_width"])
+    physics.check_filter_width(coerced["filter_width"], nelx=nelx, nely=nely)
     return coerced
 
 def specified_task(problem):
@@ -158,6 +160,14 @@ class Environment:
   """Backend wrapper for structural physics.
 
   Uses the legacy autograd-based physics backend for topology optimization.
+
+  `__init__` normalizes `args` into its own dict, and every physics entry point
+  reads `env.args`. Mutating the dict that was handed in -- including
+  `model.args`, which `Model` keeps as a separate reference -- therefore has no
+  effect on this environment. To change a discretization parameter on a
+  constructed model (to switch the Heaviside projection on, say), set it on
+  `model.structural_params` and call `model._refresh_physics_environment()`, or
+  write to `model.env.args` directly.
   """
 
   def __init__(self, args: Dict[str, Any]):

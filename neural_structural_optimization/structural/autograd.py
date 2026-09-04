@@ -225,9 +225,21 @@ autograd.extend.defvjp(
 
 @autograd.primitive
 def find_root(
-    f, x, lower_bound, upper_bound, tolerance=1e-12, max_iterations=64):
+    f, x, lower_bound, upper_bound, tolerance=1e-12, max_iterations=64,
+    check_bracket=False):
   # Implicitly solve f(x,y)=0 for y(x) using binary search.
-  # Assumes that y is a scalar and f(x,y) is monotonic in y.
+  # Assumes that y is a scalar and f(x,y) is increasing in y.
+  # Bisection cannot detect a bad bracket on its own: it just walks to whichever
+  # bound is closer to a root and returns it. Pass check_bracket=True to reject
+  # such a bracket up front instead of returning a confidently wrong answer.
+  if check_bracket:
+    f_lower, f_upper = f(x, lower_bound), f(x, upper_bound)
+    if not f_lower <= 0 <= f_upper:
+      raise ValueError(
+          'find_root bracket does not contain a root: f(lower_bound={}) = {}, '
+          'f(upper_bound={}) = {}; expected f(lower_bound) <= 0 <= '
+          'f(upper_bound) for a function increasing in y.'.format(
+              lower_bound, f_lower, upper_bound, f_upper))
   for _ in range(max_iterations):
     y = 0.5 * (lower_bound + upper_bound)
     if upper_bound - lower_bound < tolerance:
@@ -239,7 +251,8 @@ def find_root(
   return y
 
 
-def grad_find_root(y, f, x, lower_bound, upper_bound, tolerance=None):
+def grad_find_root(y, f, x, lower_bound, upper_bound, tolerance=None,
+                   max_iterations=None, check_bracket=False):
   # This uses a special case of the adjoint gradient rule:
   # http://www.dolfin-adjoint.org/en/latest/documentation/maths/3-gradients.html#the-adjoint-approach
   def jvp(grad_y):
@@ -251,4 +264,4 @@ def grad_find_root(y, f, x, lower_bound, upper_bound, tolerance=None):
 
 autograd.extend.defvjp(
     find_root, _grad_undefined, grad_find_root,
-    _zero_grad, _zero_grad, _zero_grad)
+    _zero_grad, _zero_grad, _zero_grad, _zero_grad, _zero_grad)

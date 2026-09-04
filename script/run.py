@@ -230,11 +230,14 @@ def main(suffix_str: str | None = None) -> int:
             height=100,
             density=0.3,
             num_stories=5,
-            # Grow across stages: start at 0.25px and reach the standard 2.0px by Stage 4.
-            rmin=0.25,
-            # Stay fluid within stages: start blurry (2 * rmin) and shrink to rmin.
+            # Filter radius in element units, scaled with the grid on each
+            # upsample. A radius <= 1.0 degenerates the cone filter to the
+            # identity, so this is the floor that still filters.
+            rmin=1.0,
+            # Resolves to a fixed 2 * rmin, the legacy 2.0px radius. There is no
+            # within-stage schedule; continuation is not implemented yet.
             filter_width="linear",
-            # Sharpen within stages: start fluid (beta=1.0) and lock in (beta=4.0).
+            # Resolves to a fixed beta=1.0; no sharpening schedule.
             beta="linear" 
         )
         params, dynamic_kwargs = pipeline_utils.dynamic_depth_kwargs(params)
