@@ -29,7 +29,15 @@ def get_variables(model) -> np.ndarray:
         for v in model.parameters() if v.requires_grad])
 
 def constrained_logits(init_model) -> np.ndarray:
-    """Produce matching initial conditions with volume constraints applied."""
+    """Produce matching initial conditions with volume constraints applied.
+
+    Returns the *pre-filter* density, because the pixel model this seeds treats
+    its design variables as unfiltered densities and applies the cone filter
+    itself. `physical_density` still solves the volume offset against the
+    filtered density, so this is the same design the CNN objective saw, just
+    viewed before the filter -- handing over the filtered field instead would
+    filter it twice.
+    """
     logits = init_model().detach().cpu().numpy().astype(np.float64).squeeze(axis=0)
     return physics.physical_density(
         logits, init_model.env.args, volume_constraint=True, cone_filter=False)
