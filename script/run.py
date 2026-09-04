@@ -229,7 +229,9 @@ def main(suffix_str: str | None = None) -> int:
             width=50,
             height=100,
             density=0.3,
-            num_stories=5,
+            # Floors are spaced by rows, not counted: 20 rows apart over a
+            # height of 100 is the 5 floors this previously asked for.
+            interval=20,
             # Filter radius in element units, scaled with the grid on each
             # upsample. A radius <= 1.0 degenerates the cone filter to the
             # identity, so this is the floor that still filters.

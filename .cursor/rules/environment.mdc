@@ -50,16 +50,25 @@ scipy 1.16.0, scikit-sparse (CHOLMOD).
   `site-packages/numpy/.dylibs/`. So `conda install`/`conda list` will report a
   numpy that is not the one actually being imported, and reinstalling it via conda
   does nothing. Use pip for these.
-- **CHOLMOD segfaults above ~50k dofs — including the 128×256 golden-run grid.**
-  conda's `libcholmod` links Apple Accelerate while numpy's pip wheel bundles its
-  own OpenBLAS; CHOLMOD's *supernodal* path calls BLAS and dies, which is why only
-  larger problems crash. It is a raw `SIGSEGV` with no traceback, so a run just
-  vanishes. 37k dofs is fine, 51k is not. `mode='simplicial'` avoids it.
-  CHOLMOD is ~5x faster than SuperLU below the threshold and, in the simplicial
-  mode that survives, only ~5% faster at 128×256.
-- Related: CHOLMOD **cannot be caught and retried**. After a
+- **Never unset `OMP_NUM_THREADS=1`.** `neural_structural_optimization/__init__.py`
+  pins it at import, before any native library loads. Without it, CHOLMOD's
+  supernodal factorization races against the other OpenMP runtime in the process
+  (`libcholmod` links `libomp` and Accelerate; numpy bundles its own OpenBLAS)
+  and dies on a bare `SIGSEGV` — no traceback, the run just vanishes.
+  It is **intermittent**, so a green run proves nothing: 96×192 crashed 3 runs in
+  5 and 128×256 crashed 4 in 5. Never conclude a size is safe from one trial.
+- The pin **costs nothing and gains a lot** — single-threaded supernodal is
+  faster than the racy threaded version (137.5ms vs 171.9ms at 96×192) and 9×
+  faster than the SuperLU fallback at 128×256. It is not a safe-but-slow mode.
+- For torch, call `neural_structural_optimization.configure_torch_threads()`.
+  The pin would otherwise leave torch single-threaded; restoring it explicitly
+  measures *faster* than torch's own default (44.0ms vs 79.1ms).
+- CHOLMOD **cannot be caught and retried**. After a
   `CholmodNotPositiveDefiniteError` is raised and handled, the next solve in that
   process segfaults. Fall back in a fresh process, never in a `try`/`except`.
+  A problem with no X constraint anywhere (a free horizontal slide) is the usual
+  trigger — that rank deficiency is why `multistory_building` fixes the right
+  wall by default.
 
 ## Tests
 

@@ -34,6 +34,7 @@ from neural_structural_optimization.models.model_pixel import PixelModel
 from neural_structural_optimization.structural import api as topo_api
 from neural_structural_optimization.structural import physics
 from neural_structural_optimization.structural import autograd as topo_autograd
+from neural_structural_optimization.structural import problems
 from neural_structural_optimization.structural.problems import (
     StructuralParams,
     resolve_analysis_filter_width,
@@ -83,7 +84,7 @@ def _shipped_structural_params(**overrides):
   """The multistory config script/run.py ships, which the parity work targets."""
   kwargs = dict(
       problem_name='multistory_building', width=50, height=100, density=0.3,
-      num_stories=5, rmin=1.0, filter_width='linear', beta='linear')
+      interval=20, rmin=1.0, filter_width='linear', beta='linear')
   kwargs.update(overrides)
   return StructuralParams(**kwargs)
 
@@ -227,6 +228,88 @@ class VolumeUnderProjectionTest(absltest.TestCase):
     self.assertAlmostEqual(
         _design_region_mean(density, args), 0.7, delta=self._TOLERANCE)
     self.assertGreater(abs(float(density.mean()) - 0.7), 0.2)
+
+
+class MultistoryLoadPatternTest(absltest.TestCase):
+  """`multistory_building` spaces floors by rows, and that choice is load-bearing.
+
+  It previously took a floor COUNT. Switching to a SPACING changes the structure
+  at a fixed call site by an order of magnitude, so these pin the semantics and
+  the measured size of the difference rather than leaving it to a docstring.
+  """
+
+  _W, _H, _VOLFRAC = 128, 256, 0.3
+
+  def _compliance(self, problem):
+    args = topo_api.specified_task(problem)
+    ke = physics.get_stiffness_matrix(args['young'], args['poisson'])
+    x = npo.full((args['nely'], args['nelx']), self._VOLFRAC)
+    return float(physics.objective(x, ke, args, volume_constraint=False))
+
+  def _loaded_rows(self, problem):
+    return int((npo.abs(problem.forces[:, :, 1]).sum(axis=0) > 0).sum())
+
+  def test_interval_sets_the_floor_spacing(self):
+    problem = problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC, interval=64)
+    # Rows 0, 64, 128, 192, 256 -- the last sits on the supported edge.
+    self.assertEqual(self._loaded_rows(problem), 5)
+
+  def test_floor_count_and_spacing_are_convertible(self):
+    """interval == height // num_stories reproduces the old load pattern."""
+    problem = problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC, interval=self._H // 16)
+    rows = npo.nonzero(npo.abs(problem.forces[:, :, 1]).sum(axis=0))[0]
+    self.assertContainsSubset(list(range(0, self._H, 16)), rows.tolist())
+
+  def test_the_spacing_change_is_an_order_of_magnitude(self):
+    """Guards the claim that pre-change compliance figures are incomparable."""
+    sparse = self._compliance(problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC, interval=64))
+    dense = self._compliance(problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC, interval=16))
+    self.assertGreater(dense / sparse, 10.0)
+
+  # The companion measurement -- that dropping the right wall moves compliance
+  # by only 0.07% (563.43 walled vs 563.80 free, 128x256, uniform 0.3) -- is
+  # NOT asserted here, and deliberately so. Solving the wall-free case needs a
+  # solver that tolerates the rank deficiency, and merely provoking CHOLMOD's
+  # CholmodNotPositiveDefiniteError corrupts its internal state so the NEXT
+  # solve in the process segfaults. A test that measures it would take the rest
+  # of the suite down with it. Recompute it under SuperLU if it needs checking.
+
+  def test_without_the_right_wall_nothing_constrains_x(self):
+    """The rank deficiency CHOLMOD rejects: a free horizontal slide."""
+    free = problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC, fix_right_wall=False)
+    walled = problems.multistory_building(
+        self._W, self._H, density=self._VOLFRAC)
+    self.assertEqual(int(free.normals[:, :, 0].sum()), 0)
+    self.assertGreater(int(walled.normals[:, :, 0].sum()), 0)
+
+  def test_stale_num_stories_warns_instead_of_being_dropped(self):
+    params = StructuralParams(
+        problem_name='multistory_building', width=50, height=100,
+        density=0.3, num_stories=5)
+    with self.assertWarnsRegex(UserWarning, 'num_stories.*is ignored'):
+      params.get_problem()
+
+  def test_interval_alone_does_not_warn(self):
+    params = StructuralParams(
+        problem_name='multistory_building', width=50, height=100,
+        density=0.3, interval=20)
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      params.get_problem()
+
+  def test_num_stories_still_reaches_staircase(self):
+    """The field is not dead -- staircase genuinely takes a count."""
+    params = StructuralParams(
+        problem_name='staircase', width=64, height=64, density=0.3,
+        num_stories=3)
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', UserWarning)
+      params.get_problem()
 
 
 class VolumeWithoutProjectionTest(absltest.TestCase):

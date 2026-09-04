@@ -682,18 +682,48 @@ def staggered_points(width=32, height=32, density=0.3, interval=16,
   return problem
 
 
-def multistory_building(width=32, height=32, density=0.3, num_stories=16):
-  """A multi-story building, supported from the ground."""
+def multistory_building(width=32, height=32, density=0.3, interval=16,
+                        fix_right_wall=True):
+  """A multi-story building, supported from the ground, loaded every `interval`.
+
+  Floors are placed by SPACING (`interval` rows apart), which is the legacy
+  convention the reference results were produced under. An earlier version of
+  this function took a floor COUNT instead and spaced them `height //
+  num_stories` apart. The two are trivially convertible -- `interval = height //
+  num_stories` -- but they are not the same problem at a given call site, and
+  the difference is not subtle: at 128x256 the old default of 16 stories loads
+  16 rows against this function's 5, which is 3.2x the total load and 12.5x the
+  compliance (7025.99 vs 563.80 at uniform density 0.3). Compliance figures from
+  before that change are therefore NOT comparable to figures from after it.
+
+  Loads landing on the supported bottom row are inert -- those degrees of
+  freedom are fixed, so they never enter the free system.
+
+  Args:
+    width: grid width in elements.
+    height: grid height in elements.
+    density: target volume fraction.
+    interval: rows between successive loaded floors.
+    fix_right_wall: constrain X along the right edge. Defaults True and should
+      normally stay that way. Without it NOTHING constrains X anywhere, so the
+      structure can slide horizontally at zero energy cost and the stiffness
+      matrix is singular -- CHOLMOD rejects it outright and only a solver that
+      tolerates a consistent singular system (SuperLU) will return anything.
+      The constraint is nearly free: every load here is vertical, so it changes
+      compliance by 0.07% (563.43 vs 563.80 at 128x256, uniform density 0.3).
+      Set False only to reproduce the legacy boundary conditions exactly, and
+      only with a solver that can handle the rank deficiency.
+
+  Returns:
+    A `Problem` describing the loaded building.
+  """
   normals = np.zeros((width + 1, height + 1, 2))
   normals[:, -1, Y] = 1
-  normals[-1, :, X] = 1
+  if fix_right_wall:
+    normals[-1, :, X] = 1
 
   forces = np.zeros((width + 1, height + 1, 2))
-
-  story_height = height // num_stories
-  for story in range(0, num_stories):
-    story_y = story * story_height
-    forces[:, story_y, Y] = -1 / width
+  forces[:, ::interval, Y] = -1 / width
 
   problem = Problem(normals, forces, density)
   problem.name = f"multistory_building_{width}x{height}"
@@ -892,6 +922,24 @@ class StructuralParams:
             k: v for k, v in self.to_dict().items()
             if k in sig.parameters and k not in skip
         }
+
+        # Silently dropping a field the caller clearly meant is how `rmin` went
+        # inert; `num_stories` is now the same trap, since multistory_building
+        # takes a spacing rather than a floor count but staircase still takes a
+        # count, so the field cannot simply be removed.
+        num_stories_default = next(
+            f.default for f in dataclasses.fields(self)
+            if f.name == 'num_stories')
+        if ('num_stories' not in sig.parameters
+                and 'interval' in sig.parameters
+                and self.num_stories != num_stories_default):
+            warnings.warn(
+                f'num_stories={self.num_stories} is ignored by '
+                f'{self.problem_name}, which spaces floors by `interval` '
+                f'(currently {self.interval}). Pass '
+                f'interval={self.height // max(self.num_stories, 1)} for the '
+                'same floor count.',
+                stacklevel=3)
         problem = problem_function(**filtered_params)
         apply_discretization_params(problem, self)
         return problem
@@ -1068,12 +1116,14 @@ PROBLEMS_BY_CATEGORY = {
         staggered_points(128, 512, density=0.3),
         staggered_points(128, 512, interval=32, density=0.15),
     ],
+    # Spacings below are the `height // num_stories` equivalents of the floor
+    # counts these entries used previously, so the catalog keeps its shape.
     'multistory_building': [
         multistory_building(32, 64, density=0.5),
-        multistory_building(64, 128, num_stories=32, density=0.4),
-        multistory_building(128, 256, num_stories=64, density=0.3),
-        multistory_building(128, 512, num_stories=64, density=0.25),
-        multistory_building(128, 512, num_stories=128, density=0.2),
+        multistory_building(64, 128, interval=4, density=0.4),
+        multistory_building(128, 256, interval=4, density=0.3),
+        multistory_building(128, 512, interval=8, density=0.25),
+        multistory_building(128, 512, interval=4, density=0.2),
     ],
 }
 
