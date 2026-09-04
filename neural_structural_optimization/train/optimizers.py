@@ -25,10 +25,99 @@ from pathlib import Path
 from PIL import Image
 
 from neural_structural_optimization import models
-from neural_structural_optimization.models import PixelModel, CNNModel
+from neural_structural_optimization.models import AdaptivePixelModel, PixelModel, CNNModel
+from neural_structural_optimization.models.model_ada import (
+    DEFAULT_CONVERGENCE_THRESHOLD,
+    DEFAULT_MAX_RESIZE_ITERATION,
+    DEFAULT_RESIZE_THRESHOLD,
+)
+from neural_structural_optimization.models.model_base import VeniceLossTerms
 
 from .base import BaseOptimizer
-from .utils import cosine_warmup, get_variables, constrained_logits, ensure_array_size, calibrate_lambda_clip
+from .utils import (cosine_warmup, get_variables, constrained_logits, ensure_array_size,
+                    calibrate_lambda_clip, repeat_to_shape)
+
+
+# Ceiling on the default inverse-normalized CLIP weight, which grows without
+# bound as compliance falls and would otherwise dominate late in a run. It
+# belongs to that formula alone: the Venice algebra's weight is *directly*
+# proportional to compliance and uncapped (the reference run peaks near 740),
+# so the preset path must never clamp -- a cap that does not bind today would
+# bind at higher compliance later and silently corrupt the trajectory.
+CLIP_DYNAMIC_WEIGHT_MAX = 2000.0
+
+
+def _reject_clip_alpha_under_venice_compat(model, clip_alpha, optimizer_name: str) -> None:
+    """Refuse a `clip_alpha` that contradicts the model's Venice algebra.
+
+    `Adam_Optimizer` and `LBFGS_Optimizer` read `clip_alpha` as the scale of an
+    INVERSE-normalized weight, `clip_alpha * baseline_compliance / compliance`,
+    capped at :data:`CLIP_DYNAMIC_WEIGHT_MAX`. The Venice algebra's weight is
+    `compliance * clip_alpha`: directly proportional, undetached and uncapped.
+    Those are structurally different formulas rather than two settings of one,
+    so a caller asking for both has asked for two different runs and gets an
+    error instead of whichever branch happens to be tested first.
+
+    Args:
+        model: the model whose `venice_loss_algebra` selects the algebra.
+        clip_alpha: the caller's `clip_alpha`, or None if unset.
+        optimizer_name: name used in the error message.
+
+    Raises:
+        ValueError: if both the preset and `clip_alpha` are configured.
+    """
+    if clip_alpha is None or model.venice_loss_algebra is None:
+        return
+    raise ValueError(
+        f'{optimizer_name} got clip_alpha={clip_alpha!r} while the model has '
+        'the Venice compatibility algebra enabled; those are contradictory '
+        "couplings. This optimizer's clip_alpha scales a weight inversely "
+        f'proportional to compliance and capped at {CLIP_DYNAMIC_WEIGHT_MAX}, '
+        'whereas the preset weight is compliance * clip_alpha, uncapped. Drop '
+        'clip_alpha to run the preset -- set its alpha with '
+        'enable_venice_compat_loss(VeniceLossAlgebra(clip_alpha=...)) -- or '
+        'disable the preset to use the default coupling.')
+
+
+def _detach_loss_terms(terms: VeniceLossTerms) -> VeniceLossTerms:
+    """Drop the autograd graph from one step's terms so a run can log them."""
+    return VeniceLossTerms(*(float(term.detach()) for term in terms))
+
+
+def _make_grads_contiguous(model) -> None:
+    """Compact any non-contiguous gradient, which L-BFGS cannot flatten.
+
+    `torch.optim.LBFGS` calls `view(-1)` on every gradient, and that raises on
+    a non-contiguous tensor, so each closure has to normalize its own grads.
+    """
+    for p in model.parameters():
+        if p.grad is not None and not p.grad.is_contiguous():
+            p.grad = p.grad.contiguous()
+
+
+def _attach_loss_terms(ds: xarray.Dataset, terms) -> xarray.Dataset:
+    """Add a term-by-term loss trajectory to `ds`, beside the scalar total.
+
+    The parity harness compares the reference log field by field, so a run has
+    to carry compliance, the weighted and unweighted CLIP terms and the weight
+    itself, not just `loss`.
+
+    Args:
+        ds: dataset with a `step` dimension; modified in place.
+        terms: one detached :class:`VeniceLossTerms` per step, or an empty
+            sequence on paths where the breakdown is unavailable without a
+            second physics solve, in which case `ds` is left untouched.
+
+    Returns:
+        `ds`, for chaining onto a `create_dataset` call.
+    """
+    if not terms:
+        return ds
+    ds['compliance'] = (('step',), [t.compliance_loss for t in terms])
+    ds['clip_loss'] = (('step',), [t.clip_loss for t in terms])
+    ds['clip_loss_raw'] = (('step',), [t.clip_loss_raw for t in terms])
+    ds['clip_weight'] = (('step',), [t.clip_weight for t in terms])
+    return ds
 
 
 class Adam_Optimizer(BaseOptimizer):
@@ -53,10 +142,20 @@ class Adam_Optimizer(BaseOptimizer):
         # baseline structural loss for normalized inverse coupling
         self._baseline_Ls = None
         # cap for dynamic CLIP weight to avoid late domination
-        self._clip_dynamic_w_max = 2000.0
+        self._clip_dynamic_w_max = CLIP_DYNAMIC_WEIGHT_MAX
+        # One detached VeniceLossTerms per step, appended in step with the
+        # tracker -- which `optimize` does not reset either, so the two stay
+        # the same length however many times a run is restarted. Only filled
+        # on the preset path.
+        self.loss_terms = []
+        _reject_clip_alpha_under_venice_compat(model, clip_alpha, 'Adam_Optimizer')
     
     def optimize(self) -> xarray.Dataset:
         """Run Adam optimization."""
+        # Re-checked here because the seam can be flipped on an already-built
+        # model, after this optimizer was constructed.
+        _reject_clip_alpha_under_venice_compat(
+            self.model, self.clip_alpha, 'Adam_Optimizer')
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr_init)
         
         for i in tqdm(range(self.max_iterations + 1), desc="Adam Optimizer"):
@@ -71,7 +170,15 @@ class Adam_Optimizer(BaseOptimizer):
             optimizer.param_groups[0]['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
             logits = self.model()
-            if self.clip_alpha is not None:
+            if self.model.venice_loss_algebra is not None:
+                # The legacy algebra owns the coupling outright, so neither the
+                # warmed-up `cw` nor the cap above applies. One call, one FEA
+                # solve, and the whole breakdown for the parity log.
+                terms = self.model.get_venice_compat_losses(
+                    logits, compliance_weight=self.compliance_weight)
+                loss = terms.total_loss
+                self.loss_terms.append(_detach_loss_terms(terms))
+            elif self.clip_alpha is not None:
                 # Inverse-normalized, capped dynamic coupling
                 Ls = self.model.get_structural_loss(logits)
                 Lc = self.model.get_semantic_loss(logits) if self.model.clip_loss is not None else Ls.new_tensor(0.0)
@@ -97,7 +204,232 @@ class Adam_Optimizer(BaseOptimizer):
             
             self.tracker.add_step(float(loss.detach()), logits.detach().cpu().numpy())
         
-        return self.tracker.create_dataset(self.model)
+        return _attach_loss_terms(self.tracker.create_dataset(self.model), self.loss_terms)
+
+
+# Venice's iteration counter is initialised to 1 rather than 0 (models.py line
+# 618; `reset_iteration` exists but is never called) and is incremented before
+# the resize test runs, so after N gradient steps the counter reads N + 1. The
+# first upsample therefore lands one step earlier than max_resize_iteration
+# reads: at 50 it fires after 49 steps. The reference run's timing depends on
+# this, so it is reproduced rather than quietly corrected.
+VENICE_ITERATION_OFFSET = 1
+
+
+class AdaptiveAdam_Optimizer(BaseOptimizer):
+    """Adam driving `AdaptivePixelModel` on Venice's coarse-to-fine schedule.
+
+    Two policies distinguish this from `Adam_Optimizer`, and both read
+    COMPLIANCE rather than the total loss, so a semantic term that is still
+    moving cannot hold either one open:
+
+    * While upsamples remain, the grid advances a stage whenever the iteration
+      count divides `max_resize_iteration` OR compliance moved less than
+      `resize_threshold` over the last iteration.
+    * Once the schedule is exhausted, the run stops as soon as compliance moves
+      less than `convergence_threshold` over an iteration.
+
+    The learning rate is held constant, as Venice holds it -- there is no
+    cosine schedule here -- and a fresh Adam is built on every upsample.
+    """
+
+    def __init__(self, model, max_iterations: int, save_intermediate_designs: bool = True,
+                 lr: float = 1e-2, grad_clip: Optional[float] = None,
+                 clip_weight: float = 1.0,
+                 clip_alpha: Optional[float] = None,
+                 compliance_weight: Optional[float] = None,
+                 resize_threshold: float = DEFAULT_RESIZE_THRESHOLD,
+                 max_resize_iteration: int = DEFAULT_MAX_RESIZE_ITERATION,
+                 convergence_threshold: float = DEFAULT_CONVERGENCE_THRESHOLD):
+        """Configure the run.
+
+        Args:
+            model: an `AdaptivePixelModel`; it owns `resize_num` and
+                `resize_scale`, which set the resolutions this schedule visits.
+            max_iterations: hard cap on gradient steps. The schedule normally
+                stops well short of it -- the reference run stops at 124 of 200.
+            save_intermediate_designs: keep every stage's design, not just the
+                best one.
+            lr: constant Adam learning rate. Defaults to the repository's Adam
+                default rather than to Venice's, which is 0.2 for the reference
+                run and belongs in that run's configuration.
+            grad_clip: optional gradient-norm clip.
+            clip_weight: static weight on the semantic loss. Ignored when
+                `clip_alpha` is set, matching `Model.get_total_loss`, and
+                ignored outright when the model carries a Venice algebra.
+            clip_alpha: if set, weights the semantic loss by
+                `clip_alpha * compliance` each iteration, which is Venice's
+                dynamic coupling. Under a Venice algebra this is the same knob,
+                so it overrides the algebra's own `clip_alpha` rather than
+                conflicting with it.
+            compliance_weight: optional scalar on the structural loss. It
+                scales the value the schedule tests, so the thresholds are read
+                against the weighted compliance, exactly as Venice reads them.
+            resize_threshold: compliance delta below which the grid advances.
+            max_resize_iteration: iteration period that forces an advance.
+            convergence_threshold: compliance delta below which the run stops,
+                once no upsamples remain.
+        """
+        super().__init__(model, max_iterations, save_intermediate_designs)
+        self._validate_model_type(AdaptivePixelModel, "Adaptive Adam")
+        if max_resize_iteration <= 0:
+            raise ValueError(
+                f'max_resize_iteration must be positive, got '
+                f'{max_resize_iteration}; it is the period of the forced '
+                'upsample, so zero has no meaning. Raise it above '
+                'max_iterations to leave only the compliance-delta trigger.')
+        self.lr = lr
+        self.grad_clip = grad_clip
+        self.clip_weight = float(clip_weight)
+        self.clip_alpha = clip_alpha
+        self.compliance_weight = compliance_weight
+        self.resize_threshold = float(resize_threshold)
+        self.max_resize_iteration = int(max_resize_iteration)
+        self.convergence_threshold = float(convergence_threshold)
+        # Gradient steps at which an upsample fired, and whether the run
+        # stopped on the convergence test rather than on max_iterations.
+        self.resize_steps = []
+        # One detached VeniceLossTerms per step: the compliance trajectory the
+        # schedule ran on, plus the breakdown the parity harness compares.
+        # Appended in step with the tracker, which is likewise not reset by
+        # `optimize`, so the two stay the same length.
+        self.loss_terms = []
+        self.converged = False
+
+    def _compose_loss(self, logits) -> VeniceLossTerms:
+        """Return the whole loss breakdown from ONE physics solve.
+
+        The schedule reads the compliance term while the parity harness reads
+        every term, and both have to come out of a single FEA solve -- asking
+        the model for compliance separately would double the dominant cost of
+        the run.
+
+        Under a Venice algebra this delegates to
+        `Model.get_venice_compat_losses`, which is itself one solve wide and
+        routes through the shared `venice_compat_total_loss`; restating that
+        algebra here is what would let the two paths drift. Only the default
+        composition -- a detached weight and no unweighted term -- is spelled
+        out, packed into the same container so one dataset schema covers both.
+        """
+        if self.model.venice_loss_algebra is not None:
+            return self.model.get_venice_compat_losses(
+                logits,
+                clip_alpha=self.clip_alpha,
+                compliance_weight=self.compliance_weight,
+            )
+
+        compliance = self.model.get_structural_loss(logits)
+        if self.compliance_weight is not None:
+            compliance = compliance * float(self.compliance_weight)
+        if self.model.clip_loss is None:
+            zero = compliance.detach().new_tensor(0.0)
+            return VeniceLossTerms(
+                total_loss=compliance,
+                compliance_loss=compliance,
+                clip_loss=zero,
+                clip_loss_raw=zero,
+                clip_weight=zero,
+            )
+        semantic = self.model.get_semantic_loss(logits)
+        if self.clip_alpha is not None:
+            weight = float(self.clip_alpha) * compliance.detach()
+        else:
+            weight = semantic.detach().new_tensor(self.clip_weight)
+        clip_loss = semantic * weight
+        return VeniceLossTerms(
+            total_loss=compliance + clip_loss,
+            compliance_loss=compliance,
+            clip_loss=clip_loss,
+            clip_loss_raw=semantic,
+            clip_weight=weight,
+        )
+
+    def optimize(self) -> xarray.Dataset:
+        """Run Adam, advancing and stopping on the compliance schedule."""
+        model = self.model
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+
+        # One environment per stage, plus the stage each frame was drawn under,
+        # so frames recorded at different resolutions can be rendered later.
+        stage_envs = [model.env]
+        stage_of_step = []
+        self.resize_steps = []
+        self.converged = False
+
+        pbar = tqdm(range(self.max_iterations), desc="Adaptive Adam")
+        for step in pbar:
+            optimizer.zero_grad(set_to_none=True)
+            logits = model()
+            terms = self._compose_loss(logits)
+            loss = terms.total_loss
+            loss.backward()
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+            optimizer.step()
+
+            # Both losses describe the design that produced the gradient, i.e.
+            # the design before this step, which is what Venice records too.
+            step_terms = _detach_loss_terms(terms)
+            compliance_value = step_terms.compliance_loss
+            self.tracker.add_step(step_terms.total_loss, logits.detach().cpu().numpy())
+            self.loss_terms.append(step_terms)
+            stage_of_step.append(len(stage_envs) - 1)
+            pbar.set_postfix({'compliance': f'{compliance_value:.4f}',
+                              'grid': f'{model.shape[2]}x{model.shape[1]}'})
+
+            iteration = step + 1 + VENICE_ITERATION_OFFSET
+            if model.can_upsample and (
+                    iteration % self.max_resize_iteration == 0
+                    or model.threshold_crossed(compliance_value, self.resize_threshold)):
+                model.upsample()
+                # Adam's moments are keyed on the parameter object, which
+                # upsample has just replaced with one of a different shape.
+                optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+                stage_envs.append(model.env)
+                self.resize_steps.append(step)
+
+            # Deliberately not elif: the final upsample makes the schedule
+            # exhausted within this same iteration, and Venice tests for
+            # convergence immediately, against the same compliance delta.
+            if not model.can_upsample and model.threshold_crossed(
+                    compliance_value, self.convergence_threshold):
+                self.converged = True
+                break
+
+            model.prev_loss = compliance_value
+
+        return self._create_dataset(stage_envs, stage_of_step)
+
+    def _create_dataset(self, stage_envs, stage_of_step) -> xarray.Dataset:
+        """Collect the run into a dataset spanning more than one resolution.
+
+        `OptimizationTracker.create_dataset` renders every frame through the
+        model's current environment, which is only correct when the grid never
+        moved. Each frame is rendered here through the environment it was
+        optimized under, then repeated up to the final grid so that the whole
+        run shares one set of coordinates.
+        """
+        _, height, width = self.model.full_shape
+        designs = [
+            repeat_to_shape(
+                np.asarray(stage_envs[stage].render(frame, volume_constraint=True)),
+                height, width)
+            for frame, stage in zip(self.tracker.frames, stage_of_step)
+        ]
+
+        losses = self.tracker.losses
+        logging.info(f'Final loss: {losses[int(np.nanargmin(losses))]}')
+        data = {'loss': (('step',), losses)}
+        if self.tracker.save_intermediate_designs:
+            data['design'] = (('step', 'y', 'x'), designs)
+        else:
+            data['design'] = (('y', 'x'), designs[int(np.nanargmin(losses))])
+
+        ds = xarray.Dataset(data, coords={'step': np.arange(len(losses))})
+        _attach_loss_terms(ds, self.loss_terms)
+        ds.attrs['resize_steps'] = list(self.resize_steps)
+        ds.attrs['converged'] = int(self.converged)
+        return ds
 
 
 class LBFGS_Optimizer(BaseOptimizer):
@@ -126,10 +458,19 @@ class LBFGS_Optimizer(BaseOptimizer):
         self.clip_alpha = clip_alpha
         self.compliance_weight = compliance_weight
         self._baseline_Ls = None
-        self._clip_dynamic_w_max = 2000.0
+        self._clip_dynamic_w_max = CLIP_DYNAMIC_WEIGHT_MAX
+        # One detached VeniceLossTerms per step, appended in step with the
+        # tracker (see `Adam_Optimizer`). Only filled on the preset path.
+        self.loss_terms = []
+        _reject_clip_alpha_under_venice_compat(model, clip_alpha, 'LBFGS_Optimizer')
     
     def optimize(self) -> xarray.Dataset:
         """Run L-BFGS optimization."""
+        # Re-checked here because the seam can be flipped on an already-built
+        # model, after this optimizer was constructed.
+        _reject_clip_alpha_under_venice_compat(
+            self.model, self.clip_alpha, 'LBFGS_Optimizer')
+        venice_compat = self.model.venice_loss_algebra is not None
         opt = torch.optim.LBFGS(
             self.model.parameters(),
             lr=self.lr,
@@ -154,7 +495,10 @@ class LBFGS_Optimizer(BaseOptimizer):
 
             with torch.no_grad():
                 logits_probe = self.model()
-            if self.model.clip_loss is None or self.clip_alpha is not None:
+            # The calibration below costs an extra FEA solve, so it is skipped
+            # wherever its lambda would go unused -- including the preset path,
+            # whose weight comes from the legacy algebra instead.
+            if self.model.clip_loss is None or self.clip_alpha is not None or venice_compat:
                 self._lam_clip = None
             elif self._lam_clip is None or step == 0 or step % 10 == 0:
                 # clip_R is used only when clip_loss exists
@@ -169,9 +513,25 @@ class LBFGS_Optimizer(BaseOptimizer):
             else:
                 clip_weight = self.clip_weight_max
             
+            # The line search calls `closure` several times per step, but
+            # `opt.step` returns the FIRST evaluation's loss, so only the first
+            # step's terms are logged -- they are the ones `loss_val` describes.
+            step_terms = []
+
             def closure():
                 opt.zero_grad(set_to_none=True)
                 logits = self.model()
+                if venice_compat:
+                    # The legacy algebra owns the coupling outright, so neither
+                    # `clip_weight` nor the cap above applies. One call, one FEA
+                    # solve, and the whole breakdown for the parity log.
+                    terms = self.model.get_venice_compat_losses(
+                        logits, compliance_weight=self.compliance_weight)
+                    loss = terms.total_loss
+                    loss.backward()
+                    _make_grads_contiguous(self.model)
+                    step_terms.append(_detach_loss_terms(terms))
+                    return loss
                 if self.clip_alpha is not None:
                     # Inverse-normalized, capped dynamic coupling
                     Ls = self.model.get_structural_loss(logits)
@@ -184,10 +544,7 @@ class LBFGS_Optimizer(BaseOptimizer):
                     w_eff = min(raw_w, self._clip_dynamic_w_max)
                     loss = Ls_eff + Lc * w_eff
                     loss.backward()
-                    # Ensure grads are contiguous for LBFGS (it uses view(-1) on grads)
-                    for p in self.model.parameters():
-                        if p.grad is not None and not p.grad.is_contiguous():
-                            p.grad = p.grad.contiguous()
+                    _make_grads_contiguous(self.model)
                     return loss
                 if self._lam_clip is None:
                     # No semantic loss configured; fall back to structural-only if clip_loss is absent.
@@ -199,9 +556,7 @@ class LBFGS_Optimizer(BaseOptimizer):
                     else:
                         loss = self.model.get_semantic_loss(logits) * clip_weight
                     loss.backward()
-                    for p in self.model.parameters():
-                        if p.grad is not None and not p.grad.is_contiguous():
-                            p.grad = p.grad.contiguous()
+                    _make_grads_contiguous(self.model)
                     return loss
                 loss_structural = self.model.get_structural_loss(logits)
                 loss_semantic = self.model.get_semantic_loss(logits)
@@ -209,14 +564,14 @@ class LBFGS_Optimizer(BaseOptimizer):
                     loss_structural = loss_structural * float(self.compliance_weight)
                 loss = loss_structural + loss_semantic * self._lam_clip * clip_weight
                 loss.backward()
-                for p in self.model.parameters():
-                    if p.grad is not None and not p.grad.is_contiguous():
-                        p.grad = p.grad.contiguous()
+                _make_grads_contiguous(self.model)
                 return loss
             
             loss = opt.step(closure)
             loss_val = float(loss.detach())
             
+            if step_terms:
+                self.loss_terms.append(step_terms[0])
             self.tracker.add_step(loss_val, self.model().detach().cpu().numpy())
 
             # Save a progress image every 10 iterations to script/test_results_pytorch/progress.png
@@ -260,7 +615,7 @@ class LBFGS_Optimizer(BaseOptimizer):
             
             prev_loss = loss_val
         
-        return self.tracker.create_dataset(self.model)
+        return _attach_loss_terms(self.tracker.create_dataset(self.model), self.loss_terms)
 
 
 class MMA_Optimizer(BaseOptimizer):

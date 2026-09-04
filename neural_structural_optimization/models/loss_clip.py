@@ -5,7 +5,11 @@ import torch.nn.functional as F
 import kornia.augmentation as K
 import clip
 import math
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
+
+# Pixel statistics of the CLIP training distribution.
+CLIP_PIXEL_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_PIXEL_STD = (0.26862954, 0.26130258, 0.27577711)
 
 # ---- multi-patch pyramid and tiling helpers ----
 def _affine_grid_from_boxes(H: int, W: int, boxes_xywh: torch.Tensor, out: Tuple[int,int]):
@@ -284,6 +288,188 @@ class PairedCrops(nn.Module):
         return x_aug, y_aug
 
 
+# ---------------------------------------------------------------------------
+# Venice legacy-compatibility seam
+#
+# Everything in this section reproduces the CLIP pipeline of the legacy Venice
+# repo so a known-good run can be replayed here and A/B-ed against the richer
+# default path. It is deliberately self-contained: `CLIPLoss.forward` dispatches
+# to `VeniceClipPath` in one place, and none of the default machinery (patch
+# pyramid, global views, negative hinge, low-frequency regularizer, seamless
+# edges, the x100 output scale) is reachable from it.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VeniceClipPreset:
+    """Settings of the legacy Venice image-to-text CLIP pipeline.
+
+    Attributes:
+        resize_short_side: Length the shorter image edge is resized to before
+            cropping, i.e. Venice's ``transforms.Resize(params['img_width'])``.
+            The reference run used 512, giving 512x1024 for a 128x256 grid.
+        num_augs: Number of augmented crops evaluated per step.
+        min_original_size: Reference size behind ``RandomResizedCrop``'s
+            minimum scale, which Venice fixes at ``crop_size / 480``.
+        aug_noise: Upper bound of the per-crop additive-noise factor.
+        use_arcsin_transform: Apply ``arcsin(d / 2) ** 2`` to the L2 distance
+            between unit-normalized embeddings, as Venice does. When False the
+            raw distance is averaged instead, matching Venice's other branch.
+    """
+
+    resize_short_side: int = 512
+    num_augs: int = 32
+    min_original_size: int = 480
+    aug_noise: float = 0.1
+    use_arcsin_transform: bool = True
+
+
+VENICE_CLIP_PRESET = VeniceClipPreset()
+
+
+def _coerce_venice_clip_preset(value) -> Optional[VeniceClipPreset]:
+    """Normalize a ``venice_compat`` argument to a preset or None.
+
+    Accepts None/False (default path), True (the reference preset), or an
+    explicit :class:`VeniceClipPreset` so the seam can be driven straight from
+    a boolean configuration flag.
+    """
+    if value is None or value is False:
+        return None
+    if value is True:
+        return VENICE_CLIP_PRESET
+    if isinstance(value, VeniceClipPreset):
+        return value
+    raise TypeError(
+        "venice_compat must be None, a bool, or a VeniceClipPreset, "
+        f"got {type(value).__name__}."
+    )
+
+
+def _resize_short_side(x: torch.Tensor, short_side: int) -> torch.Tensor:
+    """Resize NCHW ``x`` so its shorter edge is ``short_side``, keeping aspect.
+
+    Bit-exact with ``torchvision.transforms.Resize(int)`` (which Venice uses),
+    including its integer truncation of the longer edge and its bilinear +
+    antialias defaults for tensor inputs.
+    """
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    if min(h, w) == short_side:
+        return x
+    if w <= h:
+        new_w, new_h = short_side, int(short_side * h / w)
+    else:
+        new_h, new_w = short_side, int(short_side * w / h)
+    return F.interpolate(
+        x, size=(new_h, new_w), mode='bilinear', align_corners=False, antialias=True
+    )
+
+
+class VeniceCrops(nn.Module):
+    """Venice's ``GenerateCrops``: replicate, augment, then add per-crop noise.
+
+    The Kornia chain and its parameters are copied verbatim from the legacy
+    implementation; unlike :class:`PairedCrops` there is no paired mode and no
+    channels-last conversion, so the arithmetic matches the reference run.
+    """
+
+    def __init__(self, crop_size: int, num_augs: int, min_original_size: int = 480,
+                 noise: float = 0.1):
+        super().__init__()
+        self.crop_size = int(crop_size)
+        self.num_augs = int(num_augs)
+        self.noise = float(noise)
+
+        scale_min = self.crop_size / float(min_original_size)
+        try:
+            rrc = K.RandomResizedCrop(size=(self.crop_size, self.crop_size),
+                                      scale=(scale_min, 1.0),
+                                      cropping_mode="resample")
+        except TypeError:
+            rrc = K.RandomResizedCrop(size=(self.crop_size, self.crop_size),
+                                      scale=(scale_min, 1.0))
+
+        self.augs = nn.Sequential(
+            rrc,
+            K.RandomHorizontalFlip(p=0.5),
+            K.RandomSharpness(0.3, p=0.4),
+            K.RandomAffine(degrees=30, translate=0.1, p=0.8, padding_mode="border"),
+            K.RandomPerspective(0.2, p=0.4),
+            K.ColorJitter(hue=0.01, saturation=0.01, p=0.7),
+        )
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        batch = self.augs(torch.cat(self.num_augs * [image], dim=0))
+        if self.noise:
+            facs = batch.new_empty([batch.shape[0], 1, 1, 1]).uniform_(0.0, self.noise)
+            batch = batch + facs * torch.randn_like(batch)
+        return batch
+
+
+class VeniceClipPath(nn.Module):
+    """The complete legacy Venice image-to-text CLIP loss.
+
+    Consumes the *raw* model output -- no sigmoid, cone filter, problem mask or
+    volume constraint -- expands it to RGB, resizes the shorter edge to
+    ``preset.resize_short_side``, augments it into ``preset.num_augs`` crops,
+    CLIP-normalizes them (no clamping: the raw tensor is unbounded, the
+    reference run logged min -11.78 / max 13.12) and encodes them. The returned
+    value is Venice's ``clip_loss_raw``: per prompt, the mean transformed
+    distance over crops, summed with the prompt weights. No output scaling and
+    no auxiliary terms are applied.
+    """
+
+    def __init__(self, preset: VeniceClipPreset, clip_encoder: nn.Module,
+                 clip_input_res: int, device: torch.device):
+        super().__init__()
+        self.preset = preset
+        self.clip_encoder = clip_encoder
+        self.device = torch.device(device)
+        self.cropper = VeniceCrops(
+            clip_input_res,
+            preset.num_augs,
+            min_original_size=preset.min_original_size,
+            noise=preset.aug_noise,
+        ).to(self.device)
+
+        mean = torch.tensor(CLIP_PIXEL_MEAN, device=self.device).view(1, 3, 1, 1)
+        std = torch.tensor(CLIP_PIXEL_STD, device=self.device).view(1, 3, 1, 1)
+        self.register_buffer("clip_mean", mean, persistent=False)
+        self.register_buffer("clip_std", std, persistent=False)
+
+    def _encode_crops(self, crops: torch.Tensor) -> torch.Tensor:
+        """CLIP-normalize crops and return unit-normalized embeddings [N,D]."""
+        imgs = (crops.to(self.clip_mean.device) - self.clip_mean) / self.clip_std
+        if self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                z_img = self.clip_encoder(imgs).float()
+        else:
+            z_img = self.clip_encoder(imgs).float()
+        return F.normalize(z_img, dim=1)
+
+    def forward(self, logits: torch.Tensor, prompt_embeds: torch.Tensor,
+                prompt_weights: torch.Tensor) -> torch.Tensor:
+        """Compute the unweighted legacy CLIP loss for raw ``logits``.
+
+        Args:
+            logits: Raw model output, (H,W)/(1,H,W)/(N,1,H,W).
+            prompt_embeds: Unit-normalized text embeddings, [K,D].
+            prompt_weights: Per-prompt weights, [K].
+        """
+        x = _to_clip_rgb(_ensure_nchw(logits))
+        x = _resize_short_side(x, self.preset.resize_short_side)
+        z_img = self._encode_crops(self.cropper(x))
+
+        loss = z_img.new_tensor(0.0)
+        for embed, weight in zip(prompt_embeds, prompt_weights):
+            d = torch.norm(z_img - embed[None, :], dim=1)
+            if self.preset.use_arcsin_transform:
+                # Venice: arcsin(d / 2) ** 2. The clamp only guards arcsin
+                # against d drifting past 2.0 by float error.
+                d = torch.arcsin(d.clamp(0.0, 2.0 - 1e-6) * 0.5) ** 2
+            loss = loss + d.mean() * weight
+        return loss
+
+
 class RNTrunk(nn.Module):
     """
     Wraps CLIP-ResNet visual trunk, exposing stem + layers 1..4 + attnpool.
@@ -322,6 +508,10 @@ class CLIPLoss(nn.Module):
     CLIP guidance loss with paired crops. Initialize with prompts + weights.
       - If image_prompt is provided -> image-to-image conv-feature loss.
       - Else -> image-to-text loss vs combined positive (and optional negatives).
+
+    Passing `venice_compat` swaps the whole forward pipeline for the legacy
+    Venice one (see :class:`VeniceClipPath`); both paths remain selectable so
+    the two behaviors can be compared.
     """
     def __init__(
         self,
@@ -360,6 +550,10 @@ class CLIPLoss(nn.Module):
         use_lowfreq_reg: bool = True,
         lowfreq_sigma: float = 2.5,
         lowfreq_weight_max: float = 0.2,
+        # legacy compatibility: None/False for the default path above, True for
+        # VENICE_CLIP_PRESET, or an explicit VeniceClipPreset. See
+        # `_enable_venice_compat` for exactly what it replaces and disables.
+        venice_compat: Optional[VeniceClipPreset | bool] = None,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -417,8 +611,8 @@ class CLIPLoss(nn.Module):
         ).to(self.device)
 
         # CLIP mean/std buffers
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1, 3, 1, 1)
-        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1, 3, 1, 1)
+        mean = torch.tensor(CLIP_PIXEL_MEAN, device=self.device).view(1, 3, 1, 1)
+        std  = torch.tensor(CLIP_PIXEL_STD, device=self.device).view(1, 3, 1, 1)
         self.register_buffer("clip_mean", mean, persistent=False)
         self.register_buffer("clip_std", std, persistent=False)
 
@@ -444,8 +638,61 @@ class CLIPLoss(nn.Module):
 
         # Store prompts and image target
         self.image_prompt = image_prompt
+        self._E_pos_bank = None  # Store individual positive embeddings
+        self._pos_weights = None
         self._E_neg_bank = None  # Store individual negative embeddings
         self._set_and_cache_prompts(pos, w_pos, neg, w_neg)
+
+        # Legacy compatibility seam (must come last: it inspects the config above)
+        self.venice_preset = None
+        self.venice_path = None
+        preset = _coerce_venice_clip_preset(venice_compat)
+        if preset is not None:
+            self._enable_venice_compat(preset)
+
+    # ---- legacy compatibility seam ----
+    def _validate_venice_compat_prompts(self) -> None:
+        """Reject prompt configurations the legacy loss cannot express."""
+        if self.image_prompt is not None:
+            raise ValueError(
+                "venice_compat supports only the image-to-text path; the legacy "
+                "run set clip_rn_alpha=0 and had no geometric loss."
+            )
+        if self._E_neg_bank is not None:
+            raise ValueError(
+                "venice_compat has no negative hinge term; drop negative_prompts."
+            )
+        if self._E_pos_bank is None:
+            raise ValueError("venice_compat requires at least one positive prompt.")
+
+    def _enable_venice_compat(self, preset: VeniceClipPreset) -> None:
+        """Install the Venice-compatible CLIP path in place of the default one.
+
+        Beyond building the alternative path this switches off every default
+        stage the legacy pipeline omits, so that inspecting the module reflects
+        what `forward` will actually do. The omitted stages are: the sigmoid and
+        gaussian pre-blur on the input, the multi-scale patch pyramid, the
+        global / down-up / center-crop views, the negative hinge, the
+        low-frequency regularizer, the seamless-edges term and the x100 output
+        scale.
+
+        Raises:
+            ValueError: If the configuration uses a term the legacy loss has no
+                equivalent for (an image prompt or negative prompts), or if no
+                positive prompt was given.
+        """
+        self._validate_venice_compat_prompts()
+        self.venice_preset = preset
+        self.num_augs = preset.num_augs
+        self.use_arcsin_transform = preset.use_arcsin_transform
+        self.preblur_sigma = 0.0
+        self.use_patch_pyramid = False
+        self.use_global_path = False
+        self.use_lowfreq_reg = False
+        self.use_pairwise_spread = False
+        self.venice_path = VeniceClipPath(
+            preset, self.clip_encoder, self.clip_input_res, self.device
+        )
 
     # ---- prompt handling (simple & explicit) ----
     def _make_weighted(self, texts, weights):
@@ -467,7 +714,19 @@ class CLIPLoss(nn.Module):
         # Cache combined embeddings
         self.e_pos = self._encode_weighted(self.pos_prompts)
         self.e_neg = self._encode_weighted(self.neg_prompts)
-        
+
+        # Store individual positive embeddings and weights: the legacy path
+        # sums a separate per-prompt loss instead of combining the embeddings.
+        if self.pos_prompts:
+            texts = [p.text for p in self.pos_prompts]
+            self._E_pos_bank = _encode_texts(self.clip_model, texts, self.device)
+            self._pos_weights = torch.tensor(
+                [p.weight for p in self.pos_prompts], device=self.device
+            )
+        else:
+            self._E_pos_bank = None
+            self._pos_weights = None
+
         # Store individual negative embeddings for better negative guidance
         if self.neg_prompts:
             texts = [p.text for p in self.neg_prompts]
@@ -493,6 +752,8 @@ class CLIPLoss(nn.Module):
         pos, w_pos = _coerce(pos, pos_weights)
         neg, w_neg = _coerce(neg, neg_weights)
         self._set_and_cache_prompts(pos, w_pos, neg, w_neg)
+        if self.venice_path is not None:
+            self._validate_venice_compat_prompts()
 
     # ---- distance on the unit sphere or cosine ----
     def _spherical_loss(self, z_img, z_txt, use_arcsin=True):
@@ -686,6 +947,10 @@ class CLIPLoss(nn.Module):
         return L_pos + L_neg + L_low
 
     def forward(self, logits: torch.Tensor):
+        if self.venice_path is not None:
+            # Legacy path: raw logits in, no output scale, no auxiliary terms.
+            return self.venice_path(logits, self._E_pos_bank, self._pos_weights)
+
         # Ensure NCHW before any spatial ops like blur
         input_image = _ensure_nchw(torch.sigmoid(logits))
         clip_image = _gaussian_blur(input_image, sigma=self.preblur_sigma) if self.preblur_sigma > 0 else input_image
