@@ -15,11 +15,99 @@
 
 """Utility functions for optimization framework."""
 
+from pathlib import Path
+from typing import Union
+
 import numpy as np
 import torch
 from absl import logging
+from PIL import Image
+from torchvision import transforms
 
 from neural_structural_optimization.structural import physics
+
+
+def load_venice_initial_image(
+    image_path: Union[str, Path],
+    height: int,
+    width: int,
+    invert_image: bool = True,
+) -> torch.Tensor:
+    """Load an initial design field the way the legacy Venice run does.
+
+    Venice's chain (`models.py` lines 659-729) is RGB -> `Resize((height,
+    width))` -> `ToTensor` -> `1 - t` when inverting -> `Grayscale(1)`, and it
+    is reproduced here step for step:
+
+    * The resize runs on the PIL image, not on a tensor. PIL's bilinear
+      resampling is not the same operator as `F.interpolate`, so moving the
+      resize after `ToTensor` would change the field.
+    * The inversion happens BEFORE the grayscale reduction. Both are affine in
+      the channels and a constant-alpha image commutes them, but the source is
+      only near-grayscale, so the order is kept.
+    * The result stays in [0, 1] PIXEL space. No `logit` is applied: the design
+      parameter of `AdaptivePixelModel` is a density-like field that the
+      physics backend squashes itself (see `model_ada`), so pushing the image
+      through a logit would hand the solver a different field entirely.
+
+    `ToTensor` yields float32, which is why the reference run's design
+    parameter is float32 throughout -- including after the resolution
+    schedule's upsamples, which preserve dtype. Matching that is a parity
+    requirement, not a precision compromise.
+
+    Args:
+        image_path: path to the source image.
+        height: rows of the target grid, i.e. the model's `nely`.
+        width: columns of the target grid, i.e. the model's `nelx`.
+        invert_image: subtract the image from 1, so that dark ink becomes
+            dense material. True for the reference run.
+
+    Returns:
+        A float32 tensor of shape `(1, height, width)` with values in [0, 1].
+
+    Raises:
+        FileNotFoundError: if `image_path` does not exist.
+    """
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f'Initial image not found: {image_path}')
+
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = transforms.ToTensor()(
+        transforms.Resize((height, width))(image))
+    if invert_image:
+        image_tensor = 1 - image_tensor
+    return transforms.Grayscale(num_output_channels=1)(image_tensor)
+
+
+def init_weight_with_image(
+    model,
+    image_path: Union[str, Path],
+    invert_image: bool = True,
+) -> torch.Tensor:
+    """Seed `model.z` with an image, at the model's CURRENT resolution.
+
+    This is Venice's `MMSD.init_weight_with_image`, and the resolution it reads
+    is load-bearing. The reference run starts its adaptive model COARSE -- at
+    32x64, the bottom of a two-step schedule up to 128x256 -- so the image is
+    resampled to 32x64 here and reaches the final grid only by being carried up
+    through the schedule's upsamples. Loading it at the final resolution
+    instead would give the run a different starting design and a different
+    trajectory.
+
+    Args:
+        model: a model exposing a `z` parameter of shape `(1, height, width)`.
+        image_path: path to the source image.
+        invert_image: see `load_venice_initial_image`.
+
+    Returns:
+        The newly installed parameter.
+    """
+    height, width = model.z.shape[1:3]
+    image = load_venice_initial_image(image_path, height, width, invert_image)
+    model.z = torch.nn.Parameter(
+        image.to(model.z.device), requires_grad=True)
+    return model.z
 
 
 def get_variables(model) -> np.ndarray:
@@ -41,6 +129,19 @@ def constrained_logits(init_model) -> np.ndarray:
     logits = init_model().detach().cpu().numpy().astype(np.float64).squeeze(axis=0)
     return physics.physical_density(
         logits, init_model.env.args, volume_constraint=True, cone_filter=False)
+
+def repeat_to_shape(design: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Repeat a coarse design up to `height` x `width` by an integer factor.
+
+    Progressive schedules record designs at several resolutions, and stacking
+    them into one dataset needs them on a common grid. Nearest-neighbour repeat
+    keeps every coarse element visible as the block it actually was, rather
+    than interpolating detail the stage never had.
+    """
+    factor_y, factor_x = height // design.shape[0], width // design.shape[1]
+    if factor_y == 1 and factor_x == 1:
+        return design
+    return np.repeat(np.repeat(design, factor_y, axis=0), factor_x, axis=1)
 
 def cosine_warmup(t: int, T: int, warmup: float = 0.1, start: float = 1.0, end: float = 0.0) -> float:
     """Cosine from `start`→`end` after a linear warmup portion."""

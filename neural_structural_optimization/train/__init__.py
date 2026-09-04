@@ -27,6 +27,7 @@ from .base import BaseOptimizer, OptimizationTracker
 # Import optimizers
 from .optimizers import (
     Adam_Optimizer,
+    AdaptiveAdam_Optimizer,
     LBFGS_Optimizer,
     MMA_Optimizer,
     OptimalityCriteria_Optimizer,
@@ -43,6 +44,7 @@ __all__ = [
     
     # Optimizers
     'Adam_Optimizer',
+    'AdaptiveAdam_Optimizer',
     'LBFGS_Optimizer', 
     'MMA_Optimizer',
     'OptimalityCriteria_Optimizer',

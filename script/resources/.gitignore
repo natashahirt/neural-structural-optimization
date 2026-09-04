@@ -1,0 +1,13 @@
+# The repository root ignores *.png as build output. The files under this
+# directory are the opposite: committed REFERENCE ASSETS, copied from the
+# legacy Venice tree so that a golden run's initial condition and its one
+# surviving design artifact travel with this repository and cannot drift when a
+# sibling checkout moves. Without this negation the initial image is silently
+# absent from a fresh clone and the Venice parity harness fails on a machine
+# that never had the Venice repo.
+#
+# `results/.../0_final-*.jpg` needs no negation only because the root ignores
+# no JPEG pattern today. It is load-bearing in exactly the same way -- it is
+# the sole non-scalar record of the reference run's geometry -- so anything
+# added to the root ignore file must keep it tracked.
+!*.png

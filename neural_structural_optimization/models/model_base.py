@@ -1,6 +1,7 @@
 """Base model class for neural structural optimization."""
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import NamedTuple, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,6 +18,112 @@ from .utils import set_random_seed
 from neural_structural_optimization.structural import api as topo_api
 
 
+# ---------------------------------------------------------------------------
+# Venice legacy-compatibility seam
+#
+# The default total loss couples CLIP to compliance through a *detached* weight
+# and has no unweighted term. The legacy Venice run does neither, so the two
+# algebras live side by side and are selected per model instance. See
+# `venice_compat_total_loss` for the formula and `Model.get_total_loss` for the
+# single dispatch point.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VeniceLossAlgebra:
+    """Coefficients of the legacy Venice total-loss algebra.
+
+    Attributes:
+        clip_alpha: Multiplier turning the compliance loss into the CLIP weight.
+        compliance_weight: Multiplier on the raw structural loss.
+
+    Defaults are the values of the reference run.
+    """
+
+    clip_alpha: float = 10.0
+    compliance_weight: float = 1.0
+
+
+VENICE_LOSS_ALGEBRA = VeniceLossAlgebra()
+
+
+class VeniceLossTerms(NamedTuple):
+    """Per-step loss breakdown, named after the legacy log fields."""
+
+    total_loss: torch.Tensor
+    compliance_loss: torch.Tensor
+    clip_loss: torch.Tensor
+    clip_loss_raw: torch.Tensor
+    clip_weight: torch.Tensor
+
+
+def _coerce_venice_loss_algebra(value) -> Optional[VeniceLossAlgebra]:
+    """Normalize a ``venice_compat`` argument to an algebra or None.
+
+    Accepts None/False (default algebra), True (the reference coefficients), or
+    an explicit :class:`VeniceLossAlgebra`, so the seam can be driven straight
+    from a boolean configuration flag.
+    """
+    if value is None or value is False:
+        return None
+    if value is True:
+        return VENICE_LOSS_ALGEBRA
+    if isinstance(value, VeniceLossAlgebra):
+        return value
+    raise TypeError(
+        "venice_compat must be None, a bool, or a VeniceLossAlgebra, "
+        f"got {type(value).__name__}."
+    )
+
+
+def venice_compat_total_loss(
+    structural_loss: torch.Tensor,
+    clip_loss_raw: torch.Tensor,
+    *,
+    clip_alpha: float,
+    compliance_weight: float,
+) -> VeniceLossTerms:
+    """Combine the losses exactly as the legacy Venice ``LossObject`` does::
+
+        compliance_loss = structural_loss * compliance_weight
+        clip_weight     = compliance_loss * clip_alpha
+        clip_loss       = clip_loss_raw * clip_weight
+        total_loss      = compliance_loss + clip_loss + clip_loss_raw
+
+    Two properties are load-bearing and deliberate, not oversights:
+
+    * ``clip_weight`` is **not** detached. Compliance therefore receives
+      gradient through the CLIP term as well as directly, which is a real part
+      of the legacy dynamics.
+    * The raw, unweighted CLIP loss is added *on top of* the weighted one,
+      because Venice sums every populated field of its loss dictionary.
+
+    Both were confirmed arithmetically against the reference log: a compliance
+    of 73.99691670938864 at ``clip_alpha=10`` gives a weight of 739.97, and
+    ``283.3703603894398 / 0.3829488754272461`` is exactly 740.0; the three terms
+    sum to the logged total of 357.75022597425567.
+
+    Args:
+        structural_loss: Unweighted compliance from the physics solve.
+        clip_loss_raw: Unweighted CLIP loss (see `loss_clip.VeniceClipPath`).
+        clip_alpha: Compliance-to-CLIP-weight multiplier.
+        compliance_weight: Multiplier on the structural loss.
+
+    Returns:
+        The full :class:`VeniceLossTerms` breakdown.
+    """
+    compliance_loss = structural_loss * float(compliance_weight)
+    clip_weight = compliance_loss * float(clip_alpha)
+    clip_loss = clip_loss_raw * clip_weight
+    total_loss = compliance_loss + clip_loss + clip_loss_raw
+    return VeniceLossTerms(
+        total_loss=total_loss,
+        compliance_loss=compliance_loss,
+        clip_loss=clip_loss,
+        clip_loss_raw=clip_loss_raw,
+        clip_weight=clip_weight,
+    )
+
+
 class Model(nn.Module):
     """Base model class for structural optimization."""
     
@@ -25,9 +132,15 @@ class Model(nn.Module):
         structural_params: Optional[StructuralParams | dict] = None, 
         clip_loss: Optional[object] = None, 
         seed: Optional[int] = None, 
-        args: Optional[dict] = None
+        args: Optional[dict] = None,
+        venice_compat: Optional[VeniceLossAlgebra | bool] = None,
     ):
         super().__init__()
+
+        # Legacy loss algebra; None keeps the default detached coupling.
+        # Subclasses that do not forward this kwarg can use
+        # `enable_venice_compat_loss()` after construction instead.
+        self.venice_loss_algebra = _coerce_venice_loss_algebra(venice_compat)
         
         # Handle problem parameters
         if structural_params is not None:
@@ -241,7 +354,51 @@ class Model(nn.Module):
             return logits.new_tensor(0.0)  # Return zero loss if no CLIP loss configured
         # Convert logits to images using sigmoid for CLIP loss
         return self.clip_loss(logits)
-        
+
+    def enable_venice_compat_loss(
+        self,
+        algebra: VeniceLossAlgebra | bool = True,
+    ) -> "Model":
+        """Switch `get_total_loss` to the legacy Venice algebra.
+
+        Provided because the model subclasses do not forward the `venice_compat`
+        constructor kwarg, so configuration wiring can flip the seam on an
+        already-built model.
+
+        Args:
+            algebra: True for the reference coefficients, an explicit
+                :class:`VeniceLossAlgebra`, or False to restore the default.
+
+        Returns:
+            This model, for chaining.
+        """
+        self.venice_loss_algebra = _coerce_venice_loss_algebra(algebra)
+        return self
+
+    def get_venice_compat_losses(
+        self,
+        logits: torch.Tensor,
+        clip_alpha: Optional[float] = None,
+        compliance_weight: Optional[float] = None,
+    ) -> VeniceLossTerms:
+        """Compute the full legacy loss breakdown for one step.
+
+        Exposed separately from `get_total_loss` so a run can log the same
+        fields as the reference trajectory (compliance, weighted CLIP, raw CLIP
+        and the total). Usable whether or not the seam is enabled; arguments
+        left as None fall back to this model's algebra, then to
+        :data:`VENICE_LOSS_ALGEBRA`.
+        """
+        algebra = self.venice_loss_algebra or VENICE_LOSS_ALGEBRA
+        return venice_compat_total_loss(
+            self.get_structural_loss(logits),
+            self.get_semantic_loss(logits),
+            clip_alpha=algebra.clip_alpha if clip_alpha is None else clip_alpha,
+            compliance_weight=(
+                algebra.compliance_weight if compliance_weight is None else compliance_weight
+            ),
+        )
+
     def get_total_loss(
         self, 
         logits: torch.Tensor, 
@@ -264,7 +421,40 @@ class Model(nn.Module):
             compliance_weight: Optional scalar to scale the structural loss term,
                 and to determine the dynamic CLIP weight when `dynamic_clip_alpha`
                 is provided (i.e., weight is based on the scaled structural loss).
+
+        When the Venice compatibility seam is enabled, the legacy algebra
+        replaces all of the above: `dynamic_clip_alpha` and `compliance_weight`
+        override the configured algebra when given, the weight is undetached,
+        and `clip_weight` is REFUSED rather than ignored (see below). See
+        :func:`venice_compat_total_loss`.
+
+        Raises:
+            ValueError: if `clip_weight` is given while the seam is enabled.
+                The legacy weight is `compliance * clip_alpha`, recomputed
+                every step; a static `clip_weight` is not a setting of that
+                formula but a different one, so a caller passing it is
+                describing a different run and gets an error rather than
+                whichever weight the branch happens to apply. This mirrors the
+                refusal `train.optimizers` already applies to `clip_alpha`.
         """
+        if self.venice_loss_algebra is not None:
+            if clip_weight is not None:
+                raise ValueError(
+                    f'get_total_loss got clip_weight={clip_weight!r} while the '
+                    'Venice compatibility algebra is enabled; those are '
+                    'contradictory couplings. The algebra weights the semantic '
+                    'loss by compliance * clip_alpha, recomputed and '
+                    'undetached at every step, so a static clip_weight has no '
+                    'place in it and would be silently discarded. Drop '
+                    'clip_weight to run the preset -- set its alpha with '
+                    'enable_venice_compat_loss(VeniceLossAlgebra(clip_alpha=...)) '
+                    '-- or disable the preset to use the default coupling.')
+            return self.get_venice_compat_losses(
+                logits,
+                clip_alpha=dynamic_clip_alpha,
+                compliance_weight=compliance_weight,
+            ).total_loss
+
         structural_loss = self.get_structural_loss(logits)
         structural_loss_eff = structural_loss if compliance_weight is None else (structural_loss * float(compliance_weight))
         semantic_loss = self.get_semantic_loss(logits)

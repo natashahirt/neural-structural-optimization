@@ -35,6 +35,7 @@ import dataclasses
 import numpy as np
 import skimage.draw
 
+from neural_structural_optimization.structural import autograd as topo_autograd
 from neural_structural_optimization.structural import physics
 
 
@@ -709,10 +710,20 @@ def multistory_building(width=32, height=32, density=0.3, interval=16,
       structure can slide horizontally at zero energy cost and the stiffness
       matrix is singular -- CHOLMOD rejects it outright and only a solver that
       tolerates a consistent singular system (SuperLU) will return anything.
-      The constraint is nearly free: every load here is vertical, so it changes
-      compliance by 0.07% (563.43 vs 563.80 at 128x256, uniform density 0.3).
-      Set False only to reproduce the legacy boundary conditions exactly, and
-      only with a solver that can handle the rank deficiency.
+      The constraint is nearly free, because every load here is vertical, but
+      how nearly depends on the design it is measured against:
+
+        field                      32x64    64x128   128x256
+        Venice seeded image       0.335%    0.365%    0.380%
+        uniform density 0.3            --        --    0.070%
+
+      The uniform-field figure (563.43 walled vs 563.80 free) is the one an
+      earlier note quoted, and it understates the bias on the field a replay
+      actually starts from by roughly a factor of five. Set False only to
+      reproduce the legacy boundary conditions exactly, and only with a solver
+      that can handle the rank deficiency -- `StructuralParams` refuses the
+      combination outright when CHOLMOD is the active backend, because there
+      the failure is a process-killing segfault rather than an exception.
 
   Returns:
     A `Problem` describing the loaded building.
@@ -801,6 +812,11 @@ class StructuralParams:
 
     # grid and interval params
     interval: int = 16 # for multistory buildings
+    # for multistory buildings: constrain X on the right edge. True is not a
+    # styling default -- False leaves the stiffness matrix singular, which
+    # CHOLMOD refuses and only SuperLU can solve. See `multistory_building`
+    # for the boundary condition and `get_problem` for the refusal.
+    fix_right_wall: bool = True
     break_symmetry: bool = False # for staggered points
 
     # position for michell_centered_both
@@ -940,6 +956,35 @@ class StructuralParams:
                 f'interval={self.height // max(self.num_stories, 1)} for the '
                 'same floor count.',
                 stacklevel=3)
+
+        # Dropping the right wall is not a preference, it is a different linear
+        # system: nothing constrains X anywhere, so the stiffness matrix is
+        # singular. CHOLMOD rejects it with CholmodNotPositiveDefiniteError and
+        # leaves state behind that segfaults the NEXT solve in the process, so
+        # the requirement is stated here -- once, before anything is built --
+        # rather than discovered as a crash with no traceback.
+        if not self.fix_right_wall:
+            if 'fix_right_wall' not in sig.parameters:
+                warnings.warn(
+                    f'fix_right_wall=False is ignored by {self.problem_name}, '
+                    'which does not take it; only multistory_building has a '
+                    'right wall to drop.',
+                    stacklevel=3)
+            elif topo_autograd.HAS_CHOLMOD:
+                raise ValueError(
+                    'fix_right_wall=False leaves nothing constraining X, so '
+                    'the stiffness matrix is singular and only a solver that '
+                    'tolerates a consistent singular system can factor it. '
+                    'This environment has sksparse.cholmod installed, so the '
+                    'physics backend uses CHOLMOD, which raises '
+                    'CholmodNotPositiveDefiniteError and then segfaults the '
+                    'next solve in the process. Run the unconstrained '
+                    'boundary conditions in an environment without '
+                    'sksparse.cholmod, where the backend falls back to '
+                    'SuperLU, or keep fix_right_wall=True -- it biases '
+                    'compliance by 0.335% at 32x64, 0.365% at 64x128 and '
+                    '0.380% at 128x256 on the Venice seeded field.')
+
         problem = problem_function(**filtered_params)
         apply_discretization_params(problem, self)
         return problem
