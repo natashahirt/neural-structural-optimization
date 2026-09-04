@@ -29,7 +29,7 @@ overview:
 - This implementation exclusively uses the legacy autograd physics backend
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Union
 import autograd.numpy as np
 import numpy as _np
 import autograd.core
@@ -45,6 +45,7 @@ _HAS_PYFANTOM = False
 
 # Legacy backend (autograd-based)
 from neural_structural_optimization.structural import physics
+from neural_structural_optimization.structural.problems import resolve_discretization_value
 
 def _to_numpy(x, dtype=np.float64):
     """Convert torch.Tensor / list / np.array to np.ndarray(dtype), no copy if possible."""
@@ -86,7 +87,7 @@ def _args_to_numpy(args: Dict[str, Any]) -> Dict[str, Any]:
     # scalar-ish fields: make sure they are plain Python/NumPy scalars
     for key in ("young", "young_min", "poisson", "g",
                 "volfrac", "xmin", "xmax", "nelx", "nely",
-                "penal", "filter_width"):
+                "penal", "filter_width", "rmin", "beta", "eta"):
         if key in out:
             v = out[key]
             if _torch is not None and _torch.is_tensor(v):
@@ -97,8 +98,27 @@ def _args_to_numpy(args: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
             out[key] = v
+    if "heavyside" in out:
+        out["heavyside"] = bool(out["heavyside"])
 
     return out
+
+
+def _coerce_discretization_args(problem) -> Dict[str, Union[float, bool]]:
+    """Ensure discretization fields on *problem* are concrete floats/bools."""
+    rmin = float(problem.rmin)
+    coerced = {}
+    for name in ("filter_width", "rmin", "beta", "heavyside", "eta"):
+        raw = getattr(problem, name)
+        if isinstance(raw, str):
+            coerced[name] = resolve_discretization_value(name, raw, rmin=rmin)
+        elif name == "heavyside":
+            coerced[name] = bool(raw)
+        else:
+            coerced[name] = float(raw)
+    # Problem fields can be set directly, bypassing resolve_discretization_value.
+    physics.check_filter_width(coerced["filter_width"])
+    return coerced
 
 def specified_task(problem):
     """Given a problem, return parameters for running topology optimization (NumPy)."""
@@ -111,6 +131,7 @@ def specified_task(problem):
     alldofs = _np.arange(2 * (problem.width + 1) * (problem.height + 1), dtype=_np.int64)
     freedofs = _np.sort(_np.setdiff1d(alldofs, fixdofs, assume_unique=False))
 
+    disc = _coerce_discretization_args(problem)
     params = {
         # material properties
         "young": 1.0,
@@ -129,11 +150,7 @@ def specified_task(problem):
         "fixdofs": fixdofs,
         "forces": forces.ravel(),
         "penal": 3.0,
-        "rmin": float(getattr(problem, "rmin", 2.0)),
-        "filter_width": getattr(problem, "filter_width", 2.0),
-        "heavyside": getattr(problem, "heavyside", True),
-        "beta": getattr(problem, "beta", 2.0),
-        "eta": getattr(problem, "eta", 0.5),
+        **disc,
     }
     return params
 

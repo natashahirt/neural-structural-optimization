@@ -50,6 +50,41 @@ import numpy as _np
 # - mask is either a scalar (1) or an array of shape (X, Y).
 # Yes, this is confusing. Sorry!
 
+# Logits are clipped here before the sigmoid, so beyond this magnitude every
+# element saturates to exactly 0 or exactly 1. sigmoid_with_constrained_mean
+# leans on that to bracket its root.
+SIGMOID_CLIP = 40.0
+
+# Below this sharpness the Heaviside projection is the identity to within
+# floating point, and its normalizing denominator underflows.
+MIN_PROJECTION_BETA = 1e-8
+
+# A cone filter of this radius or smaller admits only the (0, 0) offset, which
+# normalized_cone_filter_matrix then divides straight back out, so the filter is
+# exactly the identity and all checkerboard control is silently lost.
+MIN_FILTER_WIDTH = 1.0
+
+
+def check_filter_width(filter_width):
+  """Return `filter_width` as a float, rejecting degenerate cone-filter radii.
+
+  `_cone_filter_matrix` keeps the offsets satisfying ``dx**2 + dy**2 <
+  radius**2``, so a radius of at most 1.0 keeps only the element itself and
+  row normalization then divides that single weight back out. The resulting
+  identity filter is indistinguishable from a working one at the call site,
+  which is why this raises rather than warns.
+  """
+  width = float(filter_width)
+  if width <= MIN_FILTER_WIDTH:
+    raise ValueError(
+        f'filter_width resolves to {width}, which degenerates the cone filter '
+        f'to the identity (a radius of {MIN_FILTER_WIDTH} or less reaches no '
+        'neighbouring element), silently removing checkerboard control. Use a '
+        'radius greater than 1.0; 2.0 is the standard choice. With '
+        "filter_width='linear' the radius is 2 * rmin, so rmin must exceed 0.5."
+    )
+  return width
+
 
 def default_args():
   # select the degrees of freedom
@@ -84,21 +119,90 @@ def default_args():
           'name': 'truss'}
 
 
+def projection_params(args):
+  """Return (beta, eta) if Heaviside projection is enabled, else None.
+
+  Rejects the parameter values that make `heavyside_projection` meaningless:
+  `eta` outside [0, 1] drives its normalizing denominator to zero (NaN-ing the
+  whole density field), and a non-positive `beta` is not a softer projection
+  but an ill-posed one. Both are validated in `StructuralParams` as well; this
+  is the backstop for args dicts assembled by hand.
+  """
+  if not args.get('heavyside', False):
+    return None
+  beta = float(args.get('beta', 2.0))
+  eta = float(args.get('eta', 0.5))
+  if beta <= 0.0:
+    raise ValueError(
+        f'beta must be positive, got {beta}. The Heaviside projection is even '
+        'in beta, so a negative value is not a weaker projection; disable the '
+        'projection with heavyside=False instead.')
+  if not 0.0 <= eta <= 1.0:
+    raise ValueError(
+        f'eta must lie in [0, 1], got {eta}. Outside that range the projection '
+        'denominator tanh(beta * eta) + tanh(beta * (1 - eta)) cancels to zero '
+        'and the density field becomes NaN.')
+  if beta <= MIN_PROJECTION_BETA:
+    return None  # the projection degenerates to the identity as beta -> 0
+  return beta, eta
+
+
 def physical_density(x, args, volume_constraint=False, cone_filter=True):
+  """Map raw design variables onto physical densities.
+
+  Runs the standard SIMP chain: sigmoid, mask, density filter, optional
+  Heaviside projection, then volume enforcement. The filter radius comes from
+  args['filter_width'], which upstream already resolves from args['rmin'].
+
+  Neither stage after the sigmoid preserves the mean -- the cone filter is
+  row-normalized rather than sum-preserving, and the projection deliberately
+  pushes densities apart -- so the volume constraint only holds on the final
+  density when it is enforced last. Enforcing it last perturbs the legacy
+  result, so it switches on exactly when it is needed (whenever projection is
+  enabled) and can be forced either way with args['enforce_volume_last'].
+
+  The volume offset is always solved against the filtered density, whatever
+  `cone_filter` asks for here. Callers that pass cone_filter=False want the
+  unfiltered view of the design the objective sees -- Environment.render and
+  the CNN-to-pixel handoff both do -- and solving a second offset against the
+  unfiltered residual would hand them a different design instead.
+  """
   shape = (args['nely'], args['nelx'])
   assert x.shape == shape or x.ndim == 1
   x = x.reshape(shape)
-  if volume_constraint:
-    mask = np.broadcast_to(args['mask'], x.shape) > 0
-    x_designed = sigmoid_with_constrained_mean(x[mask], args['volfrac'])
-    x_flat = topo_autograd.scatter1d(
-        x_designed, np.flatnonzero(mask), x.size)
-    x = x_flat.reshape(x.shape)
+  projection = projection_params(args)
+  # Constrain the mean of the finished density, matching mean_density().
+  volume_last = volume_constraint and args.get(
+      'enforce_volume_last', projection is not None)
+  if cone_filter or volume_last:
+    check_filter_width(args['filter_width'])
+
+  def filter_and_project(x_full, apply_filter):
+    if apply_filter:
+      x_full = topo_autograd.cone_filter(
+          x_full, args['filter_width'], args['mask'])
+    if projection is not None:
+      x_full = heavyside_projection(x_full, *projection)
+    return x_full
+
+  if not volume_constraint:
+    return filter_and_project(x * args['mask'], cone_filter)
+
+  mask = np.broadcast_to(args['mask'], x.shape) > 0
+  design_indices = np.flatnonzero(mask)
+
+  def build(x_designed, apply_filter):
+    x_flat = topo_autograd.scatter1d(x_designed, design_indices, x.size)
+    return filter_and_project(x_flat.reshape(shape), apply_filter)
+
+  if volume_last:
+    design_fraction = np.mean(args['mask'])
+    measure = lambda x_designed: np.mean(build(x_designed, True)) / design_fraction
   else:
-    x = x * args['mask']
-  if cone_filter:
-    x = topo_autograd.cone_filter(x, args['filter_width'], args['mask'])
-  return x
+    measure = None
+  return build(
+      sigmoid_with_constrained_mean(x[mask], args['volfrac'], measure),
+      cone_filter)
 
 
 def mean_density(x, args, volume_constraint=False, cone_filter=True):
@@ -250,7 +354,7 @@ def optimality_criteria_combine(x, dc, dv, args, max_move=0.2, eta=0.5):
 
 def sigmoid(x):
   # Stable logistic sigmoid; differentiable under autograd
-  x = np.clip(x, -40.0, 40.0)
+  x = np.clip(x, -SIGMOID_CLIP, SIGMOID_CLIP)
   return 0.5*np.tanh(0.5*x) + 0.5
 
 
@@ -259,14 +363,49 @@ def logit(p, eps=1e-12):
   return np.log(p) - np.log1p(-p)
 
 
+def heavyside_projection(x, beta, eta=0.5):
+  """Smoothed Heaviside projection (Wang, Lazarov & Sigmund, 2011).
+
+  Pushes densities toward 0/1 with sharpness `beta` about the threshold `eta`,
+  holding the endpoints fixed: 0 maps to 0 and 1 maps to 1. Strictly increasing
+  in `x`, which the volume-enforcement bisection relies on, but not mean
+  preserving.
+  """
+  offset = np.tanh(beta * eta)
+  return ((offset + np.tanh(beta * (x - eta)))
+          / (offset + np.tanh(beta * (1.0 - eta))))
+
+
 # an alternative to the optimality criteria
-def sigmoid_with_constrained_mean(x, average):
-  def f(x_, y):
-    z = np.clip(x_ + y, -40.0, 40.0)  # keep inputs tame
-    return sigmoid(z).mean() - average
-  lower_bound = logit(average) - np.max(x)
-  upper_bound = logit(average) - np.min(x)
-  b = topo_autograd.find_root(f, x, lower_bound, upper_bound)
+def sigmoid_with_constrained_mean(x, average, measure=None):
+  """Return ``sigmoid(x + b)`` for the offset `b` that hits a target mean.
+
+  By default `b` solves ``mean(sigmoid(x + b)) == average``. Passing `measure`
+  constrains that downstream quantity instead, so the volume constraint can be
+  imposed on the filtered and projected density rather than on the raw sigmoid.
+  Either residual is increasing in `b`, as `find_root` requires.
+  """
+  if measure is None:
+    def f(x_, y):
+      return sigmoid(x_ + y).mean() - average
+    # Tight bracket, valid only for the plain-sigmoid residual: shifting every
+    # element to at most (at least) logit(average) drives the mean below (above)
+    # the target.
+    lower_bound = logit(average) - np.max(x)
+    upper_bound = logit(average) - np.min(x)
+    check_bracket = False
+  else:
+    def f(x_, y):
+      return measure(sigmoid(x_ + y)) - average
+    # `measure` composes stages whose effect on the mean is unknown here, so
+    # bracket on sigmoid saturation instead: past +/-SIGMOID_CLIP every element
+    # is exactly 0 or exactly 1, and any increasing measure that maps those two
+    # fields to 0 and to at least 1 then straddles any average in [0, 1].
+    lower_bound = -SIGMOID_CLIP - np.max(x)
+    upper_bound = SIGMOID_CLIP - np.min(x)
+    check_bracket = True
+  b = topo_autograd.find_root(
+      f, x, lower_bound, upper_bound, check_bracket=check_bracket)
   return sigmoid(x + b)
 
 
