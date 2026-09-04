@@ -11,7 +11,7 @@ from neural_structural_optimization.structural.problems import (
     StructuralParams,
     resolve_analysis_filter_width,
 )
-from .loss_structural import StructuralLoss
+from .loss_structural import StructuralLoss, PhysicalDensity
 from .loss_clip import CLIPLoss
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
@@ -348,12 +348,31 @@ class Model(nn.Module):
         # Use NumPy/HIPS-autograd bridge (faster/stable on CPU)
         return StructuralLoss.apply(z, env).mean()
 
+    def get_physical_density(self, logits: torch.Tensor) -> torch.Tensor:
+        """The canonical density: filtered, volume-constrained, same as render.
+
+        Differentiable through a HIPS VJP. Evaluated on `self.env` (full
+        resolution), not `analysis_env`. Venice CLIP does not use this.
+        """
+        return PhysicalDensity.apply(logits, self.env)
+
+    def _clip_sees_raw_design(self) -> bool:
+        """Venice CLIP (and the Venice algebra's stub) consume raw z."""
+        if getattr(self.clip_loss, 'venice_path', None) is not None:
+            return True
+        return self.venice_loss_algebra is not None
+
     def get_semantic_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        """Compute clip-based semantic loss."""
+        """Compute clip-based semantic loss on the canonical density.
+
+        Default CLIP sees `get_physical_density(logits)`, not `sigmoid(z)`.
+        The Venice preset still passes raw logits, matching the golden run.
+        """
         if self.clip_loss is None:
-            return logits.new_tensor(0.0)  # Return zero loss if no CLIP loss configured
-        # Convert logits to images using sigmoid for CLIP loss
-        return self.clip_loss(logits)
+            return logits.new_tensor(0.0)
+        if self._clip_sees_raw_design():
+            return self.clip_loss(logits)
+        return self.clip_loss(self.get_physical_density(logits))
 
     def enable_venice_compat_loss(
         self,

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from .utils import batched_topo_loss
+from neural_structural_optimization.structural import physics
 
 
 class StructuralLoss(torch.autograd.Function):
@@ -65,3 +66,54 @@ class StructuralLoss(torch.autograd.Function):
         # Map back to torch, match original dtype & device
         g = torch.from_numpy(g_np).to(ctx.device).to(ctx.dtype)
         return g, None  # no grad for env
+
+
+class PhysicalDensity(torch.autograd.Function):
+    """Map design variables onto the canonical physical density.
+
+    Forward is `physics.physical_density(..., volume_constraint=True,
+    cone_filter=True)` -- the same field `Environment.render` returns.
+    Backward is a HIPS-autograd VJP of that map, not a Jacobian.
+
+    The `import autograd` below is the third-party HIPS package, not
+    `neural_structural_optimization.structural.autograd`.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, env: Any) -> torch.Tensor:
+        if not isinstance(logits, torch.Tensor):
+            raise TypeError("logits must be a torch.Tensor")
+        ctx.device = logits.device
+        ctx.dtype = logits.dtype
+        ctx.input_shape = tuple(logits.shape)
+        ctx.nely = int(env.args["nely"])
+        ctx.nelx = int(env.args["nelx"])
+        ctx.env = env
+        logits_cpu = logits.detach().cpu()
+        ctx.save_for_backward(logits_cpu)
+        x2d = logits_cpu.double().numpy().reshape(ctx.nely, ctx.nelx)
+        density = physics.physical_density(
+            x2d, env.args, volume_constraint=True, cone_filter=True)
+        out = torch.as_tensor(
+            _np.asarray(density), dtype=ctx.dtype, device=ctx.device)
+        return out.reshape(ctx.input_shape)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        (logits_cpu,) = ctx.saved_tensors
+        env = ctx.env
+        nely, nelx = ctx.nely, ctx.nelx
+        import autograd  # HIPS autograd; do not alias over topo_autograd
+
+        x2d = logits_cpu.double().numpy().reshape(nely, nelx)
+        go = grad_output.detach().cpu().to(torch.float64).numpy().reshape(
+            nely, nelx)
+
+        def scalar_density(x_arr):
+            dens = physics.physical_density(
+                x_arr, env.args, volume_constraint=True, cone_filter=True)
+            return np.sum(dens * go)
+
+        g_np = autograd.grad(scalar_density)(x2d)
+        g = torch.from_numpy(_np.asarray(g_np)).to(ctx.device).to(ctx.dtype)
+        return g.reshape(ctx.input_shape), None

@@ -207,12 +207,11 @@ def default_args():
 def projection_params(args):
   """Return (beta, eta) if Heaviside projection is enabled, else None.
 
-  EXPERIMENTAL. Enabling the projection breaks the volume constraint on the
-  rendered/saved design: only the objective's view of the density is driven to
-  `volfrac`, and the two diverge sharply away from ``volfrac == eta`` (at
-  volfrac=0.3, eta=0.5, beta=16 the render comes out ~37% heavy). This is a
-  known gap, pinned by `HeavysideVolumeGapCharacterizationTest`, and is tracked
-  for a later stage.
+  With Heaviside enabled, `Environment.render` and the objective share the
+  filtered physical density, which holds `volfrac`. `cone_filter=False` is the
+  CNN-to-pixel handoff view of the same offset -- already projected, so the
+  pixel objective projecting it again is a Stage 8 concern, not a render bug.
+  See `CanonicalRenderVolumeTest`.
 
   Rejects the parameter values that make `heavyside_projection` meaningless:
   `eta` outside [0, 1] drives its normalizing denominator to zero (NaN-ing the
@@ -264,20 +263,18 @@ def physical_density(x, args, volume_constraint=False, cone_filter=True):
   result, so it switches on exactly when it is needed (whenever projection is
   enabled) and can be forced either way with args['enforce_volume_last'].
 
-  Heaviside projection (args['heavyside']) is EXPERIMENTAL: with it enabled the
-  rendered/saved design does not satisfy the volume constraint the objective
-  enforces. See `projection_params` and
-  `HeavysideVolumeGapCharacterizationTest`.
+  Heaviside projection (args['heavyside']) is opt-in. With it enabled, the
+  volume constraint holds on this function's `cone_filter=True` result, which
+  is also what `Environment.render` returns. `cone_filter=False` is the
+  pre-filter view of the SAME volume offset -- the CNN-to-pixel handoff
+  (`train.utils.constrained_logits`) -- not a second design and not the saved
+  image. See `projection_params` and `CanonicalRenderVolumeTest`.
 
-  The volume offset is always solved against the filtered density, whatever
-  `cone_filter` asks for here, so cone_filter=False returns the pre-filter view
-  of the SAME design rather than a second design whose offset was re-solved
-  against the unfiltered residual. That is what `Environment.render` and the
-  CNN-to-pixel handoff want. Note that this makes them agree with the objective
-  only for a given `args`: `Model.get_structural_loss` evaluates the objective
-  on `analysis_env` whenever `analysis_factor != 1`, while `train/base.py`
-  renders through `model.env`, so above the analysis-dimension cap the render
-  and the objective use a different grid and a different radius.
+  Note that render and the objective agree only for a given `args`:
+  `Model.get_structural_loss` evaluates the objective on `analysis_env`
+  whenever `analysis_factor != 1`, while `train/base.py` renders through
+  `model.env`, so above the analysis-dimension cap they use a different grid
+  and a different radius. That is a resolution split, not a third density.
   """
   shape = (args['nely'], args['nelx'])
   assert x.shape == shape or x.ndim == 1

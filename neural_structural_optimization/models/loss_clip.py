@@ -512,6 +512,10 @@ class CLIPLoss(nn.Module):
     Passing `venice_compat` swaps the whole forward pipeline for the legacy
     Venice one (see :class:`VeniceClipPath`); both paths remain selectable so
     the two behaviors can be compared.
+
+    On the default path `forward` consumes an already-[0, 1] physical density
+    (`Model.get_semantic_loss` runs `physical_density` first). It does not
+    sigmoid. The Venice path still consumes raw logits.
     """
     def __init__(
         self,
@@ -946,13 +950,15 @@ class CLIPLoss(nn.Module):
 
         return L_pos + L_neg + L_low
 
-    def forward(self, logits: torch.Tensor):
+    def forward(self, image: torch.Tensor):
         if self.venice_path is not None:
             # Legacy path: raw logits in, no output scale, no auxiliary terms.
-            return self.venice_path(logits, self._E_pos_bank, self._pos_weights)
+            return self.venice_path(image, self._E_pos_bank, self._pos_weights)
 
-        # Ensure NCHW before any spatial ops like blur
-        input_image = _ensure_nchw(torch.sigmoid(logits))
+        # Canonical path: already-[0, 1] physical density, not logits.
+        # Model.get_semantic_loss runs physical_density first; a second
+        # sigmoid here would be a different field.
+        input_image = _ensure_nchw(image)
         clip_image = _gaussian_blur(input_image, sigma=self.preblur_sigma) if self.preblur_sigma > 0 else input_image
         loss = (self.evaluate_image_to_image(clip_image, self.image_prompt) 
                 if self.image_prompt is not None 

@@ -777,13 +777,12 @@ class StructuralParams:
     rmin: Union[float, str, None] = None
     
     # projection parameters (None → physics defaults in get_problem)
-    # heavyside is EXPERIMENTAL: with the Heaviside projection enabled, the
-    # rendered/saved design does NOT satisfy the volume constraint that the
-    # objective enforces. Only the objective's view of the density is driven to
-    # `density`; the render runs heavy, and increasingly so the further
-    # `density` sits from `eta` (at density=0.3, eta=0.5, beta=16 the render is
-    # ~37% over). The gap is pinned by
-    # `HeavysideVolumeGapCharacterizationTest` and tracked for a later stage.
+    # heavyside is opt-in. With it enabled, Environment.render and the
+    # objective share the filtered physical density, which holds `density`.
+    # The CNN-to-pixel handoff still reads the pre-filter view
+    # (`constrained_logits`); that field is already projected, so a second
+    # projection in the pixel objective is a Stage 8 concern. See
+    # `CanonicalRenderVolumeTest`.
     heavyside: Optional[bool] = None
     beta: Union[float, str, None] = None
     eta: Optional[float] = None
