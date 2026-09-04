@@ -1,0 +1,74 @@
+---
+description: How to run Python, tests, and the conda environment in this repo. Read before running any python or pytest command.
+alwaysApply: true
+---
+
+# Running Python in this repo
+
+## Run Python OUTSIDE the tool sandbox. Always.
+
+Any sandboxed Python that imports numpy dies instantly with:
+
+```
+Fatal Python error: Floating point exception
+  numpy/linalg/linalg.py:561 in inv
+  numpy/lib/polynomial.py:680 in polyfit
+  numpy/__init__.py:386 in _mac_os_check
+```
+
+The sandbox blocks syscalls OpenBLAS uses for CPU detection. **This is not a
+code bug and not a broken environment.** It fires inside numpy's own import-time
+check, before any project code runs, and pytest reports it during *collection* —
+so it reads convincingly like a corrupt install. It is not. Do not investigate
+it, and do not "repair" the environment in response to it.
+
+Use `required_permissions: ["all"]` and invoke the interpreter directly:
+
+```bash
+cd "<repo>" && PYTHONPATH="$PWD" /opt/miniconda3/envs/neural_structural_opt/bin/python ...
+```
+
+Do **not** use `conda run`. It is sandboxed too unless the permission is passed,
+and it hides the real traceback behind a conda wrapper error.
+
+Other permissions: `git_write` for `git commit`/`git stash`, `full_network` for
+conda/pip. Plain `grep`, `ls`, and `git log` are fine sandboxed.
+
+**If a numpy-touching command fails in a way you don't understand, re-run it once
+with the sandbox off before forming any hypothesis.** Skipping that step once cost
+an hour of conda archaeology chasing a phantom broken install.
+
+## The environment
+
+`neural_structural_opt` (conda, osx-64): Python 3.11, torch 2.2.2, numpy 1.26.4,
+scipy 1.16.0, scikit-sparse (CHOLMOD).
+
+- **numpy must stay below 2.0** — HIPS `autograd`, which the physics backend is
+  built on, requires it.
+- **numpy and scipy here are pip wheels, not conda packages**, despite living in a
+  conda env. numpy carries its own bundled `libopenblas64_` in
+  `site-packages/numpy/.dylibs/`. So `conda install`/`conda list` will report a
+  numpy that is not the one actually being imported, and reinstalling it via conda
+  does nothing. Use pip for these.
+- CHOLMOD roughly halves physics time versus the SuperLU fallback. Confirm with
+  `from neural_structural_optimization.structural.autograd import HAS_CHOLMOD`.
+
+## Tests
+
+```bash
+cd "<repo>" && /opt/miniconda3/envs/neural_structural_opt/bin/python -m pytest neural_structural_optimization/tests -q
+```
+
+The suite must stay green. It includes characterization pins on the default
+density path that are **bit-exact by design** — the legacy reproduction depends on
+that path not moving. If you change physics and a parity pin fails, that is the
+test doing its job; do not update the pin to match your output without
+establishing that the change was intended.
+
+## The name collision that has already caused one silent bug
+
+This repo has its own `neural_structural_optimization.structural.autograd`,
+distinct from the third-party HIPS `autograd` package. Importing both without
+aliasing shadows the library and silently disables whatever depends on it — a test
+went unexecuted for months this way. Alias the repo module as `topo_autograd`, per
+the existing tests.
