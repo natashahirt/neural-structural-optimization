@@ -12,10 +12,10 @@ success: 'null'
 files: ''
 session_id: sess-cf4626a3
 created_at: '2026-09-04T19:54:35.849312+00:00'
-updated_at: '2026-09-04T19:54:45.568583+00:00'
+updated_at: '2026-09-04T20:45:46.331884+00:00'
 has_child_rationale: Confirmed research target for Stage 6, after Stage 5 experiment
   config.
-related_to: plan-c9c6884b,deci-640e26f0
+related_to: plan-c9c6884b,deci-640e26f0,plan-1c9a2525
 ---
 User confirmed Stage 6 sketch guidance as a spatial prior on material distribution, not silhouette matching and not CLIP.
 
