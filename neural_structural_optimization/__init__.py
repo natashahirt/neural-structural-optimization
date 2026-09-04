@@ -16,6 +16,50 @@
 # Keep __init__ lightweight to avoid circular imports; import submodules explicitly where needed.
 __version__ = "0.1.0"
 
+# Pin OpenMP to one thread BEFORE anything can load a native library.
+#
+# CHOLMOD's supernodal factorization races against the other OpenMP runtime in
+# this process (libcholmod links libomp and Apple's Accelerate; numpy ships its
+# own bundled OpenBLAS) and takes the interpreter down with a bare SIGSEGV -- no
+# exception, no traceback, the run simply disappears. It is intermittent, which
+# is worse than deterministic: multistory_building at 96x192 crashed 3 runs in 5
+# and at 128x256 crashed 4 in 5, so a green run proves nothing.
+#
+# Serializing OpenMP is not a slow safe fallback here -- single-threaded
+# supernodal is FASTER than the racy threaded version (137.5ms vs 171.9ms at
+# 96x192) because the contention was pure overhead, and it is ~9x faster than
+# the SuperLU fallback at 128x256. Torch is unaffected: it reads this at import
+# but `configure_torch_threads()` below restores its thread pool afterwards.
+#
+# This must run before numpy/scipy/sksparse are imported, so it lives at the top
+# of the package __init__ rather than next to the solver that needs it. An
+# externally set OMP_NUM_THREADS is respected.
+import os as _os
+
+_os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+def configure_torch_threads(num_threads=None):
+  """Restore torch's CPU thread pool after the OpenMP pin above.
+
+  `OMP_NUM_THREADS=1` would otherwise leave torch single-threaded and roughly
+  1.8x slower on CPU. Calling this is a net win rather than a repair: setting
+  the count explicitly measured faster than torch's own default (44.0ms vs
+  79.1ms on a 1500x1500 matmul).
+
+  Args:
+    num_threads: threads to allow torch. Defaults to the machine's CPU count.
+
+  Returns:
+    The thread count torch actually adopted, or None if torch is unavailable.
+  """
+  try:
+    import torch
+  except ImportError:
+    return None
+  torch.set_num_threads(num_threads or _os.cpu_count() or 1)
+  return torch.get_num_threads()
+
 # Optional CLIP availability flag
 try:
     from .models.loss_clip import CLIPLoss  # type: ignore
