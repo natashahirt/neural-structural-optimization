@@ -12,9 +12,10 @@ success: 'null'
 files: ''
 session_id: sess-a469ebb9
 created_at: '2026-09-04T18:44:46.620083+00:00'
-updated_at: '2026-09-04T18:44:46.620083+00:00'
+updated_at: '2026-09-04T18:45:22.853945+00:00'
 has_child_rationale: Stage 5 is the next gate after canonical density; sequencing
   decision deci-640e26f0 parks CNN handoff until Stage 8.
+related_to: deci-640e26f0
 ---
 GOAL: typed experiment interface so Stages 6-7 are comparable runs, not hardcoded script/run.py.
 
