@@ -205,10 +205,15 @@ class Environment:
 
   # ----------------------------- Renders ------------------------------
   def render(self, params, volume_constraint=True):
+    """Return the physical density the objective uses, not a pre-filter view.
+
+    `cone_filter=True` is the stiffness field. The CNN-to-pixel handoff still
+    asks `physical_density(..., cone_filter=False)` itself; that is a view of
+    the same volume offset, not a second design, and it is not what we save.
+    """
     x2d = self.reshape(params)
-    # Legacy physics
     return physics.physical_density(
-        x2d, self.args, volume_constraint=volume_constraint, cone_filter=False
+        x2d, self.args, volume_constraint=volume_constraint, cone_filter=True
     )
 
   # ----------------------------- Objective ---------------------------

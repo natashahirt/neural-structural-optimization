@@ -30,7 +30,9 @@ import warnings
 
 import autograd
 import autograd.numpy as np
+import torch
 from neural_structural_optimization.models.model_pixel import PixelModel
+from neural_structural_optimization.models.loss_structural import PhysicalDensity
 from neural_structural_optimization.structural import api as topo_api
 from neural_structural_optimization.structural import physics
 from neural_structural_optimization.structural import autograd as topo_autograd
@@ -677,11 +679,12 @@ class ProjectionParameterValidationTest(absltest.TestCase):
 class RenderObjectiveConsistencyTest(absltest.TestCase):
   """Gate 6: the unfiltered view must be the design the objective solved for.
 
-  Environment.render and train.utils.constrained_logits ask for the density
-  without the cone filter. That has to be the same design seen before the
-  filter, not a second design whose own volume offset was re-solved against the
-  unfiltered residual -- otherwise the CNN-to-pixel handoff hands over
-  something the objective never evaluated.
+  `train.utils.constrained_logits` asks for the density without the cone
+  filter. That has to be the same design seen before the filter, not a second
+  design whose own volume offset was re-solved against the unfiltered residual
+  -- otherwise the CNN-to-pixel handoff hands over something the objective
+  never evaluated. `Environment.render` is the filtered field (Stage 4); this
+  class pins the handoff view, not the saved image.
   """
 
   def test_filtering_the_render_reproduces_the_objective(self):
@@ -719,27 +722,26 @@ class RenderObjectiveConsistencyTest(absltest.TestCase):
         npo.testing.assert_allclose(rebuilt, objective, rtol=0, atol=1e-9)
 
 
-class HeavysideVolumeGapCharacterizationTest(absltest.TestCase):
-  """KNOWN-GAP PIN -- these numbers are WRONG and pinned so they stay visible.
+class CanonicalRenderVolumeTest(absltest.TestCase):
+  """Stage 4: the saved design is the physical density, so it holds volfrac.
 
-  With Heaviside projection enabled the volume constraint holds on the
-  objective's density but NOT on the rendered/saved design: `Environment.render`
-  asks for the pre-filter view, and the projection is applied to a field the
-  offset was never solved against. This test asserts the CURRENT, incorrect
-  render volumes so the gap cannot drift or be "fixed" silently -- it is a
-  characterization pin, not an endorsement. Closing the gap is deferred to the
-  later "one canonical physical density" stage; when that lands, these pins are
-  expected to fail and should be replaced by an equality against volfrac.
+  `Environment.render` used to ask for the pre-filter view. Under Heaviside
+  that field's mean was 19.9% (beta=4) and 37.0% (beta=16) above volfrac on
+  this split, while the objective held volfrac exactly. Render now uses
+  `cone_filter=True`; the old means are the rejected near-miss so a silent
+  revert is visible.
 
   Measured OFF the volfrac == eta diagonal deliberately. At volfrac == eta ==
-  0.5 the projection is mean-neutral (the render comes out 0.1% heavy), which
-  is precisely the operating point at which this gap was previously missed.
+  0.5 the projection is mean-neutral, which is precisely the operating point
+  at which this gap was previously missed. Do not validate a projection
+  change only on that diagonal.
   """
 
   _VOLFRAC = 0.3
   _ETA = 0.5
   # cantilever_beam_full 60x60, RandomState(0).randn(60, 60) * 2.0 logits.
-  _RENDER_MEAN_BY_BETA = {
+  # Pre-Stage-4 Environment.render means (cone_filter=False).
+  _OLD_UNFILTERED_MEAN_BY_BETA = {
       4.0: 0.35958723578062846,   # 19.9% over volfrac
       16.0: 0.4110767562774843,   # 37.0% over volfrac
   }
@@ -750,21 +752,29 @@ class HeavysideVolumeGapCharacterizationTest(absltest.TestCase):
         density=self._VOLFRAC, heavyside=True, beta=beta, eta=self._ETA)
     return topo_api.specified_task(params.get_problem())
 
-  def test_render_volume_gap_is_unchanged(self):
-    for beta, render_mean in self._RENDER_MEAN_BY_BETA.items():
+  def test_render_matches_the_objective_and_holds_volfrac(self):
+    for beta, old_mean in self._OLD_UNFILTERED_MEAN_BY_BETA.items():
       with self.subTest(beta=beta):
         args = self._projection_args(beta)
+        env = topo_api.Environment(args)
         logits = npo.random.RandomState(0).randn(
             args['nely'], args['nelx']) * 2.0
         objective = physics.physical_density(
             logits, args, volume_constraint=True, cone_filter=True)
-        render = physics.physical_density(
+        render = env.render(logits, volume_constraint=True)
+        unfiltered = physics.physical_density(
             logits, args, volume_constraint=True, cone_filter=False)
-        # The objective does satisfy the constraint; only the render does not.
         self.assertAlmostEqual(
             float(objective.mean()), self._VOLFRAC, delta=1e-9)
+        self.assertAlmostEqual(
+            float(render.mean()), self._VOLFRAC, delta=1e-9)
+        npo.testing.assert_allclose(render, objective, rtol=0, atol=1e-12)
         npo.testing.assert_allclose(
-            float(render.mean()), render_mean, rtol=1e-9, atol=0)
+            float(unfiltered.mean()), old_mean, rtol=1e-9, atol=0)
+        self.assertGreater(
+            abs(float(unfiltered.mean()) - self._VOLFRAC), 0.05,
+            'the pre-filter view already holds volfrac, so the old gap '
+            'is no longer a discriminating near-miss')
 
 
 class FilteredProjectionGradientTest(absltest.TestCase):
@@ -828,6 +838,133 @@ class FilteredProjectionGradientTest(absltest.TestCase):
         x0 = npo.random.RandomState(0).randn(args['nely'], args['nelx']) * 0.5
         fn = lambda x: physics.objective(x, ke, args, volume_constraint=True)
         self._assert_directional_grad(fn, x0)
+
+
+class CanonicalHandoffVolumeTest(absltest.TestCase):
+  """KNOWN-GAP for Stage 8: the handoff field is already projected.
+
+  `constrained_logits` still asks for `cone_filter=False`. Slice A made render
+  the filtered field but left this view alone, so the pixel objective
+  re-filters and re-projects a density that already went through Heaviside.
+  The sign of the volume error still flips with beta.
+
+  Crane 32x32 is the split the Stage-1 critic published. Do not "fix" these
+  here.
+  """
+
+  _VOLFRAC = 0.3
+  _ETA = 0.5
+  # Design-region mean of the re-projected handoff, from note-7dabd6e1
+  # (crane 32x32, volfrac=0.3, eta=0.5, RandomState(0)*2 logits).
+  _CRITIC_AFTER_DMEAN = {
+      4.0: 0.28082,    # -6.4%
+      16.0: 0.33348,   # +11.2%
+  }
+
+  def test_reprojected_handoff_still_misses_volfrac_and_flips_sign(self):
+    errors = {}
+    for beta, published in self._CRITIC_AFTER_DMEAN.items():
+      with self.subTest(beta=beta):
+        params = StructuralParams(
+            problem_name='crane', width=32, height=32,
+            density=self._VOLFRAC, heavyside=True, beta=beta, eta=self._ETA)
+        args = topo_api.specified_task(params.get_problem())
+        logits = npo.random.RandomState(0).randn(
+            args['nely'], args['nelx']) * 2.0
+        handoff = physics.physical_density(
+            logits, args, volume_constraint=True, cone_filter=False)
+        after = physics.physical_density(
+            handoff, args, volume_constraint=False, cone_filter=True)
+        after_mean = _design_region_mean(after, args)
+        err = (after_mean - self._VOLFRAC) / self._VOLFRAC
+        errors[beta] = err
+        self.assertGreater(
+            abs(_design_region_mean(handoff, args) - self._VOLFRAC), 0.05)
+        npo.testing.assert_allclose(after_mean, published, rtol=1e-4, atol=0)
+        self.assertGreater(abs(err), 0.05)
+    self.assertLess(errors[4.0], 0.0)
+    self.assertGreater(errors[16.0], 0.0)
+
+
+class CanonicalDensityBridgeTest(absltest.TestCase):
+  """Default CLIP input is Environment.render, and the VJP matches HIPS."""
+
+  def test_physical_density_bridge_matches_render(self):
+    params = StructuralParams(
+        problem_name='cantilever_beam_full', width=24, height=16, density=0.3,
+        heavyside=True, beta=4.0, eta=0.5)
+    model = PixelModel(structural_params=params, seed=0)
+    logits = model()
+    bridged = model.get_physical_density(logits)
+    rendered = model.env.render(
+        logits.detach().cpu().numpy(), volume_constraint=True)
+    npo.testing.assert_allclose(
+        bridged.detach().cpu().numpy().reshape(rendered.shape),
+        rendered, rtol=0, atol=1e-5)
+
+  def test_default_clip_sees_the_rendered_density(self):
+    params = StructuralParams(width=24, height=16, density=0.4)
+    captured = {}
+
+    def capture(image):
+      captured['image'] = image.detach().clone()
+      return image.reshape(-1).sum() * 0.0
+
+    model = PixelModel(structural_params=params, seed=0)
+    model.clip_loss = capture
+    logits = model()
+    model.get_semantic_loss(logits)
+    rendered = model.env.render(
+        logits.detach().cpu().numpy(), volume_constraint=True)
+    npo.testing.assert_allclose(
+        captured['image'].cpu().numpy().reshape(rendered.shape),
+        rendered, rtol=0, atol=1e-5)
+
+  def test_venice_algebra_still_passes_raw_logits_to_clip(self):
+    from neural_structural_optimization.models.model_base import VeniceLossAlgebra
+    params = StructuralParams(width=24, height=16, density=0.4)
+    captured = {}
+
+    def capture(image):
+      captured['image'] = image.detach().clone()
+      return image.reshape(-1).sum() * 0.0
+
+    model = PixelModel(structural_params=params, seed=0)
+    model.clip_loss = capture
+    model.enable_venice_compat_loss(VeniceLossAlgebra())
+    logits = model()
+    model.get_semantic_loss(logits)
+    npo.testing.assert_allclose(
+        captured['image'].cpu().numpy(),
+        logits.detach().cpu().numpy(), rtol=0, atol=0)
+
+  def test_bridge_vjp_matches_directional_finite_difference(self):
+    args = _small_structural_args(heavyside=True, beta=4.0)
+    env = topo_api.Environment(args)
+    rng = npo.random.RandomState(0)
+    x0 = rng.randn(args['nely'], args['nelx']).astype(npo.float64) * 0.5
+    direction = rng.randn(*x0.shape)
+    direction /= npo.linalg.norm(direction)
+    eps = 1e-4
+
+    def numpy_density(x):
+      return physics.physical_density(
+          x, args, volume_constraint=True, cone_filter=True)
+
+    numeric = (
+        (numpy_density(x0 + eps * direction) - numpy_density(x0 - eps * direction))
+        / (2 * eps))
+    # directional derivative of sum(density): sum(ddensity) along direction
+    numeric_scalar = float(numeric.sum())
+
+    x_t = torch.tensor(x0, dtype=torch.float64, requires_grad=True)
+    dens = PhysicalDensity.apply(x_t, env)
+    dens.sum().backward()
+    analytic_scalar = float((x_t.grad.numpy() * direction).sum())
+    scale = max(abs(analytic_scalar), abs(numeric_scalar), 1.0)
+    self.assertLess(
+        abs(analytic_scalar - numeric_scalar) / scale, 1e-5,
+        msg=f'analytic={analytic_scalar!r} numeric={numeric_scalar!r}')
 
 
 if __name__ == '__main__':
