@@ -29,6 +29,44 @@ Comparing only the endpoint would let a run that took a completely different
 path pass on one lucky number, so the assertions run over every recorded point
 and additionally over the distribution of per-point errors.
 
+Of those four series only two are independent: `clip_loss` is
+`clip_loss_raw * compliance * clip_alpha` and `loss` is the sum of all three,
+so both are algebraic functions of compliance and the raw CLIP term. The raw
+term turns out to be nearly flat with respect to the design -- 2.24% across
+blank, noise, stripe and skeleton fields, narrower than its own 4% tolerance --
+which leaves COMPLIANCE doing essentially all of the trajectory's geometric
+work.
+
+WHY THE CURVE IS NOT ENOUGH, AND WHAT PINS THE DESIGN
+-----------------------------------------------------
+Compliance is a scalar functional of the design, and a left-right MIRRORED
+skeleton is a different design with almost the same one. Measured against this
+reference: mirroring matches compliance to 0.041% and `clip_loss_raw` to
+0.002%, i.e. better than the reproduction itself does, so it would pass every
+assertion on the curve. A harness that checks only the loss series therefore
+does not pin the geometry at all -- it pins a projection of it that mirroring
+happens to lie inside.
+
+Two design-side comparisons sit beside the curve, both in
+`VeniceFullParityTest`. They do different jobs, and the first one is NOT a
+geometry pin:
+
+* `params['volume_actual']`, transcribed from the log. This is Venice's
+  `get_volume_ratio`: the fraction of the RAW design parameter above 0.9, a
+  strict-inequality count and NOT a mean density. The count is permutation-
+  invariant -- a left-right mirror of the same field produces the same
+  number -- so this pin constrains fill fraction / saturation, not layout.
+  The distinction from a mean density is still the whole content of the pin
+  as a *statistic*: the rendered mean is held at `volfrac` by the volume
+  constraint, so a mean would restate 0.30 and constrain nothing.
+* the rendered final design, compared field-to-field against Venice's own
+  output image (Pearson correlation, plus a saved side-by-side PNG). The
+  correlation floor is deliberately loose -- a 16x16 coarsening or a heavy
+  blur of the reference can still clear it -- so it rejects the obviously
+  wrong topologies (X-brace, noise) but is not a substitute for looking at
+  the image. The saved visual is first-class; do not chase a tighter Pearson
+  floor to close that gap.
+
 WHY THE TOLERANCE IS STATISTICAL
 --------------------------------
 The CLIP term is a Monte-Carlo estimate: each evaluation draws 32 random crops
@@ -45,20 +83,34 @@ prompt "skeletons") gave a mean of 0.4444 with a relative standard deviation of
 0.13% and a full range of 0.60%. That is the per-evaluation floor. The
 trajectory tolerances below are larger because the noise enters the GRADIENT at
 every one of ~124 steps, so two runs drift apart rather than tracking each other
-with a fixed error, and because of the one deliberate modelling difference noted
-under `fix_right_wall` in `structural.problems.multistory_building`: this
-repository constrains X on the right wall and Venice does not, worth about 0.07%
-on compliance, because without it the stiffness matrix is singular and CHOLMOD
-refuses the solve outright.
+with a fixed error.
+
+The second contribution is not noise at all. It is the one deliberate modelling
+difference, noted under `fix_right_wall` in
+`structural.problems.multistory_building`: this repository constrains X on the
+right wall and Venice does not, because without it the stiffness matrix is
+singular and CHOLMOD refuses the solve outright. On the field a replay actually
+starts from -- the seeded Venice image -- that constraint biases compliance by
+0.335% at 32x64, 0.365% at 64x128 and 0.380% at 128x256. It is a SYSTEMATIC
+bias, in one direction, compounding through all 122 gradient steps, not
+sampling noise that averages out. An earlier note here quoted 0.07%, which is
+the figure on a uniform density 0.3 field and understates the real bias by
+roughly a factor of five; the seeded-field measurements above are the relevant
+ones and are the reason the tolerances cannot be tightened to the sampling
+floor.
 
 WHAT THE REPRODUCTION ACTUALLY ACHIEVES
 ---------------------------------------
 Better than the tolerances require. A full replay converged at step 122 against
-the reference's 124, fired both upsamples at the steps the reference log
-implies, and tracked the logged curve to a median relative error under 1% on
-every term, ending within 0.6% of the reference's final total. The measured
-error distribution and the tolerances derived from it are tabulated at
-`TRAJECTORY_RTOL`.
+the reference's 124, fired its two upsamples at steps 48 and 70, and tracked
+the logged curve to a median relative error under 1% on every term, ending
+within 0.6% of the reference's final total. The measured error distribution and
+the tolerances derived from it are tabulated at `TRAJECTORY_RTOL`.
+
+The upsample steps are a CHARACTERIZATION pin, not a transcription: the golden
+JSON has no resize field, so Venice's own timing is not recorded anywhere and
+can only be inferred from kinks in the logged compliance curve. See
+`GOLDEN_RESIZE_STEPS`.
 
 PRECISION: float32 IS THE PARITY-CORRECT CHOICE
 -----------------------------------------------
@@ -109,13 +161,23 @@ from pathlib import Path
 import numpy as np
 import torch
 from absl.testing import absltest
+from PIL import Image
 
-from neural_structural_optimization.models.loss_clip import VENICE_CLIP_PRESET
+# `_resize_short_side` is private, and imported anyway because it is the one
+# implementation of Venice's `transforms.Resize(int)` in this repository,
+# already pinned bit-exact against torchvision. Venice runs its display image
+# and its CLIP view through the SAME call, so re-deriving it here would be a
+# second copy of the same claim, free to drift from the one under test.
+from neural_structural_optimization.models.loss_clip import (
+    VENICE_CLIP_PRESET,
+    _resize_short_side,
+)
 from neural_structural_optimization.models.model_base import (
     VeniceLossAlgebra,
     venice_compat_total_loss,
 )
 from neural_structural_optimization.models.utils import batched_topo_loss
+from neural_structural_optimization.train.optimizers import VENICE_ITERATION_OFFSET
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GOLDEN_SCRIPT = _REPO_ROOT / 'script' / 'venice_golden_250214.py'
@@ -207,10 +269,22 @@ GOLDEN_TRAJECTORY = {
 # well short of its 200-iteration cap.
 GOLDEN_FINAL_STEP = 124
 
+# params['volume_actual'], transcribed from the same log. Venice's
+# `get_volume_ratio` (`models.py` line 837): the fraction of the RAW design
+# parameter strictly above 0.9. At 128x256 this is 10316 of 32768 elements.
+GOLDEN_VOLUME_ACTUAL = 0.3148193359375
+
 # sha256 of the initial image as committed to Venice at 97f9336, so a silently
 # re-exported or re-compressed copy fails loudly rather than shifting the run.
 GOLDEN_IMAGE_SHA256 = (
     '750bb809f38c0f5ef6f9af51f228a860a40287b56efde07e27dc061eff157d98')
+
+# sha256 of Venice's own final design image, likewise copied into this
+# repository rather than read across checkouts. It is the ONLY surviving
+# artifact of the reference run's geometry -- the log records scalars only --
+# so a re-encoded copy would quietly move the one design pin there is.
+GOLDEN_FINAL_IMAGE_SHA256 = (
+    'd2264973199422722db657983f349c2a2552566133b2cf4ed42195eeb37a2271')
 
 # Characterization pins for the initial design at the schedule's COARSE grid,
 # i.e. the field Venice's `init_weight_with_image` actually installs. Measured
@@ -224,8 +298,9 @@ COARSE_IMAGE_PIN_TOL = 1e-6
 
 # Trajectory tolerances, set from a measured replay rather than guessed. A full
 # reproduction on this machine stopped at step 122 (reference: 124), fired both
-# upsamples at the same steps the reference log implies, and gave these relative
-# errors over the 24 comparable recorded points:
+# upsamples at the steps pinned in `GOLDEN_RESIZE_STEPS` -- which the reference
+# log does NOT record -- and gave these relative errors over the 24 comparable
+# recorded points:
 #
 #     term             median    p90     max
 #     compliance        0.82%   2.00%   2.62%
@@ -275,6 +350,89 @@ CONVERGENCE_STEP_RTOL = 0.15
 # its own right (asserted separately), not an excuse to compare four points.
 MIN_COMPARED_POINTS = 20
 
+# Gradient steps at which the two upsamples fired in the measured replay.
+#
+# This is a CHARACTERIZATION pin. The golden JSON has no resize field, so
+# Venice's own timing was never recorded; the older claim that these are the
+# steps "the reference log implies" was wrong, and the log can at best be read
+# for kinks in the compliance curve. What the pin does hold is that the
+# schedule fires where THIS repository's rules say it should, which is
+# checkable arithmetic on both steps:
+#
+#   step 48 -> iteration 48 + 1 + VENICE_ITERATION_OFFSET = 50, and
+#              50 % max_resize_iteration == 0, so the PERIODIC trigger fires.
+#   step 70 -> iteration 72, and 72 % 50 == 22, so the periodic trigger cannot
+#              have fired; this one is the compliance-DELTA trigger.
+#
+# Both branches of that `or` therefore run in the reference reproduction, which
+# is why `test_training_loop_coverage.py` exercises them separately too.
+GOLDEN_RESIZE_STEPS = [48, 70]
+
+# Venice's `params['img_width']`: the short side its display and CLIP views are
+# both resized to before anything else happens to them.
+DISPLAY_SHORT_SIDE = 512
+
+# How far the replay's filled fraction may sit from the logged 0.3148. The
+# measured replay gave 0.31644, a relative error of 0.51%; this is ~4x that.
+#
+# The ceiling also has to stay well under 4.71%, which is where a mean density
+# would land (the volume constraint holds that at volfrac = 0.30 whatever the
+# design does). Otherwise the pin would pass on a statistic that says nothing
+# about fill fraction, which is the failure this whole constant exists to
+# prevent -- see `test_the_volume_pin_rejects_both_plausible_wrong_statistics`.
+# This pin is permutation-invariant and does not reject a mirror.
+VOLUME_RATIO_RTOL = 0.02
+
+# Agreement required between the replay's final design and Venice's, as a
+# Pearson correlation over the 128x256 display field. Measured on this machine,
+# against the same reference image:
+#
+#     replay                              0.741
+#     the reference vs its OWN mirror     0.632
+#     replay, mirrored left-right         0.544
+#     the initial image alone             0.466
+#     replay, flipped top-to-bottom       0.130
+#
+# The floor sits below the replay and above the measured wrong answers, but it
+# is still a weak pin: a 16x16 coarsening or a sigma=8 blur of the reference
+# can clear 0.60. It is kept as a cheap reject of obviously wrong topologies
+# (X-brace, noise), not as the geometric claim. The saved side-by-side visual
+# is the comparison that actually pins the design; do not raise this floor to
+# close the gap.
+DESIGN_CORRELATION_MIN = 0.60
+
+# The two margins that make the floor above mean something, rather than being a
+# number a blurry-enough field could clear. Measured: 0.197 against the mirror
+# and 0.275 against the seed. Differences of correlations are the robust half
+# of this comparison -- a different augmentation draw moves both sides together
+# -- so these are the assertions that carry the geometric claim.
+DESIGN_MIRROR_MARGIN = 0.10
+DESIGN_SEED_MARGIN = 0.10
+
+# Correlation is invariant to affine rescaling, so it cannot see a design of the
+# right shape at the wrong density. The display field's mean closes that:
+# measured 0.3351 against the reference's 0.3323, 0.8% apart.
+DISPLAY_MEAN_RTOL = 0.05
+
+# How closely the reference image's own filled fraction has to reproduce the
+# logged `volume_actual`. This is not a claim about the replay -- it is the
+# check that this file decodes Venice's image the way Venice wrote it. Reading
+# the inversion, orientation or channel convention wrong moves it by tens of
+# percent. Measured 0.31806 against the logged 0.31482, 1.03% apart, the
+# residual being the 4x resample and JPEG quantization the image went through.
+REFERENCE_IMAGE_DECODE_RTOL = 0.03
+
+# The seed image is left-right symmetric to within this, measured 0.0002. That
+# is what makes the mirror margin above a statement about the OPTIMIZATION: the
+# initial condition carries no left-right information for it to inherit.
+SEED_MIRROR_SYMMETRY_TOL = 0.01
+
+# Rows carrying a loaded floor of `multistory_building` hold at least this
+# multiple of the median row mass. Measured 2.6x to 2.8x on the four floors at
+# `interval` = 64; a vertically flipped reading of the image peaks at 1.6x, so
+# this is what fixes the image's orientation rather than assuming it.
+FLOOR_ROW_MASS_RATIO = 2.0
+
 _FULL_RUN_ENV = 'VENICE_PARITY_FULL'
 
 
@@ -313,6 +471,109 @@ def _relative_errors(replay_values, reference_values):
   replay = np.asarray(replay_values, dtype=np.float64)
   reference = np.asarray(reference_values, dtype=np.float64)
   return np.abs(replay - reference) / np.abs(reference)
+
+
+def _block_mean(field, shape):
+  """Average `field` down to `shape` over non-overlapping blocks."""
+  height, width = shape
+  if field.shape[0] % height or field.shape[1] % width:
+    raise ValueError(
+        f'{field.shape} does not divide evenly into {shape}.')
+  block_y, block_x = field.shape[0] // height, field.shape[1] // width
+  return field.reshape(height, block_y, width, block_x).mean(axis=(1, 3))
+
+
+def _venice_display_field(raw_design, short_side=DISPLAY_SHORT_SIDE):
+  """Reproduce the field Venice's saved image shows, on the design grid.
+
+  Venice's `structural_model_image_to_PIL_image` (`models.py` line 831) resizes
+  the raw design's shorter edge to `params['img_width']`, THEN clamps to
+  [0, 1], then inverts. That order is not incidental: the raw parameter is
+  unbounded -- the reference run's spans -11.78 to 13.12 -- so resizing before
+  clamping lets neighbouring extremes pull an interpolated pixel across the
+  bound, and clamping first would give a different field.
+
+  The result is averaged back down to the design grid. That is what makes this
+  comparable to the reference image, which went through the same 4x resample:
+  clamping in between means the round trip is NOT the identity, so both sides
+  have to make it.
+
+  Args:
+    raw_design: the raw design parameter, (height, width).
+    short_side: Venice's `img_width`.
+
+  Returns:
+    The displayed density on the design grid, in [0, 1].
+  """
+  field = np.ascontiguousarray(raw_design, dtype=np.float32)
+  resized = _resize_short_side(
+      torch.as_tensor(field)[None, None], short_side).clamp(0.0, 1.0)
+  return _block_mean(resized[0, 0].numpy().astype(np.float64), field.shape)
+
+
+def _reference_image_field():
+  """Decode Venice's final image back to a density, at the image's own size.
+
+  Undoes the one invertible step between the saved JPEG and a density: PIL's
+  `ImageOps.invert`, so that material reads high rather than low. Nothing else
+  is undone -- JPEG quantization is not invertible, and the clamp lost
+  everything outside [0, 1] for good, which is why the replay side clamps too.
+
+  The channel convention is checked rather than chosen: Venice expands one
+  grayscale channel to three, so the three have to be identical, and taking any
+  one of them is then exact where a luma reduction would round.
+
+  Returns:
+    The reference density at 512x1024, in [0, 1].
+  """
+  pixels = np.asarray(Image.open(golden.GOLDEN_FINAL_IMAGE_PATH).convert('RGB'))
+  if not (np.array_equal(pixels[..., 0], pixels[..., 1])
+          and np.array_equal(pixels[..., 0], pixels[..., 2])):
+    raise ValueError(
+        'the reference image is not grayscale, so Venice did not write it the '
+        'way this decoding assumes.')
+  return 1.0 - pixels[..., 0].astype(np.float64) / 255.0
+
+
+def _reference_display_field(shape):
+  """The decoded reference image averaged back down to the design grid.
+
+  The 4x resample Venice applied on the way out is undone by block-averaging,
+  which also suppresses most of the JPEG ringing -- it survives only at the
+  edges of a field that is 97% saturated.
+
+  Pixel-level statistics such as the filled fraction must NOT be taken here:
+  averaging blurs the two-thirds of a pixel-count that sits at an edge, and it
+  moves the fraction above 0.9 from 0.318 to 0.295. Use
+  `_reference_image_field` for those.
+
+  Args:
+    shape: the design grid, (height, width).
+
+  Returns:
+    The reference density on that grid, in [0, 1].
+  """
+  return _block_mean(_reference_image_field(), shape)
+
+
+def _correlation(field_a, field_b):
+  """Pearson correlation between two fields of the same shape."""
+  return float(np.corrcoef(np.ravel(field_a), np.ravel(field_b))[0, 1])
+
+
+def _seed_display_field(shape):
+  """The initial image on the final grid, as a control for the design pin.
+
+  The seeded image is where both runs start, so any agreement it already
+  explains is agreement the design comparison has not earned.
+  """
+  from neural_structural_optimization.train.utils import (  # pylint: disable=g-import-not-at-top
+      load_venice_initial_image)
+  height, width = shape
+  seed = load_venice_initial_image(
+      golden.GOLDEN_IMAGE_PATH, height=height, width=width,
+      invert_image=golden.GOLDEN.invert_image)
+  return _venice_display_field(seed.numpy()[0])
 
 
 class VeniceGoldenLogTest(absltest.TestCase):
@@ -456,6 +717,120 @@ class VeniceImageInitTest(absltest.TestCase):
     self.assertLessEqual(float(model.z.max()), 1.0)
 
 
+class VeniceFinalImageDecodingTest(absltest.TestCase):
+  """Venice's final image is read back the way Venice wrote it.
+
+  The design comparison in `VeniceFullParityTest` is only as good as this
+  decoding, and a decoding is exactly the kind of thing that is confidently
+  wrong: invert the wrong way and the pin measures the VOID, read the rows
+  upside down and it measures a different building. Both mistakes produce a
+  clean-looking number, so each convention is checked against something the
+  reference run recorded independently rather than asserted in a comment.
+
+  None of this needs a replay, CLIP or a physics solve, so it runs in the
+  default suite -- which matters, because it is the half of the design pin that
+  can be wrong without any replay ever being run.
+  """
+
+  DESIGN_SHAPE = (256, 128)
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls.image = _reference_image_field()
+    cls.reference = _reference_display_field(cls.DESIGN_SHAPE)
+
+  def test_asset_is_the_committed_venice_file(self):
+    path = golden.GOLDEN_FINAL_IMAGE_PATH
+    self.assertTrue(path.exists(), f'missing reference design image: {path}')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    self.assertEqual(digest, GOLDEN_FINAL_IMAGE_SHA256)
+
+  def test_image_geometry_is_the_design_grid_resized_by_the_view_size(self):
+    """512x1024, i.e. the 128x256 grid with its short side taken to 512."""
+    with Image.open(golden.GOLDEN_FINAL_IMAGE_PATH) as image:
+      width, height = image.size
+    design_height, design_width = self.DESIGN_SHAPE
+    self.assertEqual(width, DISPLAY_SHORT_SIDE)
+    self.assertEqual(height, DISPLAY_SHORT_SIDE * design_height // design_width)
+
+  def test_inversion_is_undone_the_right_way_round(self):
+    """The filled fraction of the decoded field reproduces the logged one.
+
+    This is the load-bearing convention check. Venice inverts on the way out,
+    so material is DARK in the file; undoing that gives a field whose fraction
+    above 0.9 should be the logged `volume_actual`. Reading the file without
+    undoing the inversion measures the void instead, which is most of the
+    picture -- so the two readings are not close, and this test tells them
+    apart rather than trusting the sign of a comment.
+
+    Taken at the image's own resolution: a filled fraction is a pixel count,
+    and averaging down to the design grid first would fold the blurred edges
+    into it and move the answer by 6%.
+    """
+    filled = float((self.image > 0.9).mean())
+    self.assertAlmostEqual(
+        filled / GOLDEN_VOLUME_ACTUAL, 1.0, delta=REFERENCE_IMAGE_DECODE_RTOL,
+        msg=f'decoded filled fraction {filled} against the logged '
+            f'{GOLDEN_VOLUME_ACTUAL}')
+
+    not_inverted = float((1.0 - self.image > 0.9).mean())
+    self.assertGreater(
+        abs(not_inverted - GOLDEN_VOLUME_ACTUAL) / GOLDEN_VOLUME_ACTUAL,
+        10 * REFERENCE_IMAGE_DECODE_RTOL,
+        msg='reading the image without undoing the inversion is within '
+            'tolerance of the logged volume too, so this test cannot '
+            'distinguish the two conventions')
+
+  def test_rows_are_the_right_way_up_against_the_loaded_floors(self):
+    """The heavy rows are where `multistory_building` puts its floors.
+
+    `forces[:, ::interval]` loads rows 0, 64, 128 and 192 of a 256-row grid, so
+    those rows carry structure. The spacing is deliberately not symmetric about
+    the mid-height -- a flipped reading would put the load rows at 255, 191,
+    127 and 63 -- so this pins the vertical orientation, which mirroring the
+    columns cannot help with and which the volume fraction above is blind to.
+    """
+    row_mass = self.reference.sum(axis=1)
+    median = float(np.median(row_mass))
+    floors = list(range(0, self.DESIGN_SHAPE[0], golden.GOLDEN.interval))
+    self.assertLen(floors, 4)
+    for row in floors:
+      with self.subTest(floor_row=row):
+        self.assertGreater(row_mass[row], FLOOR_ROW_MASS_RATIO * median)
+
+    flipped = row_mass[::-1]
+    self.assertLess(
+        min(flipped[row] for row in floors), FLOOR_ROW_MASS_RATIO * median,
+        msg='a vertically flipped reading also lands the floors on the heavy '
+            'rows, so this test does not constrain the orientation')
+
+  def test_the_seed_image_carries_no_left_right_information(self):
+    """Mirroring the initial image does not change how well it matches.
+
+    This is what licenses the mirror margin in `VeniceFullParityTest`. If the
+    seeded image were itself lopsided, a replay could inherit the agreement
+    without the optimization having produced any of it, and the mirror test
+    would be measuring the loader.
+    """
+    seed = _seed_display_field(self.DESIGN_SHAPE)
+    upright = _correlation(seed, self.reference)
+    mirrored = _correlation(seed[:, ::-1], self.reference)
+    self.assertAlmostEqual(
+        upright, mirrored, delta=SEED_MIRROR_SYMMETRY_TOL,
+        msg=f'seed correlates {upright} upright and {mirrored} mirrored')
+
+  def test_the_seed_image_does_not_already_explain_the_reference(self):
+    """And it leaves room for the design pin to say something.
+
+    A floor the initial condition already clears would be a pin on the loader
+    wearing a geometry pin's name.
+    """
+    seed = _seed_display_field(self.DESIGN_SHAPE)
+    self.assertLess(_correlation(seed, self.reference),
+                    DESIGN_CORRELATION_MIN - DESIGN_SEED_MARGIN)
+
+
 class VeniceGoldenConfigTest(absltest.TestCase):
   """`script/venice_golden_250214.py` really encodes the logged configuration."""
 
@@ -496,7 +871,53 @@ class VeniceGoldenConfigTest(absltest.TestCase):
     self.assertEqual(model.venice_loss_algebra.clip_alpha, 10.0)
     self.assertEqual(model.venice_loss_algebra.compliance_weight, 1.0)
 
-  def test_clip_preset_for_the_golden_run_is_the_reference_preset(self):
+  def test_clip_preset_fields_match_the_logged_configuration(self):
+    """Every preset field, against the LOG rather than against itself.
+
+    This replaces an assertion that `venice_clip_preset(GOLDEN)` equalled
+    `VENICE_CLIP_PRESET`, which was worth nothing: three of the four fields are
+    unset on both sides, so both were reading the same dataclass defaults and
+    the comparison reduced to `x == x`. A preset default edited in
+    `loss_clip.py` would have moved both sides together and passed.
+
+    The log carries three of these directly. `min_original_size` and
+    `aug_noise` are not logged at all -- they are `GenerateCrops`' defaults
+    (`CLIP_utils.py` line 138), which the reference run took as-is
+    (`loss_utils.py` line 268, which passes `min_original_size=min(480, 480)`
+    and no noise argument) -- so they are transcribed from Venice's source and
+    pinned as characterization values.
+    """
+    preset = golden.venice_clip_preset(golden.GOLDEN)
+
+    # params['use_arcsin_transform'] == true. Venice's other branch averages the
+    # untransformed L2 distance, which is a different objective.
+    self.assertTrue(preset.use_arcsin_transform)
+    # params['num_augs'] == 32.
+    self.assertEqual(preset.num_augs, 32)
+    # params['img_width'] == 512, i.e. the shorter edge Venice resizes the
+    # design to before cropping. For the 128x256 grid that is a 512x1024 view.
+    #
+    # Transcription is the ONLY thing holding this field. Changing it moves
+    # `clip_loss_raw` by a measured 0.019%, against a 4% tolerance on that
+    # series -- three orders of magnitude under the bar -- so a wrong view size
+    # cannot be detected by the trajectory comparison at all. It still decides
+    # which spatial scales the 32 crops sample, and so what the CLIP term asks
+    # the design to look like: a gradient-shaping constraint that the loss
+    # curve is simply not a witness for.
+    self.assertEqual(preset.resize_short_side, 512)
+
+    # Not logged; from Venice's source. See the docstring above.
+    self.assertEqual(preset.min_original_size, 480)
+    self.assertEqual(preset.aug_noise, 0.1)
+
+  def test_the_reference_preset_is_still_the_golden_configuration(self):
+    """`GOLDEN` asks for nothing the module defaults do not already give.
+
+    Kept as a separate, honestly-scoped statement of what the old test was
+    reaching for. It says the golden configuration adds no override on top of
+    `VENICE_CLIP_PRESET` -- useful, and NOT evidence that either side agrees
+    with the log, which the test above is for.
+    """
     self.assertEqual(golden.venice_clip_preset(golden.GOLDEN),
                      VENICE_CLIP_PRESET)
 
@@ -576,7 +997,7 @@ class VeniceSmokeRunTest(absltest.TestCase):
     self.assertGreater(steps, 0)
     self.assertLessEqual(steps, config.max_iterations)
     for name in ('loss', 'compliance', 'clip_loss', 'clip_loss_raw',
-                 'clip_weight', 'design'):
+                 'clip_weight', 'design', 'final_design_raw'):
       self.assertIn(name, ds)
 
     compliance = ds['compliance'].values
@@ -601,6 +1022,17 @@ class VeniceSmokeRunTest(absltest.TestCase):
     # The design is reported on the final grid whatever stage produced it.
     self.assertEqual(
         (ds.sizes['y'], ds.sizes['x']), (config.height, config.width))
+
+    # The raw parameter is carried too, but on the stage grid the run ENDED on
+    # rather than on the final one -- four steps is not enough to reach either
+    # upsample here, so it stays coarse. `design` is repeated up to the final
+    # grid and the raw field is not, which is the distinction this asserts.
+    raw = ds['final_design_raw'].values
+    stages_left = config.resize_num - len(ds.attrs['resize_steps'])
+    divisor = config.resize_scale ** stages_left
+    self.assertEqual(
+        raw.shape, (config.height // divisor, config.width // divisor))
+    self.assertTrue(np.all(np.isfinite(raw)))
 
 
 class VeniceFullParityTest(absltest.TestCase):
@@ -663,14 +1095,179 @@ class VeniceFullParityTest(absltest.TestCase):
             msg=f'{name} median relative error over {len(errors)} recorded '
                 f'points was {np.median(errors):.4f}')
 
-  def test_replay_ends_where_the_reference_ended(self):
-    """The endpoint alone, kept separate so a curve failure reads distinctly."""
+  def test_replay_agrees_at_the_last_step_both_runs_recorded(self):
+    """The endpoint comparison, at a MATCHED iteration.
+
+    This is the check the previous version of this file did not have. It
+    compared the replay's last point against the reference's last point, which
+    are different iterations -- 122 against 124 in the measured replay -- and
+    since the curve is still falling there, that comparison charges the
+    reproduction for two steps of convergence it never claimed to take. The
+    logged 73.99691670938864 was consequently never compared at its own
+    iteration by anything in this file.
+
+    Here the comparison happens at the latest recorded step the replay actually
+    reached. If a replay runs to 124 or beyond, that step IS 124 and the logged
+    final point is compared where it was logged.
+    """
     ds = self.ds
+    steps = int(ds.sizes['step'])
+    matched = [(i, s) for i, s in enumerate(GOLDEN_STEPS) if s - 1 < steps]
+    self.assertTrue(matched, 'replay reached none of the recorded steps')
+    index, step = matched[-1]
+
+    for name, reference in GOLDEN_TRAJECTORY.items():
+      with self.subTest(term=name):
+        replay = float(ds[name].values[step - 1])
+        self.assertLess(
+            abs(replay - reference[index]) / abs(reference[index]),
+            TRAJECTORY_RTOL[name],
+            msg=f'{name} at reference step {step}: replay {replay!r} vs '
+                f'reference {reference[index]!r}')
+
+  def test_both_runs_final_points_agree_despite_stopping_at_different_steps(self):
+    """Each run's OWN last point, which is not a matched-iteration comparison.
+
+    Kept, renamed, and scoped honestly. Both runs stop on a noisy compliance
+    delta, so they stop at different iterations -- 122 against 124 -- and this
+    asks the weaker question of whether they came to rest in the same place.
+    `CONVERGENCE_STEP_RTOL` is what bounds how far apart those steps may be;
+    the matched comparison above is what bounds the curve.
+    """
+    ds = self.ds
+    steps = int(ds.sizes['step'])
     for name, reference in GOLDEN_TRAJECTORY.items():
       with self.subTest(term=name):
         self.assertLess(
             abs(float(ds[name].values[-1]) - reference[-1]) / abs(reference[-1]),
-            TRAJECTORY_RTOL[name])
+            TRAJECTORY_RTOL[name],
+            msg=f'{name}: replay resting value after {steps} steps against '
+                f'the reference resting value after {GOLDEN_FINAL_STEP}')
+
+  def test_both_upsamples_fire_where_the_measured_replay_fires_them(self):
+    """The resolution schedule, and which trigger fired each time.
+
+    A characterization pin -- the golden JSON records no resize timing at all.
+    What is checkable is the arithmetic of this repository's own rules, so the
+    attribution of each step to a trigger is asserted rather than annotated:
+    step 48 lands on the period, step 70 provably cannot.
+    """
+    ds = self.ds
+    self.assertEqual(list(ds.attrs['resize_steps']), GOLDEN_RESIZE_STEPS)
+
+    period = golden.GOLDEN.max_resize_iteration
+    periodic, delta = GOLDEN_RESIZE_STEPS
+    self.assertEqual((periodic + 1 + VENICE_ITERATION_OFFSET) % period, 0)
+    self.assertNotEqual((delta + 1 + VENICE_ITERATION_OFFSET) % period, 0)
+
+  def test_replay_reproduces_the_logged_volume_fraction(self):
+    """`params['volume_actual']`, on the raw field Venice measured it on.
+
+    Venice's `get_volume_ratio` counts elements strictly above 0.9 in the RAW
+    design parameter. `golden.venice_volume_ratio` is that definition; using a
+    mean density instead would be a different statistic that happens to sit
+    nearby, and `test_the_volume_pin_rejects_both_plausible_wrong_statistics`
+    is why the distinction is not cosmetic.
+
+    This is a fill-fraction pin, not a geometry pin: the count is
+    permutation-invariant, so a left-right mirror of the same field produces
+    the same number. Layout is checked by the image comparison (and the
+    saved visual), not here.
+    """
+    ds = self.ds
+    replay = golden.venice_volume_ratio(ds['final_design_raw'].values)
+    self.assertAlmostEqual(
+        replay / GOLDEN_VOLUME_ACTUAL, 1.0, delta=VOLUME_RATIO_RTOL,
+        msg=f'replay filled fraction {replay} against the logged '
+            f'{GOLDEN_VOLUME_ACTUAL}')
+
+  def test_the_volume_pin_rejects_both_plausible_wrong_statistics(self):
+    """Neither a mean density nor the rendered field reproduces the log.
+
+    Two near-misses are available and both are wrong:
+
+    * the MEAN of the rendered design. `render(volume_constraint=True)` holds
+      it at `volfrac` by construction, so a mean-density version of the test
+      above would assert the volume constraint against itself and pass for any
+      design whatsoever. It also does not match: 0.30 is 4.7% from the logged
+      0.3148, which is why `VOLUME_RATIO_RTOL` cannot be widened much further.
+    * the filled fraction of the RENDERED design rather than the raw one. That
+      is the right statistic on the wrong field -- the constraint has already
+      squashed it -- and it reads 0.252, 20% low.
+
+    Measured 0.51% for the correct reading, so the pin discriminates by a
+    factor of nine against the nearer of the two.
+    """
+    ds = self.ds
+    rendered = ds['design'].values[-1]
+
+    mean_density = float(np.mean(rendered))
+    self.assertAlmostEqual(mean_density, golden.GOLDEN.density, delta=1e-3)
+    self.assertGreater(
+        abs(mean_density - GOLDEN_VOLUME_ACTUAL) / GOLDEN_VOLUME_ACTUAL,
+        VOLUME_RATIO_RTOL)
+
+    rendered_ratio = golden.venice_volume_ratio(rendered)
+    self.assertGreater(
+        abs(rendered_ratio - GOLDEN_VOLUME_ACTUAL) / GOLDEN_VOLUME_ACTUAL,
+        VOLUME_RATIO_RTOL)
+
+  def test_replay_reproduces_the_reference_design_and_not_its_mirror(self):
+    """The design itself, against Venice's own final image.
+
+    The one assertion in this file that is not invariant under a left-right
+    flip, and the reason it exists: the mirrored skeleton matches compliance to
+    0.041% and `clip_loss_raw` to 0.002%, so every other assertion here passes
+    on it. Both sides go through Venice's display transform, so the comparison
+    is between two fields that have taken the same route.
+
+    Three assertions, in increasing order of how much they carry:
+
+    1. the fields correlate above a floor set below every wrong answer;
+    2. they correlate BETTER than the mirrored replay does, by a margin;
+    3. and better than the initial image does, by a margin -- otherwise the
+       agreement could be inherited from the seed rather than produced.
+    """
+    ds = self.ds
+    reference = _reference_display_field(
+        (golden.GOLDEN.height, golden.GOLDEN.width))
+    replay = _venice_display_field(ds['final_design_raw'].values)
+    self.assertEqual(replay.shape, reference.shape)
+
+    upright = _correlation(replay, reference)
+    mirrored = _correlation(replay[:, ::-1], reference)
+    seeded = _correlation(
+        _seed_display_field(reference.shape), reference)
+
+    self.assertGreater(
+        upright, DESIGN_CORRELATION_MIN,
+        msg=f'replay design correlates {upright} with the reference')
+    self.assertGreater(
+        upright - mirrored, DESIGN_MIRROR_MARGIN,
+        msg=f'replay design correlates {upright} upright and {mirrored} '
+            'mirrored, so this comparison is close to mirror-invariant and '
+            'does not pin the geometry')
+    self.assertGreater(
+        upright - seeded, DESIGN_SEED_MARGIN,
+        msg=f'replay design correlates {upright} against {seeded} for the '
+            'initial image alone, so the agreement is not evidence the '
+            'optimization reproduced anything')
+
+  def test_replay_design_holds_the_reference_density_scale(self):
+    """The scale correlation is blind to.
+
+    Pearson correlation is invariant to an affine rescaling of either field, so
+    the comparison above would accept the right shape at the wrong density.
+    The displayed mean is the missing constraint; unlike the volume fraction it
+    counts partly-filled pixels, so the two are not the same statistic.
+    """
+    ds = self.ds
+    reference = _reference_display_field(
+        (golden.GOLDEN.height, golden.GOLDEN.width))
+    replay = _venice_display_field(ds['final_design_raw'].values)
+    self.assertAlmostEqual(
+        float(replay.mean()) / float(reference.mean()), 1.0,
+        delta=DISPLAY_MEAN_RTOL)
 
 
 if __name__ == '__main__':
