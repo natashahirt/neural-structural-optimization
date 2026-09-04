@@ -29,7 +29,6 @@ wrong:
 import json
 import random
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +41,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from neural_structural_optimization import configure_torch_threads
+from neural_structural_optimization.experiment import (
+    GOLDEN,
+    SMOKE,
+    VeniceGoldenConfig,
+)
 from neural_structural_optimization.models import AdaptivePixelModel, CLIPLoss
 from neural_structural_optimization.models.loss_clip import VeniceClipPreset
 from neural_structural_optimization.models.model_base import VeniceLossAlgebra
@@ -73,77 +77,10 @@ GOLDEN_FINAL_IMAGE_PATH = (
        '-balanced_dynamic.jpg'))
 
 
-@dataclass(frozen=True)
-class VeniceGoldenConfig:
-    """Every knob of the reference run, with the log's values as defaults.
-
-    Attributes are grouped by the object that consumes them: the structural
-    problem, the model's resolution schedule, the CLIP loss, the loss algebra
-    and the optimizer.
-    """
-
-    # Structural problem, at its FINAL resolution. `AdaptivePixelModel` divides
-    # width, height and interval down to the schedule's coarse start itself.
-    problem_name: str = 'multistory_building'
-    width: int = 128
-    height: int = 256
-    density: float = 0.3
-    interval: int = 64
-    filter_width: float = 2.0
-    # Fixed at 3.0 by `structural.api.specified_task`, which takes no override;
-    # kept here so the run asserts the value it was configured for.
-    penal: float = 3.0
-
-    # Resolution schedule. Two doublings, so training starts at 32x64.
-    resize_num: int = 2
-    resize_scale: int = 2
-
-    # CLIP guidance.
-    clip_model_name: str = 'ViT-B/32'
-    # Venice loads a second, ResNet CLIP for its geometric loss. That loss is
-    # off in this run (`clip_rn_alpha` is 0 and `geometric_loss` is absent from
-    # `loss_types`, and the log records it as null throughout), and the Venice
-    # CLIP path never touches the ResNet trunk, so the variant is inert. RN50
-    # stands in for Venice's RN101 purely because it is smaller to load.
-    clip_rn_model_name: str = 'RN50'
-    prompt: str = 'skeletons'
-    num_augs: int = 32
-    # Venice resizes the design's shorter edge to `params['img_width']` before
-    # cropping; the reference run's 512 gives the CLIP stack a 512x1024 view.
-    clip_resize_short_side: int = 512
-
-    # Loss algebra: clip_weight = compliance * clip_alpha, undetached, with the
-    # unweighted CLIP term added on top. See `models.model_base`.
-    clip_alpha: float = 10.0
-    compliance_weight: float = 1.0
-
-    # Optimizer. Adam at a constant rate -- there is no schedule in Venice.
-    lr: float = 0.2
-    max_iterations: int = 200
-    resize_threshold: float = 0.5
-    max_resize_iteration: int = 50
-    convergence_threshold: float = 0.05
-
-    seed: int = 12
-    device: str = 'cpu'
-    invert_image: bool = True
-
-
-GOLDEN = VeniceGoldenConfig()
-
-# The same wiring, sized to run in seconds rather than a quarter of an hour: a
-# quarter-scale grid, a quarter of the CLIP view and an eighth of the crops.
-# The numbers it produces mean nothing next to the reference log -- it exists to
-# prove the preset, the image seeding, the resolution schedule and the term
-# breakdown still hold together, which is what a default test run can afford.
-SMOKE = VeniceGoldenConfig(
-    width=32,
-    height=64,
-    interval=16,
-    num_augs=4,
-    clip_resize_short_side=128,
-    max_iterations=4,
-)
+# Knobs live on `neural_structural_optimization.experiment.VeniceGoldenConfig`
+# so `--print-config` can inspect them without importing this script's CLIP
+# builders. GOLDEN / SMOKE / VeniceGoldenConfig are re-exported here so the
+# parity harness and this runner keep one import path.
 
 REPLAY_FILENAME = 'venice_golden_250214_replay.json'
 

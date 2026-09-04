@@ -16,6 +16,13 @@ import sys
 import re
 import os
 from pathlib import Path
+
+# Experiment CLI (--print-config / --run / --override) must not pay the CLIP
+# import below. Dispatch before torch, models, and CLIPLoss are loaded.
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1].startswith('-'):
+    from neural_structural_optimization.experiment import cli_main
+    raise SystemExit(cli_main(sys.argv[1:]))
+
 from PIL import Image
 import seaborn
 import matplotlib.pyplot as plt

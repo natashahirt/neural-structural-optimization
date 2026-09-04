@@ -38,6 +38,15 @@ import os as _os
 
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 
+# Import torch NOW, after the OpenMP pin and before any CHOLMOD solve. A late
+# torch import (CLIPLoss, structural.api) brings a second OpenMP runtime into
+# a process that has already factored, and that race is a bare SIGSEGV.
+# CLIP stays lazy: `--print-config` must not download CLIP weights.
+try:
+    import torch as _torch  # noqa: F401
+except Exception:
+    _torch = None
+
 
 def configure_torch_threads(num_threads=None):
   """Restore torch's CPU thread pool after the OpenMP pin above.
@@ -60,9 +69,20 @@ def configure_torch_threads(num_threads=None):
   torch.set_num_threads(num_threads or _os.cpu_count() or 1)
   return torch.get_num_threads()
 
-# Optional CLIP availability flag
-try:
-    from .models.loss_clip import CLIPLoss  # type: ignore
-    CLIP_AVAILABLE = True
-except Exception:
-    CLIP_AVAILABLE = False
+# CLIP is optional and expensive to import (torch + clip + kornia). Do not
+# load it at package import: `--print-config` and other config-only paths
+# must inspect a run without constructing CLIPLoss or pulling those modules.
+# `from neural_structural_optimization import CLIP_AVAILABLE` still works via
+# module __getattr__; the first access pays the import, later ones are cached.
+
+
+def __getattr__(name):
+  if name == 'CLIP_AVAILABLE':
+    try:
+      from .models.loss_clip import CLIPLoss  # type: ignore  # noqa: F401
+      value = True
+    except Exception:
+      value = False
+    globals()['CLIP_AVAILABLE'] = value
+    return value
+  raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
