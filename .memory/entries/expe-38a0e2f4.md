@@ -13,7 +13,7 @@ files: neural_structural_optimization/train/utils.py@d6106bb, neural_structural_
   neural_structural_optimization/structural/api.py@99e3ffa
 session_id: sess-a469ebb9
 created_at: '2026-09-04T18:32:41.024598+00:00'
-updated_at: '2026-09-04T18:32:58.355934+00:00'
+updated_at: '2026-09-04T18:42:46.358273+00:00'
 has_child_rationale: Stage 4 promised a re-measure of the CNN handoff before anyone
   designs Stage 8 around old numbers.
 results: '[{"metric": "handoff_volume_error", "value": -6.4, "unit": "%", "split":
@@ -28,7 +28,7 @@ results: '[{"metric": "handoff_volume_error", "value": -6.4, "unit": "%", "split
   {"metric": "handoff_volume_error", "value": 5.9, "unit": "%", "split": "multistory_building
   60x60 interval=16 volfrac=0.3 eta=0.5 beta=16 RandomState(0)*2", "window": "mean
   of reprojected handoff", "criterion": "should equal volfrac", "source": "stage-4-remeasure"}]'
-related_to: note-7dabd6e1
+related_to: note-7dabd6e1,deci-640e26f0
 ---
 Re-measured after Stage 4 slice A (`Environment.render` now uses cone_filter=True; `constrained_logits` still cone_filter=False).
 
