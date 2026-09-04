@@ -50,8 +50,16 @@ scipy 1.16.0, scikit-sparse (CHOLMOD).
   `site-packages/numpy/.dylibs/`. So `conda install`/`conda list` will report a
   numpy that is not the one actually being imported, and reinstalling it via conda
   does nothing. Use pip for these.
-- CHOLMOD roughly halves physics time versus the SuperLU fallback. Confirm with
-  `from neural_structural_optimization.structural.autograd import HAS_CHOLMOD`.
+- **CHOLMOD segfaults above ~50k dofs — including the 128×256 golden-run grid.**
+  conda's `libcholmod` links Apple Accelerate while numpy's pip wheel bundles its
+  own OpenBLAS; CHOLMOD's *supernodal* path calls BLAS and dies, which is why only
+  larger problems crash. It is a raw `SIGSEGV` with no traceback, so a run just
+  vanishes. 37k dofs is fine, 51k is not. `mode='simplicial'` avoids it.
+  CHOLMOD is ~5x faster than SuperLU below the threshold and, in the simplicial
+  mode that survives, only ~5% faster at 128×256.
+- Related: CHOLMOD **cannot be caught and retried**. After a
+  `CholmodNotPositiveDefiniteError` is raised and handled, the next solve in that
+  process segfaults. Fall back in a fresh process, never in a `try`/`except`.
 
 ## Tests
 
