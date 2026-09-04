@@ -12,7 +12,7 @@ success: 'true'
 files: ''
 session_id: sess-7aba5a79
 created_at: '2026-09-04T22:43:33.508517+00:00'
-updated_at: '2026-09-04T22:43:33.508517+00:00'
+updated_at: '2026-09-04T23:39:47.742907+00:00'
 results: '[{"metric": "compliance", "value": 75.692, "split": "venice-250214+sketch12",
   "window": "113-steps-converged", "criterion": "look-not-parity", "source": "stage6_sketch_on_golden"},
   {"metric": "clip_loss", "value": 287.931, "split": "venice-250214+sketch12", "window":
@@ -24,6 +24,7 @@ results: '[{"metric": "compliance", "value": 75.692, "split": "venice-250214+ske
   "volume_actual", "value": 0.3186, "split": "venice-250214+sketch12", "window": "113-steps-converged",
   "source": "stage6_sketch_on_golden"}, {"metric": "steps", "value": 113, "split":
   "venice-250214+sketch12", "window": "converged", "source": "stage6_sketch_on_golden"}]'
+related_to: expe-416235a9
 ---
 Look run: Venice 250214 knobs (CLIP skeletons, AdaptivePixel, same init image/seed/schedule) plus sketch 12 occupancy at weight 400.
 
