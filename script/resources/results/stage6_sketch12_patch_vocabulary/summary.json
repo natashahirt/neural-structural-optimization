@@ -1,0 +1,47 @@
+{
+  "steps": 98,
+  "converged": true,
+  "resize_steps": [
+    48,
+    62
+  ],
+  "sketch_weight_start": 4000.0,
+  "sketch_weight_end": 800.0,
+  "init_from_occupancy": true,
+  "motif_weight_peak": 0.0,
+  "motif_weight_end": null,
+  "motif_scales": [
+    1,
+    2,
+    4
+  ],
+  "patch_weight_peak": 800.0,
+  "patch_weight_end": 300.0,
+  "patch_sizes": [
+    7,
+    15
+  ],
+  "patch_stride": 2,
+  "mass_on_occupancy": 0.5721204415375578,
+  "mass_on_allowed": 0.6025683521754446,
+  "spatial_mass_loss": 0.3974316418170929,
+  "weighted_spatial_mass_loss": 317.9453134536743,
+  "motif_loss": 0.0071030170656740665,
+  "weighted_motif_loss": 0.0,
+  "patch_loss": 0.24188145995140076,
+  "weighted_patch_loss": 72.56443798542023,
+  "load_site_frac": 0.01953125,
+  "allowed_frac": 0.2420654296875,
+  "mean_physical_density": 0.3000056743621826,
+  "volume_actual": 0.324462890625,
+  "compliance": 87.69330596923828,
+  "clip_loss": 348.20794677734375,
+  "total_loss": 827.8765869140625,
+  "paths": {
+    "replay": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary/sketch_run.png",
+    "density": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary/physical_density.png",
+    "allowed": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary/allowed_template.png",
+    "comparison": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary/comparison.png",
+    "density_strip": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary/density_vs_reference.png"
+  }
+}

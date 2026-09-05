@@ -1,0 +1,32 @@
+{
+  "selected_global_weight_end": 800.0,
+  "selection_reason": "Improves mass on sketch occupancy with about half the compliance penalty of weight_end=1200.",
+  "runs": {
+    "current_global_400": {
+      "mass_on_occupancy": 0.5451500298792412,
+      "compliance": 83.52705383300781,
+      "clip_loss": 323.8759765625,
+      "motif_loss": null
+    },
+    "stronger_global_800": {
+      "mass_on_occupancy": 0.5712354885255695,
+      "compliance": 87.44351196289062,
+      "clip_loss": 344.4364929199219,
+      "motif_loss": 0.007134634535759687
+    },
+    "strongest_global_1200": {
+      "mass_on_occupancy": 0.5915339490133035,
+      "compliance": 90.60646057128906,
+      "clip_loss": 357.59912109375,
+      "motif_loss": 0.007011090870946646
+    },
+    "global_800_plus_motif": {
+      "motif_weight_peak": 8000.0,
+      "motif_weight_end": 3000.0,
+      "mass_on_occupancy": 0.5722075662228328,
+      "compliance": 87.34049224853516,
+      "clip_loss": 337.61578369140625,
+      "motif_loss": 0.005623123608529568
+    }
+  }
+}

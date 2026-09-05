@@ -1,0 +1,31 @@
+{
+  "sketch": "3.jpg",
+  "clip_prompt": "skeletons",
+  "steps": 114,
+  "converged": true,
+  "resize_steps": [
+    48,
+    62
+  ],
+  "sketch_weight_start": 4000.0,
+  "sketch_weight_end": 400.0,
+  "init_from_occupancy": true,
+  "mass_on_occupancy": 0.4960772008824873,
+  "mass_on_allowed": 0.5323928445179904,
+  "spatial_mass_loss": 0.46760717034339905,
+  "weighted_spatial_mass_loss": 187.04286813735962,
+  "load_site_frac": 0.01953125,
+  "allowed_frac": 0.238616943359375,
+  "mean_physical_density": 0.29999858140945435,
+  "volume_actual": 0.324920654296875,
+  "compliance": 73.38639068603516,
+  "clip_loss": 285.2182922363281,
+  "total_loss": 546.0958862304688,
+  "paths": {
+    "replay": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch3_init_anneal/sketch_run.png",
+    "density": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch3_init_anneal/physical_density.png",
+    "allowed": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch3_init_anneal/allowed_template.png",
+    "comparison": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch3_init_anneal/comparison.png",
+    "density_strip": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch3_init_anneal/density_vs_reference.png"
+  }
+}

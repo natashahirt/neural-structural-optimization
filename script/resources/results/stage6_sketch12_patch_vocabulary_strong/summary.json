@@ -1,0 +1,47 @@
+{
+  "steps": 104,
+  "converged": true,
+  "resize_steps": [
+    48,
+    62
+  ],
+  "sketch_weight_start": 4000.0,
+  "sketch_weight_end": 800.0,
+  "init_from_occupancy": true,
+  "motif_weight_peak": 0.0,
+  "motif_weight_end": null,
+  "motif_scales": [
+    1,
+    2,
+    4
+  ],
+  "patch_weight_peak": 1600.0,
+  "patch_weight_end": 800.0,
+  "patch_sizes": [
+    7,
+    15
+  ],
+  "patch_stride": 2,
+  "mass_on_occupancy": 0.5730219844689776,
+  "mass_on_allowed": 0.6030384716402147,
+  "spatial_mass_loss": 0.3969615399837494,
+  "weighted_spatial_mass_loss": 317.5692319869995,
+  "motif_loss": 0.006982741411775351,
+  "weighted_motif_loss": 0.0,
+  "patch_loss": 0.23829412460327148,
+  "weighted_patch_loss": 190.6352996826172,
+  "load_site_frac": 0.01953125,
+  "allowed_frac": 0.2420654296875,
+  "mean_physical_density": 0.2999842166900635,
+  "volume_actual": 0.32476806640625,
+  "compliance": 88.03839111328125,
+  "clip_loss": 342.7989196777344,
+  "total_loss": 939.4334716796875,
+  "paths": {
+    "replay": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary_strong/sketch_run.png",
+    "density": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary_strong/physical_density.png",
+    "allowed": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary_strong/allowed_template.png",
+    "comparison": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary_strong/comparison.png",
+    "density_strip": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/stage6_sketch12_patch_vocabulary_strong/density_vs_reference.png"
+  }
+}
