@@ -12,7 +12,8 @@ success: 'null'
 files: ''
 session_id: sess-60a28823
 created_at: '2026-09-05T06:12:37.756384+00:00'
-updated_at: '2026-09-05T06:12:37.756384+00:00'
+updated_at: '2026-09-05T06:12:50.462005+00:00'
+related_to: plan-3d516df5,todo-8f888aea
 ---
 Original Stage 7 from the consolidation plan, sequenced after CLIP motif scale so the Pareto is against the semantic term we actually want (skeletons at more than one physical length), not against one-scale gothic.
 
