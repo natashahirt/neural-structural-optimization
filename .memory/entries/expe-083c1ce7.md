@@ -17,7 +17,7 @@ files: neural_structural_optimization/models/loss_clip.py@9816779, neural_struct
   script/resources/results/clip_motif_scale_physical_density_no_occupancy/sketch_run.png@9816779
 session_id: sess-dac77cc3
 created_at: '2026-09-05T19:08:08.449071+00:00'
-updated_at: '2026-09-05T19:08:08.449071+00:00'
+updated_at: '2026-09-05T19:08:20.239543+00:00'
 results: '[{"metric": "compliance", "value": 72.32072448730469, "split": "venice-250214-motif-scale-physical-density-no-occupancy",
   "window": "final-step", "criterion": "at or better than Venice selected-look band",
   "source": "script/resources/results/clip_motif_scale_physical_density_no_occupancy/summary.json"},
@@ -35,6 +35,7 @@ results: '[{"metric": "compliance", "value": 72.32072448730469, "split": "venice
   "window": "final-step", "source": "script/resources/results/clip_motif_scale_physical_density_no_occupancy/summary.json"},
   {"metric": "test_suite", "value": 240, "unit": "passed", "split": "neural_structural_optimization/tests",
   "window": "2026-09-05", "criterion": "all collected tests pass", "source": "pytest"}]'
+related_to: expe-2293aefa
 ---
 Implemented the approved isolated A/B: Venice's primary RandomResizedCrop still receives raw design variables, while only the opt-in physical motif-scale path receives filtered, volume-constrained density. Empty motif scales remain on the frozen raw-only Venice route. Added routing regressions and explicit raw-versus-physical output panels.
 
