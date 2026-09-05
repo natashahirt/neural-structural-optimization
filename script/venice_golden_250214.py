@@ -26,6 +26,7 @@ wrong:
   the model and the optimizer is already Venice's.
 """
 
+import argparse
 import json
 import random
 import sys
@@ -45,6 +46,7 @@ from neural_structural_optimization.experiment import (
     GOLDEN,
     SMOKE,
     VeniceGoldenConfig,
+    venice_250214_motif_scale,
 )
 from neural_structural_optimization.models import AdaptivePixelModel, CLIPLoss
 from neural_structural_optimization.models.loss_clip import VeniceClipPreset
@@ -371,6 +373,77 @@ def save_replay_images(ds: xarray.Dataset, output_dir: Path) -> tuple[Path, Path
     return replay_path, comparison_path
 
 
+def _venice_display_raw(ds: xarray.Dataset, size: tuple[int, int]):
+    """Venice JPEG round trip of the raw design, sized to the reference."""
+    from PIL import Image
+
+    from neural_structural_optimization.models.loss_clip import _resize_short_side
+
+    raw = np.ascontiguousarray(ds['final_design_raw'].values, dtype=np.float32)
+    resized = _resize_short_side(
+        torch.as_tensor(raw)[None, None], GOLDEN.clip_resize_short_side,
+    ).clamp(0.0, 1.0)
+    image = Image.fromarray(
+        (255.0 * (1.0 - resized[0, 0].cpu().numpy())).clip(0, 255).astype(np.uint8),
+        mode='L',
+    )
+    if image.size != size:
+        image = image.resize(size, Image.Resampling.NEAREST)
+    return image
+
+
+def save_motif_scale_look(
+    ds: xarray.Dataset,
+    output_dir: Path,
+    *,
+    extra_panels: tuple[tuple[str, Path], ...] = (),
+) -> tuple[Path, Path]:
+    """Write the no-occupancy motif-scale look next to Venice and any priors."""
+    from PIL import Image, ImageDraw
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
+    size = reference.size
+    replay = _venice_display_raw(ds, size)
+    replay_path = output_dir / 'sketch_run.png'
+    replay.save(replay_path)
+
+    panels: list[tuple[str, Image.Image]] = [
+        ('Venice 250214 RRC', reference),
+        ('Motif-scale CLIP, no occupancy', replay),
+    ]
+    for title, path in extra_panels:
+        if path.is_file():
+            panels.append((
+                title,
+                Image.open(path).convert('L').resize(size, Image.Resampling.NEAREST),
+            ))
+    gap, label_h = 16, 28
+    width, height = size
+    canvas = Image.new(
+        'L',
+        (width * len(panels) + gap * (len(panels) - 1), height + label_h),
+        255,
+    )
+    draw = ImageDraw.Draw(canvas)
+    x = 0
+    for title, image in panels:
+        canvas.paste(image, (x, label_h))
+        draw.text((x + 8, 6), title, fill=0)
+        x += width + gap
+    comparison_path = output_dir / 'comparison.png'
+    canvas.save(comparison_path)
+    return replay_path, comparison_path
+
+
+def _last_clip_motif_terms(ds: xarray.Dataset) -> dict:
+    return {
+        str(name): float(ds[name][-1])
+        for name in ds.data_vars
+        if str(name).startswith('clip_motif_')
+    }
+
+
 def trajectory(ds: xarray.Dataset) -> dict:
     """Extract the per-step term breakdown as plain lists, for saving."""
     payload = {
@@ -393,16 +466,83 @@ def trajectory(ds: xarray.Dataset) -> dict:
     return payload
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     """Replay the golden run and print its final point beside the reference."""
-    ds = run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--motif-scale',
+        action='store_true',
+        help=(
+            'Venice CLIP plus physical-scale crops; no sketch occupancy. '
+            'Writes script/resources/results/clip_motif_scale_no_occupancy/'),
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=Path,
+        help='result directory (relative paths resolve from the repository root)',
+    )
+    args = parser.parse_args(argv)
 
-    output_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
+    if args.motif_scale:
+        config = venice_250214_motif_scale().to_venice_golden()
+        default_dir = (
+            REPO_ROOT / 'script' / 'resources' / 'results'
+            / 'clip_motif_scale_no_occupancy')
+    else:
+        config = GOLDEN
+        default_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
+
+    output_dir = args.output_dir or default_dir
+    if not output_dir.is_absolute():
+        output_dir = REPO_ROOT / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(
+        'Running Venice 250214 skeletons'
+        + (' + motif-scale CLIP (no occupancy)' if args.motif_scale else '')
+        + '...')
+    ds = run(config)
+
     output_path = output_dir / REPLAY_FILENAME
     output_path.write_text(json.dumps(trajectory(ds), indent=2))
     print(f'\nWrote replay trajectory to {output_path}')
-    replay_image, comparison_image = save_replay_images(ds, output_dir)
+    if args.motif_scale:
+        occupancy_look = (
+            REPO_ROOT / 'script' / 'resources' / 'results'
+            / 'clip_motif_scale_sketch12' / 'sketch_run.png')
+        replay_image, comparison_image = save_motif_scale_look(
+            ds,
+            output_dir,
+            extra_panels=(
+                ('Occupancy + motif-scale (prior)', occupancy_look),
+            ),
+        )
+        summary = {
+            'clip_prompt': config.prompt,
+            'motif_scale': True,
+            'occupancy': False,
+            'motif_scale_fracs': list(config.motif_scale_fracs),
+            'motif_scale_crops': config.motif_scale_crops,
+            'motif_scale_weight': config.motif_scale_weight,
+            'steps': int(ds.sizes['step']),
+            'converged': bool(ds.attrs['converged']),
+            'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
+            'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
+            'compliance': float(ds['compliance'][-1]),
+            'clip_loss': float(ds['clip_loss'][-1]),
+            'clip_loss_raw': float(ds['clip_loss_raw'][-1]),
+            'total_loss': float(ds['loss'][-1]),
+            **_last_clip_motif_terms(ds),
+            'paths': {
+                'replay': str(replay_image),
+                'comparison': str(comparison_image),
+            },
+        }
+        (output_dir / 'summary.json').write_text(
+            json.dumps(summary, indent=2) + '\n')
+        print(json.dumps(summary, indent=2))
+    else:
+        replay_image, comparison_image = save_replay_images(ds, output_dir)
     print(f'Wrote replay design to {replay_image}')
     print(f'Wrote side-by-side comparison to {comparison_image}')
 
