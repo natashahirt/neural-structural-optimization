@@ -13,8 +13,9 @@ files: neural_structural_optimization/models/loss_clip.py@9816779, neural_struct
   neural_structural_optimization/tests/test_clip_motif_scale.py@9816779, script/venice_golden_250214.py@9816779
 session_id: sess-1e640c29
 created_at: '2026-09-05T19:57:48.880424+00:00'
-updated_at: '2026-09-05T19:57:48.880424+00:00'
+updated_at: '2026-09-05T20:46:25.393461+00:00'
 invalidates: expe-083c1ce7
+related_to: plan-cbdb1948
 ---
 User judged the raw-input no-occupancy motif look substantially more compelling than the physical-density replacement. Revert commit 9816779's routing/output code while preserving both experiment artifact directories for comparison.
 
