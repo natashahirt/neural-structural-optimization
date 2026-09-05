@@ -81,5 +81,10 @@ class AutogradLibTest(absltest.TestCase):
     x0 = np.random.RandomState(0).randn(3)
     check_grads(lambda x: find_root(f, x, 0, 10, 1e-12), modes=['rev'])(x0)
 
+  def test_solver_cache_holds_more_than_one_factorization(self):
+    # A metrics eval used to evict the adjoint factorization when the cache
+    # size was 1. Stage 2 leftover: keep at least two slots.
+    self.assertGreaterEqual(topo_autograd.SOLVER_CACHE_MAXSIZE, 2)
+
 if __name__ == '__main__':
   absltest.main()

@@ -254,6 +254,7 @@ class AdaptiveAdamRestartTest(absltest.TestCase):
     self.assertEmpty(optimizer.tracker.losses)
     self.assertEmpty(optimizer.tracker.frames)
     self.assertEmpty(optimizer.loss_terms)
+    self.assertEmpty(optimizer.motif_scale_terms)
     self.assertEmpty(optimizer.resize_steps)
     self.assertFalse(optimizer.converged)
     self.assertEqual(model.prev_loss, INITIAL_PREV_LOSS)

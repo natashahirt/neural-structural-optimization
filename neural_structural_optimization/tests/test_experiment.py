@@ -130,6 +130,22 @@ class ExperimentConfigContractsTest(absltest.TestCase):
     with self.assertRaisesRegex(KeyError, 'venice_250214'):
       preset('not-a-preset')
 
+  def test_physical_motif_scale_fracs_for_golden_grid(self):
+    from neural_structural_optimization.experiment import (
+        physical_motif_scale_fracs)
+    self.assertEqual(
+        physical_motif_scale_fracs(256, 64), (1.0, 0.25, 0.0625))
+
+  def test_motif_scale_preset_is_not_a_silent_golden_change(self):
+    from neural_structural_optimization.experiment import (
+        physical_motif_scale_fracs, venice_250214_motif_scale)
+    cfg = venice_250214_motif_scale()
+    self.assertEqual(cfg.name, 'venice_250214_motif_scale')
+    self.assertEqual(
+        cfg.clip.motif_scale_fracs, physical_motif_scale_fracs(256, 64))
+    self.assertEqual(venice_250214().to_venice_golden(), GOLDEN)
+    self.assertNotEqual(cfg.to_venice_golden(), GOLDEN)
+
 
 class PrintConfigDoesNotLoadClipTest(absltest.TestCase):
   """`--print-config` must not import CLIP (clip / kornia).
@@ -199,6 +215,21 @@ print(json.dumps({"banned": banned}))
     self.assertEqual(code, 0)
     resolved = json.loads(buf.getvalue())
     self.assertEqual(resolved['optimizer']['lr'], 0.05)
+
+
+class SmokeFlagSelectsCoarsePresetTest(absltest.TestCase):
+
+  def test_smoke_flag_prints_the_smoke_preset(self):
+    from io import StringIO
+    from unittest import mock
+    buf = StringIO()
+    with mock.patch('sys.stdout', buf):
+      code = cli_main(['--smoke'])
+    self.assertEqual(code, 0)
+    resolved = json.loads(buf.getvalue())
+    self.assertEqual(resolved['name'], 'venice_250214_smoke')
+    self.assertEqual(resolved['problem']['width'], 32)
+    self.assertEqual(resolved['clip']['num_augs'], 4)
 
 
 if __name__ == '__main__':
