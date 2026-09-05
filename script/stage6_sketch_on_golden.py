@@ -1,12 +1,14 @@
-"""Run Venice 250214 with sketch 12 as a spatial mass prior.
+"""Run Venice 250214 with a sketch as a spatial mass prior.
 
 Keeps the golden problem, CLIP, seed, and AdaptiveAdam schedule. Seeds ``z``
-from occupancy union load pixels (not thick_outer_lins), supports a sweep of
-the final spatial weight, and can add stage-scheduled motif recurrence.
+from occupancy union load pixels and anneals the spatial prior from 4000 at
+the coarse stage to 400 at full resolution. Motif and patch terms stay off
+unless explicitly requested.
 
-    PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py
+    PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --sketch 12
+    PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --corpus
 
-Writes labeled panels under ``script/resources/results/stage6_sketch12_init_anneal/``.
+Writes labeled panels under ``script/resources/results/stage6_sketch<id>_init_anneal/``.
 """
 
 from __future__ import annotations
@@ -26,23 +28,20 @@ if str(REPO_ROOT) not in sys.path:
 
 from neural_structural_optimization.experiment import GOLDEN, SketchConfig
 from neural_structural_optimization.models.loss_sketch import (
+    SKETCH_CORPUS,
     SKETCH_DIR,
     apply_sketch_config,
     load_site_mask,
     load_sketch_occupancy,
     mass_fraction_on_occupancy,
     sketch_mass_prior_loss,
-    sketch_motif_loss,
-    sketch_patch_vocabulary_loss,
 )
 
-SKETCH_REL = SKETCH_DIR / '12.jpg'
 # Venice CLIP weight is compliance * 10: ~4900 at step 0, ~740 at
 # convergence. A constant 400 never competed. Start at CLIP's early scale.
 DEFAULT_SKETCH_WEIGHT = 4000.0
 DEFAULT_SKETCH_WEIGHT_END = 400.0
-DEFAULT_OUTPUT_DIR = (
-    REPO_ROOT / 'script' / 'resources' / 'results' / 'stage6_sketch12_init_anneal')
+DEFAULT_SKETCH = '12.jpg'
 LOADPIXELS_RUN_PATH = (
     REPO_ROOT / 'script' / 'resources' / 'results'
     / 'stage6_sketch12_loadpixels' / 'sketch_run.png')
@@ -90,9 +89,34 @@ def _venice_display(raw: np.ndarray, size: tuple[int, int]) -> Image.Image:
     return image
 
 
-def _occupancy() -> np.ndarray:
+def _sketch_name(raw: str) -> str:
+    """Accept ``12``, ``12.jpg``, or a path under the corpus directory."""
+    name = Path(raw).name
+    if '.' not in name:
+        name = f'{name}.jpg'
+    if name not in SKETCH_CORPUS:
+        raise ValueError(
+            f'unknown sketch {raw!r}; expected one of {SKETCH_CORPUS}')
+    return name
+
+
+def _sketch_stem(name: str) -> str:
+    return Path(name).stem
+
+
+def _sketch_rel(name: str) -> Path:
+    return SKETCH_DIR / name
+
+
+def _output_dir_for(name: str) -> Path:
+    return (
+        REPO_ROOT / 'script' / 'resources' / 'results'
+        / f'stage6_sketch{_sketch_stem(name)}_init_anneal')
+
+
+def _occupancy(name: str) -> np.ndarray:
     return load_sketch_occupancy(
-        REPO_ROOT / SKETCH_REL,
+        REPO_ROOT / _sketch_rel(name),
         height=GOLDEN.height,
         width=GOLDEN.width,
     )
@@ -123,17 +147,18 @@ def _hstack(panels: list[tuple[str, Image.Image]], path: Path) -> Path:
     return path
 
 
-def save_occupancy_preview(output_dir: Path) -> dict[str, Path]:
-    occupancy = _occupancy()
+def save_occupancy_preview(output_dir: Path, sketch_name: str) -> dict[str, Path]:
+    occupancy = _occupancy(sketch_name)
     reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
     occ_img = _ink_black(occupancy, reference.size)
     output_dir.mkdir(parents=True, exist_ok=True)
     occ_path = output_dir / 'occupancy.png'
     occ_img.save(occ_path)
+    stem = _sketch_stem(sketch_name)
     preview = _hstack(
         [
-            ('Sketch 12 occupancy (ink black)', occ_img),
-            ('Venice 250214 reference', reference),
+            (f'Sketch {stem} occupancy (ink black)', occ_img),
+            ('Venice 250214 skeletons reference', reference),
         ],
         output_dir / 'occupancy_vs_reference.png',
     )
@@ -142,20 +167,19 @@ def save_occupancy_preview(output_dir: Path) -> dict[str, Path]:
 
 def run_sketch_on_golden(
     *,
+    sketch_name: str = DEFAULT_SKETCH,
     sketch_weight_end: float = DEFAULT_SKETCH_WEIGHT_END,
-    motif_weight: float = 0.0,
-    motif_weight_end: float | None = None,
-    motif_scales: tuple[int, ...] = (1, 2, 4),
-    patch_weight: float = 0.0,
-    patch_weight_end: float | None = None,
-    patch_sizes: tuple[int, ...] = (7, 15),
-    patch_stride: int = 2,
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    output_dir: Path | None = None,
     comparisons: tuple[tuple[str, Path], ...] = (),
 ) -> dict:
     import torch
 
     from neural_structural_optimization import configure_torch_threads
+
+    sketch_name = _sketch_name(sketch_name)
+    stem = _sketch_stem(sketch_name)
+    if output_dir is None:
+        output_dir = _output_dir_for(sketch_name)
 
     golden = _load_golden_script()
     configure_torch_threads()
@@ -165,17 +189,10 @@ def run_sketch_on_golden(
     apply_sketch_config(
         model,
         SketchConfig(
-            path=str(SKETCH_REL),
+            path=str(_sketch_rel(sketch_name)),
             weight=DEFAULT_SKETCH_WEIGHT,
             weight_end=sketch_weight_end,
             init_from_occupancy=True,
-            motif_weight=motif_weight,
-            motif_weight_end=motif_weight_end,
-            motif_scales=motif_scales,
-            patch_weight=patch_weight,
-            patch_weight_end=patch_weight_end,
-            patch_sizes=patch_sizes,
-            patch_stride=patch_stride,
         ),
         height=GOLDEN.height,
         width=GOLDEN.width,
@@ -185,7 +202,7 @@ def run_sketch_on_golden(
     ds = golden.attach_final_raw_design(
         golden.build_optimizer(model, GOLDEN).optimize(), model)
 
-    occupancy = _occupancy()
+    occupancy = _occupancy(sketch_name)
     density = model.get_physical_density(model()).detach().cpu().numpy()
     if density.ndim == 3:
         density = density[0]
@@ -213,7 +230,7 @@ def run_sketch_on_golden(
     density_img.save(density_path)
     allowed_img.save(allowed_path)
     comparison_panels = [
-        ('Sketch 12 occupancy', occ_img),
+        (f'Sketch {stem} occupancy', occ_img),
         ('Allowed (occ union loads)', allowed_img),
     ]
     for title, path in comparisons:
@@ -223,23 +240,17 @@ def run_sketch_on_golden(
                 Image.open(path).convert('L').resize(
                     size, Image.Resampling.NEAREST),
             ))
-    if patch_weight:
-        run_title = f'Global {sketch_weight_end:g} + patch motif'
-    elif motif_weight:
-        run_title = f'Global {sketch_weight_end:g} + motif'
-    else:
-        run_title = f'Global end {sketch_weight_end:g}'
-    comparison_panels.append((run_title, replay))
+    comparison_panels.append((f'Sketch {stem} + skeletons', replay))
     if loadpixels_img is not None and not comparisons:
         comparison_panels.append(('Load-pixel-only baseline', loadpixels_img))
-    comparison_panels.append(('Venice 250214 reference', reference))
+    comparison_panels.append(('Venice 250214 skeletons', reference))
     comparison = _hstack(comparison_panels, output_dir / 'comparison.png')
     density_strip = _hstack(
         [
-            ('Sketch 12 occupancy', occ_img),
+            (f'Sketch {stem} occupancy', occ_img),
             ('Allowed (occ union loads)', allowed_img),
             ('Physical density (volfrac held)', density_img),
-            ('Venice 250214 reference', reference),
+            ('Venice 250214 skeletons', reference),
         ],
         output_dir / 'density_vs_reference.png',
     )
@@ -248,41 +259,19 @@ def run_sketch_on_golden(
     load_sites_t = torch.as_tensor(load_sites, dtype=torch.float32)
     spatial_mass_loss = float(sketch_mass_prior_loss(
         density_t, occupancy_t, load_sites=load_sites_t))
-    motif_loss = float(sketch_motif_loss(
-        density_t, occupancy_t, scales=motif_scales))
-    patch_loss = float(sketch_patch_vocabulary_loss(
-        density_t,
-        occupancy_t,
-        load_sites=load_sites_t,
-        patch_sizes=patch_sizes,
-        stride=patch_stride,
-    ))
     summary = {
+        'sketch': sketch_name,
+        'clip_prompt': GOLDEN.prompt,
         'steps': int(ds.sizes['step']),
         'converged': bool(ds.attrs['converged']),
         'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
         'sketch_weight_start': DEFAULT_SKETCH_WEIGHT,
         'sketch_weight_end': sketch_weight_end,
         'init_from_occupancy': True,
-        'motif_weight_peak': motif_weight,
-        'motif_weight_end': motif_weight_end,
-        'motif_scales': list(motif_scales),
-        'patch_weight_peak': patch_weight,
-        'patch_weight_end': patch_weight_end,
-        'patch_sizes': list(patch_sizes),
-        'patch_stride': patch_stride,
         'mass_on_occupancy': mass_fraction_on_occupancy(density, occupancy),
         'mass_on_allowed': mass_fraction_on_occupancy(density, allowed),
         'spatial_mass_loss': spatial_mass_loss,
         'weighted_spatial_mass_loss': sketch_weight_end * spatial_mass_loss,
-        'motif_loss': motif_loss,
-        'weighted_motif_loss': (
-            (motif_weight if motif_weight_end is None else motif_weight_end)
-            * motif_loss),
-        'patch_loss': patch_loss,
-        'weighted_patch_loss': (
-            (patch_weight if patch_weight_end is None else patch_weight_end)
-            * patch_loss),
         'load_site_frac': float(load_sites.mean()),
         'allowed_frac': float(allowed.mean()),
         'mean_physical_density': float(np.mean(density)),
@@ -302,6 +291,25 @@ def run_sketch_on_golden(
     return summary
 
 
+def save_corpus_strip(sketches: tuple[str, ...], output_dir: Path) -> Path:
+    """Occupancy | result for each finished sketch, plus the skeletons reference."""
+    reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
+    size = reference.size
+    panels: list[tuple[str, Image.Image]] = []
+    for name in sketches:
+        stem = _sketch_stem(name)
+        occ = _ink_black(_occupancy(name), size)
+        run_path = _output_dir_for(name) / 'sketch_run.png'
+        if not run_path.is_file():
+            continue
+        result = Image.open(run_path).convert('L').resize(
+            size, Image.Resampling.NEAREST)
+        panels.append((f'{stem} occupancy', occ))
+        panels.append((f'{stem} + skeletons', result))
+    panels.append(('Venice 250214 skeletons', reference))
+    return _hstack(panels, output_dir / 'corpus_comparison.png')
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -310,22 +318,17 @@ def main(argv: list[str] | None = None) -> int:
         help='write occupancy vs reference and exit (no CLIP, no FEA)',
     )
     parser.add_argument(
+        '--sketch',
+        default=DEFAULT_SKETCH,
+        help='corpus sketch id or filename (default: 12.jpg)',
+    )
+    parser.add_argument(
+        '--corpus',
+        action='store_true',
+        help='run every corpus sketch except 12 (already the selected look)',
+    )
+    parser.add_argument(
         '--weight-end', type=float, default=DEFAULT_SKETCH_WEIGHT_END)
-    parser.add_argument('--motif-weight', type=float, default=0.0)
-    parser.add_argument('--motif-weight-end', type=float)
-    parser.add_argument(
-        '--motif-scales',
-        default='1,2,4',
-        help='comma-separated pooling scales for the motif descriptor',
-    )
-    parser.add_argument('--patch-weight', type=float, default=0.0)
-    parser.add_argument('--patch-weight-end', type=float)
-    parser.add_argument(
-        '--patch-sizes',
-        default='7,15',
-        help='comma-separated odd patch widths',
-    )
-    parser.add_argument('--patch-stride', type=int, default=2)
     parser.add_argument(
         '--output-dir',
         type=Path,
@@ -339,25 +342,15 @@ def main(argv: list[str] | None = None) -> int:
         help='add a labeled prior run to comparison.png',
     )
     args = parser.parse_args(argv)
-    if (args.weight_end < 0 or args.motif_weight < 0
-            or args.patch_weight < 0):
+    if args.weight_end < 0:
         parser.error('weights must be non-negative')
-    motif_scales = tuple(
-        int(value.strip()) for value in args.motif_scales.split(',')
-        if value.strip())
-    if not motif_scales or any(scale < 1 for scale in motif_scales):
-        parser.error('--motif-scales must contain positive integers')
-    patch_sizes = tuple(
-        int(value.strip()) for value in args.patch_sizes.split(',')
-        if value.strip())
-    if (not patch_sizes
-            or any(size < 3 or size % 2 == 0 for size in patch_sizes)):
-        parser.error('--patch-sizes must contain odd integers >= 3')
-    if args.patch_stride < 1:
-        parser.error('--patch-stride must be positive')
-    output_dir = args.output_dir or DEFAULT_OUTPUT_DIR
-    if not output_dir.is_absolute():
-        output_dir = REPO_ROOT / output_dir
+    try:
+        sketches = (
+            tuple(name for name in SKETCH_CORPUS if name != DEFAULT_SKETCH)
+            if args.corpus else (_sketch_name(args.sketch),)
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     comparisons = []
     for item in args.compare:
         if '=' not in item:
@@ -367,28 +360,45 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_absolute():
             path = REPO_ROOT / path
         comparisons.append((label, path))
-    paths = save_occupancy_preview(output_dir)
-    print(f'Wrote occupancy to {paths["occupancy"]}')
-    print(f'Wrote occupancy vs reference to {paths["preview"]}')
-    if args.occupancy_only:
-        return 0
-    print(
-        'Running Venice 250214 + sketch 12 '
-        f'(init occupancy, {DEFAULT_SKETCH_WEIGHT}->{args.weight_end}, '
-        f'motif peak={args.motif_weight}, patch peak={args.patch_weight})...')
-    summary = run_sketch_on_golden(
-        sketch_weight_end=args.weight_end,
-        motif_weight=args.motif_weight,
-        motif_weight_end=args.motif_weight_end,
-        motif_scales=motif_scales,
-        patch_weight=args.patch_weight,
-        patch_weight_end=args.patch_weight_end,
-        patch_sizes=patch_sizes,
-        patch_stride=args.patch_stride,
-        output_dir=output_dir,
-        comparisons=tuple(comparisons),
-    )
-    print(json.dumps(summary, indent=2))
+    summaries = []
+    for name in sketches:
+        output_dir = args.output_dir or _output_dir_for(name)
+        if not output_dir.is_absolute():
+            output_dir = REPO_ROOT / output_dir
+        paths = save_occupancy_preview(output_dir, name)
+        print(f'Wrote occupancy to {paths["occupancy"]}')
+        print(f'Wrote occupancy vs reference to {paths["preview"]}')
+        if args.occupancy_only:
+            continue
+        print(
+            f'Running Venice 250214 skeletons + sketch {Path(name).stem} '
+            f'(init occupancy, {DEFAULT_SKETCH_WEIGHT}->{args.weight_end})...')
+        summary = run_sketch_on_golden(
+            sketch_name=name,
+            sketch_weight_end=args.weight_end,
+            output_dir=output_dir,
+            comparisons=tuple(comparisons),
+        )
+        print(json.dumps(summary, indent=2))
+        summaries.append(summary)
+    if args.corpus and not args.occupancy_only:
+        corpus_dir = (
+            REPO_ROOT / 'script' / 'resources' / 'results'
+            / 'stage6_corpus_init_anneal')
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        strip = save_corpus_strip(
+            (DEFAULT_SKETCH,) + sketches, corpus_dir)
+        catalog = {
+            'clip_prompt': GOLDEN.prompt,
+            'sketch_weight_start': DEFAULT_SKETCH_WEIGHT,
+            'sketch_weight_end': args.weight_end,
+            'init_from_occupancy': True,
+            'runs': summaries,
+            'corpus_strip': str(strip),
+        }
+        (corpus_dir / 'summary.json').write_text(
+            json.dumps(catalog, indent=2) + '\n')
+        print(f'Wrote corpus comparison to {strip}')
     return 0
 
 

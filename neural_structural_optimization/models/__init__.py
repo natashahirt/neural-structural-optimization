@@ -14,6 +14,7 @@ from .loss_sketch import (
     sketch_mass_prior_loss,
     sketch_motif_descriptor,
     sketch_motif_loss,
+    sketch_patch_vocabulary_loss,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     'sketch_mass_prior_loss',
     'sketch_motif_descriptor',
     'sketch_motif_loss',
+    'sketch_patch_vocabulary_loss',
 ]

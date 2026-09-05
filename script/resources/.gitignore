@@ -10,4 +10,11 @@
 # no JPEG pattern today. It is load-bearing in exactly the same way -- it is
 # the sole non-scalar record of the reference run's geometry -- so anything
 # added to the root ignore file must keep it tracked.
+#
+# Stage 6 sketch corpus (`input_images/sketches/*.jpg`) is the same kind of
+# reference asset. The negations below are the JPEG twin of `!*.png`: they
+# keep the occupancy source tracked if a future root ignore ever swallows
+# JPEGs.
 !*.png
+!*.jpg
+!*.jpeg

@@ -48,6 +48,13 @@ from .utils import (cosine_warmup, get_variables, constrained_logits, ensure_arr
 CLIP_DYNAMIC_WEIGHT_MAX = 2000.0
 
 
+def _apply_sketch_schedule(model, step: int, max_iterations: int) -> None:
+    """Advance the sketch-weight anneal for this step, if the model has one."""
+    apply = getattr(model, 'apply_sketch_schedule', None)
+    if apply is not None:
+        apply(step=step, max_iterations=max_iterations)
+
+
 def _reject_clip_alpha_under_venice_compat(model, clip_alpha, optimizer_name: str) -> None:
     """Refuse a `clip_alpha` that contradicts the model's Venice algebra.
 
@@ -249,6 +256,7 @@ class Adam_Optimizer(BaseOptimizer):
             
             optimizer.param_groups[0]['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
+            _apply_sketch_schedule(self.model, i, self.max_iterations)
             logits = self.model()
             if self.model.venice_loss_algebra is not None:
                 # The legacy algebra owns the coupling outright, so neither the
@@ -270,6 +278,7 @@ class Adam_Optimizer(BaseOptimizer):
                 raw_w = float(self.clip_alpha) * (self._baseline_Ls / (float(Ls_eff.detach()) + 1e-8))
                 w_eff = min(raw_w, self._clip_dynamic_w_max)
                 loss = Ls_eff + Lc * w_eff
+                loss = self.model.add_sketch_term(loss, logits)
             else:
                 loss = self.model.get_total_loss(
                     logits,
@@ -410,7 +419,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         if self.model.clip_loss is None:
             zero = compliance.detach().new_tensor(0.0)
             return VeniceLossTerms(
-                total_loss=compliance,
+                total_loss=self.model.add_sketch_term(compliance, logits),
                 compliance_loss=compliance,
                 clip_loss=zero,
                 clip_loss_raw=zero,
@@ -424,7 +433,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
             weight = semantic.detach().new_tensor(static)
         clip_loss = semantic * weight
         return VeniceLossTerms(
-            total_loss=compliance + clip_loss,
+            total_loss=self.model.add_sketch_term(compliance + clip_loss, logits),
             compliance_loss=compliance,
             clip_loss=clip_loss,
             clip_loss_raw=semantic,
@@ -482,6 +491,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         pbar = tqdm(range(self.max_iterations), desc="Adaptive Adam")
         for step in pbar:
             optimizer.zero_grad(set_to_none=True)
+            _apply_sketch_schedule(self.model, step, self.max_iterations)
             logits = model()
             terms = self._compose_loss(logits)
             loss = terms.total_loss
@@ -634,6 +644,7 @@ class LBFGS_Optimizer(BaseOptimizer):
         fine_steps = 10
         
         for step in pbar:
+            _apply_sketch_schedule(self.model, step, self.max_iterations)
             if not self.coarse_start:
                 self.model.analysis_factor = 1
                 self.model.analysis_env = self.model.env
@@ -691,6 +702,7 @@ class LBFGS_Optimizer(BaseOptimizer):
                     raw_w = float(self.clip_alpha) * (self._baseline_Ls / (float(Ls_eff.detach()) + 1e-8))
                     w_eff = min(raw_w, self._clip_dynamic_w_max)
                     loss = Ls_eff + Lc * w_eff
+                    loss = self.model.add_sketch_term(loss, logits)
                     loss.backward()
                     _make_grads_contiguous(self.model)
                     return loss
@@ -703,6 +715,7 @@ class LBFGS_Optimizer(BaseOptimizer):
                             loss = self.model.get_structural_loss(logits) * float(self.compliance_weight)
                     else:
                         loss = self.model.get_semantic_loss(logits) * clip_weight
+                    loss = self.model.add_sketch_term(loss, logits)
                     loss.backward()
                     _make_grads_contiguous(self.model)
                     return loss
@@ -711,6 +724,7 @@ class LBFGS_Optimizer(BaseOptimizer):
                 if self.compliance_weight is not None:
                     loss_structural = loss_structural * float(self.compliance_weight)
                 loss = loss_structural + loss_semantic * self._lam_clip * clip_weight
+                loss = self.model.add_sketch_term(loss, logits)
                 loss.backward()
                 _make_grads_contiguous(self.model)
                 return loss
