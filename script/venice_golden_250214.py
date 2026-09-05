@@ -273,7 +273,7 @@ def attach_final_raw_design(
     ds: xarray.Dataset,
     model: AdaptivePixelModel,
 ) -> xarray.Dataset:
-    """Record the final raw design and, for motif looks, physical density.
+    """Record the design parameter as the run left it, unrendered.
 
     `ds['design']` holds the RENDERED design -- `Environment.render` applies the
     volume constraint, which bounds it to [0, 1]. Two of the reference run's
@@ -301,13 +301,6 @@ def attach_final_raw_design(
     """
     raw = model.z.detach().cpu().numpy()[0]
     ds['final_design_raw'] = (('raw_y', 'raw_x'), raw)
-    motif_fracs = getattr(model.clip_loss, 'motif_scale_fracs', ())
-    if motif_fracs:
-        density = model.get_physical_density(model.z).detach().cpu().numpy()[0]
-        ds['final_physical_density'] = (
-            ('physical_y', 'physical_x'),
-            density,
-        )
     return ds
 
 
@@ -399,54 +392,32 @@ def _venice_display_raw(ds: xarray.Dataset, size: tuple[int, int]):
     return image
 
 
-def _physical_density_display(ds: xarray.Dataset, size: tuple[int, int]):
-    """Render the final filtered, volume-constrained structural density."""
-    from PIL import Image
-
-    density = np.clip(
-        np.asarray(ds['final_physical_density'].values, dtype=np.float32),
-        0.0,
-        1.0,
-    )
-    image = Image.fromarray(
-        (255.0 * (1.0 - density)).clip(0, 255).astype(np.uint8),
-        mode='L',
-    )
-    if image.size != size:
-        image = image.resize(size, Image.Resampling.NEAREST)
-    return image
-
-
 def save_motif_scale_look(
     ds: xarray.Dataset,
     output_dir: Path,
     *,
     extra_panels: tuple[tuple[str, Path], ...] = (),
-) -> tuple[Path, Path, Path]:
-    """Write raw and load-bearing motif-scale fields beside the prior look."""
+) -> tuple[Path, Path]:
+    """Write the no-occupancy motif-scale look next to Venice and any priors."""
     from PIL import Image, ImageDraw
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
     size = reference.size
     replay = _venice_display_raw(ds, size)
-    physical = _physical_density_display(ds, size)
     replay_path = output_dir / 'sketch_run.png'
-    physical_path = output_dir / 'physical_density.png'
     replay.save(replay_path)
-    physical.save(physical_path)
 
-    panels: list[tuple[str, Image.Image]] = [('Venice 250214 RRC', reference)]
+    panels: list[tuple[str, Image.Image]] = [
+        ('Venice 250214 RRC', reference),
+        ('Motif-scale CLIP, no occupancy', replay),
+    ]
     for title, path in extra_panels:
         if path.is_file():
             panels.append((
                 title,
                 Image.open(path).convert('L').resize(size, Image.Resampling.NEAREST),
             ))
-    panels.extend([
-        ('Physical-motif run: raw design', replay),
-        ('Physical-motif run: structural density', physical),
-    ])
     gap, label_h = 16, 28
     width, height = size
     canvas = Image.new(
@@ -462,7 +433,7 @@ def save_motif_scale_look(
         x += width + gap
     comparison_path = output_dir / 'comparison.png'
     canvas.save(comparison_path)
-    return replay_path, physical_path, comparison_path
+    return replay_path, comparison_path
 
 
 def _last_clip_motif_terms(ds: xarray.Dataset) -> dict:
@@ -502,8 +473,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         '--motif-scale',
         action='store_true',
         help=(
-            'Venice CLIP plus physical-scale crops on structural density; no '
-            'sketch occupancy. Writes results to a separate A/B directory.'),
+            'Venice CLIP plus physical-scale crops; no sketch occupancy. '
+            'Writes script/resources/results/clip_motif_scale_no_occupancy/'),
     )
     parser.add_argument(
         '--output-dir',
@@ -516,7 +487,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config = venice_250214_motif_scale().to_venice_golden()
         default_dir = (
             REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_physical_density_no_occupancy')
+            / 'clip_motif_scale_no_occupancy')
     else:
         config = GOLDEN
         default_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
@@ -536,24 +507,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_path.write_text(json.dumps(trajectory(ds), indent=2))
     print(f'\nWrote replay trajectory to {output_path}')
     if args.motif_scale:
-        prior_no_occupancy_look = (
+        occupancy_look = (
             REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_no_occupancy' / 'sketch_run.png')
-        replay_image, physical_image, comparison_image = save_motif_scale_look(
+            / 'clip_motif_scale_sketch12' / 'sketch_run.png')
+        replay_image, comparison_image = save_motif_scale_look(
             ds,
             output_dir,
             extra_panels=(
-                ('Prior motif run: raw-only guidance', prior_no_occupancy_look),
+                ('Occupancy + motif-scale (prior)', occupancy_look),
             ),
-        )
-        physical_density = np.asarray(
-            ds['final_physical_density'].values,
-            dtype=np.float32,
         )
         summary = {
             'clip_prompt': config.prompt,
             'motif_scale': True,
-            'motif_input': 'filtered_volume_constrained_physical_density',
             'occupancy': False,
             'motif_scale_fracs': list(config.motif_scale_fracs),
             'motif_scale_crops': config.motif_scale_crops,
@@ -562,7 +528,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             'converged': bool(ds.attrs['converged']),
             'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
             'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
-            'mean_physical_density': float(np.mean(physical_density)),
             'compliance': float(ds['compliance'][-1]),
             'clip_loss': float(ds['clip_loss'][-1]),
             'clip_loss_raw': float(ds['clip_loss_raw'][-1]),
@@ -570,7 +535,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             **_last_clip_motif_terms(ds),
             'paths': {
                 'replay': str(replay_image),
-                'physical_density': str(physical_image),
                 'comparison': str(comparison_image),
             },
         }

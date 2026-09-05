@@ -21,7 +21,6 @@ from neural_structural_optimization.experiment import (
     venice_250214_motif_scale,
 )
 from neural_structural_optimization.models.loss_clip import physical_scale_boxes
-from neural_structural_optimization.models.model_base import Model
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GOLDEN_SCRIPT = _REPO_ROOT / 'script' / 'venice_golden_250214.py'
@@ -108,61 +107,6 @@ class MotifScalePresetDoesNotSilentChangeGoldenTest(absltest.TestCase):
         self.assertEqual(golden.prompt, GOLDEN.prompt)
         self.assertEqual(golden.num_augs, GOLDEN.num_augs)
         self.assertEqual(golden.clip_resize_short_side, GOLDEN.clip_resize_short_side)
-
-
-class VeniceMotifDensityRoutingTest(absltest.TestCase):
-    """Venice keeps raw primary CLIP while motifs see structural density."""
-
-    class _RecordingClip:
-
-        def __init__(self, motif_scale_fracs):
-            self.motif_scale_fracs = motif_scale_fracs
-            self.venice_path = object()
-            self.primary_image = None
-            self.motif_image = None
-
-        def __call__(self, image, *, motif_image=None):
-            self.primary_image = image
-            self.motif_image = motif_image
-            return image.new_tensor(1.0)
-
-    class _RoutingModel:
-
-        def __init__(self, clip_loss, physical_density):
-            self.clip_loss = clip_loss
-            self.physical_density = physical_density
-            self.physical_density_calls = 0
-
-        def _clip_sees_raw_design(self):
-            return True
-
-        def get_physical_density(self, logits):
-            self.physical_density_calls += 1
-            return self.physical_density
-
-    def test_motif_scales_receive_physical_density_only(self):
-        raw = torch.full((1, 4, 2), 7.0)
-        physical = torch.full((1, 4, 2), 0.3)
-        clip_loss = self._RecordingClip((0.25, 0.0625))
-        model = self._RoutingModel(clip_loss, physical)
-
-        Model.get_semantic_loss(model, raw)
-
-        self.assertIs(clip_loss.primary_image, raw)
-        self.assertIs(clip_loss.motif_image, physical)
-        self.assertEqual(model.physical_density_calls, 1)
-
-    def test_empty_scales_preserve_raw_only_venice_route(self):
-        raw = torch.full((1, 4, 2), 7.0)
-        physical = torch.full((1, 4, 2), 0.3)
-        clip_loss = self._RecordingClip(())
-        model = self._RoutingModel(clip_loss, physical)
-
-        Model.get_semantic_loss(model, raw)
-
-        self.assertIs(clip_loss.primary_image, raw)
-        self.assertIsNone(clip_loss.motif_image)
-        self.assertEqual(model.physical_density_calls, 0)
 
 
 class MotifScaleClipPathTest(absltest.TestCase):

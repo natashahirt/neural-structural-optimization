@@ -1051,24 +1051,8 @@ class CLIPLoss(nn.Module):
         self.last_motif_scale_losses['mean'] = float(stacked.detach().mean())
         return stacked.mean()
 
-    def forward(
-        self,
-        image: torch.Tensor,
-        *,
-        motif_image: Optional[torch.Tensor] = None,
-    ):
-        """Evaluate primary CLIP guidance and the optional motif-scale path.
-
-        Args:
-            image: Input to the primary CLIP path. Venice compatibility passes
-                raw design variables here to preserve the frozen reference.
-            motif_image: Optional distinct field for physical-scale crops.
-                Venice motif experiments pass filtered, volume-constrained
-                density so semantic motifs must survive into structural
-                geometry. Defaults to ``image`` for backwards compatibility.
-        """
-        motif_source = image if motif_image is None else motif_image
-        extra = self._physical_motif_scale_loss(motif_source)
+    def forward(self, image: torch.Tensor):
+        extra = self._physical_motif_scale_loss(image)
         if self.venice_path is not None:
             # Legacy path: raw logits in, no output scale, no auxiliary terms.
             # Physical-scale crops are an additive second path; they do not

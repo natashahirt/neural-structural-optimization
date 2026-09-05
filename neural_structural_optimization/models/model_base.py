@@ -387,19 +387,11 @@ class Model(nn.Module):
         """Compute clip-based semantic loss on the canonical density.
 
         Default CLIP sees `get_physical_density(logits)`, not `sigmoid(z)`.
-        The Venice primary path still sees raw logits, matching the golden
-        run. Its opt-in motif-scale path instead receives physical density so
-        those motifs must survive the same filter and volume constraint as the
-        structure analyzed by FEA.
+        The Venice preset still passes raw logits, matching the golden run.
         """
         if self.clip_loss is None:
             return logits.new_tensor(0.0)
         if self._clip_sees_raw_design():
-            if getattr(self.clip_loss, 'motif_scale_fracs', ()):
-                return self.clip_loss(
-                    logits,
-                    motif_image=self.get_physical_density(logits),
-                )
             return self.clip_loss(logits)
         return self.clip_loss(self.get_physical_density(logits))
 
