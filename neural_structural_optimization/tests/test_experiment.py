@@ -145,6 +145,26 @@ class ExperimentConfigContractsTest(absltest.TestCase):
         cfg.clip.motif_scale_fracs, physical_motif_scale_fracs(256, 64))
     self.assertEqual(venice_250214().to_venice_golden(), GOLDEN)
     self.assertNotEqual(cfg.to_venice_golden(), GOLDEN)
+    self.assertFalse(venice_250214().layout.enabled)
+    self.assertFalse(cfg.layout.enabled)
+
+  def test_motif_layout_preset_is_opt_in_and_not_a_user_sketch(self):
+    from neural_structural_optimization.experiment import (
+        physical_motif_scale_fracs, venice_250214_motif_layout)
+    cfg = venice_250214_motif_layout()
+    self.assertEqual(cfg.name, 'venice_250214_motif_layout')
+    self.assertTrue(cfg.layout.enabled)
+    self.assertIsNone(cfg.sketch.path)
+    self.assertEqual(cfg.sketch.motif_weight, 0.0)
+    self.assertEqual(
+        cfg.clip.motif_scale_fracs, physical_motif_scale_fracs(256, 64))
+    self.assertEqual(
+        cfg.resolved_layout_scale_fracs(),
+        physical_motif_scale_fracs(256, 64)[1:])
+    self.assertEqual(venice_250214().to_venice_golden(), GOLDEN)
+    restored = ExperimentConfig.from_json(cfg.to_json())
+    self.assertEqual(restored, cfg)
+    cfg.validate()
 
 
 class PrintConfigDoesNotLoadClipTest(absltest.TestCase):

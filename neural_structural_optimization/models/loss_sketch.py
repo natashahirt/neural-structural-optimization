@@ -12,6 +12,11 @@ redistributes the budget.
 The occupancy loader uses PIL only (no torchvision, no CLIP) so a config-only
 import path can stay free of those packages. The loss itself is a few tensor
 ops on an already-computed density.
+
+A motif-layout scaffold is the same occupancy prior, distilled from a raw
+CLIP teacher rather than a user sketch: threshold teacher ink, then take
+bounded distance envelopes at physically derived scales. Extraction is
+deterministic and CLIP-free. Load-site union still happens at apply time.
 """
 
 from __future__ import annotations
@@ -152,6 +157,143 @@ def sketch_mass_prior_loss(
         allowed = torch.maximum(occ, sites)
     mass = dens.sum().clamp_min(1e-12)
     return (dens * (1.0 - allowed)).sum() / mass
+
+
+def teacher_ink_from_raw(field: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    """Clamp a teacher design to ``[0, 1]`` ink (material = 1).
+
+    Venice displays raw logits by clamping after a short-side resize. The
+    layout scaffold is extracted on the design grid, so this is the same
+    clamp without that resize. Unbounded logits keep their decorative
+    high-value ink; a physical-density field is unchanged.
+    """
+    arr = _as_numpy(field).astype(np.float64)
+    if arr.ndim == 3:
+        arr = np.squeeze(arr, axis=0)
+    if arr.ndim != 2:
+        raise ValueError(
+            f'teacher field must be 2-D after squeeze, got {arr.shape}')
+    return np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+
+def motif_layout_envelope_sigmas(
+    height: int,
+    scale_fracs: Sequence[float],
+    envelope_sigma_frac: float,
+) -> tuple[float, ...]:
+    """Gaussian/distance-envelope sigmas in *grid* pixels.
+
+    Each scale fraction is a share of elevation height (building / storey /
+    member), matching :func:`physical_motif_scale_fracs`. ``sigma`` is
+    ``envelope_sigma_frac * frac * height``.
+    """
+    if height < 1:
+        raise ValueError(f'height must be >= 1, got {height}')
+    if float(envelope_sigma_frac) < 0.0:
+        raise ValueError(
+            f'envelope_sigma_frac must be >= 0, got {envelope_sigma_frac}')
+    if not scale_fracs:
+        raise ValueError('scale_fracs must be a non-empty sequence')
+    sigmas = []
+    for frac in scale_fracs:
+        frac = float(frac)
+        if not 0.0 < frac <= 1.0:
+            raise ValueError(
+                f'scale_fracs must be elevation fractions in (0, 1], got '
+                f'{tuple(scale_fracs)}')
+        sigmas.append(float(envelope_sigma_frac) * frac * float(height))
+    return tuple(sigmas)
+
+
+def _soft_distance_envelope(ink: np.ndarray, sigma: float) -> np.ndarray:
+    """``[0, 1]`` falloff from binary ink. ``sigma=0`` is the ink itself."""
+    binary = np.asarray(ink, dtype=bool)
+    if sigma <= 0.0:
+        return binary.astype(np.float64)
+    from scipy.ndimage import distance_transform_edt
+    dist = distance_transform_edt(np.logical_not(binary))
+    return np.exp(-dist / float(sigma))
+
+
+def motif_layout_scaffold(
+    teacher_field: Union[np.ndarray, torch.Tensor],
+    *,
+    scale_fracs: Sequence[float],
+    threshold: float = 0.5,
+    envelope_sigma_frac: float = 0.25,
+    combine: str = 'max',
+) -> np.ndarray:
+    """Soft multiscale occupancy envelope from teacher ink.
+
+    Threshold the clamped teacher field, then build a bounded distance
+    envelope at each physically derived scale and combine them. This is a
+    layout prior, not a silhouette match: fine decorative holes survive at
+    member scale while storey/building scales thicken the allowed region.
+    Deterministic; no CLIP. Does not union load sites -- that happens when
+    the mass prior is applied.
+
+    Args:
+        teacher_field: Raw design or density, any 2-D (or ``(1, H, W)``) array.
+        scale_fracs: Elevation fractions in ``(0, 1]``. Empty is rejected;
+            resolve :func:`physical_motif_scale_fracs` at the caller.
+        threshold: Cut on clamped ink in ``[0, 1]``.
+        envelope_sigma_frac: Envelope width as a fraction of each scale's
+            pixel size (``frac * height``).
+        combine: ``'max'`` (thicker union of scales) or ``'mean'``.
+
+    Returns:
+        float32 array of shape ``(H, W)`` in ``[0, 1]``.
+    """
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError(f'threshold must be in [0, 1], got {threshold!r}')
+    combine = str(combine).lower()
+    if combine not in ('max', 'mean'):
+        raise ValueError(f"combine must be 'max' or 'mean', got {combine!r}")
+    ink = teacher_ink_from_raw(teacher_field)
+    height, width = ink.shape
+    sigmas = motif_layout_envelope_sigmas(
+        height, scale_fracs, envelope_sigma_frac)
+    binary = ink >= float(threshold)
+    if not np.any(binary):
+        raise ValueError(
+            f'teacher ink is empty after threshold={threshold}; '
+            'cannot extract a layout scaffold')
+    envelopes = [
+        _soft_distance_envelope(binary, sigma) for sigma in sigmas]
+    if combine == 'max':
+        scaffold = np.maximum.reduce(envelopes)
+    else:
+        scaffold = np.mean(np.stack(envelopes, axis=0), axis=0)
+    return np.clip(scaffold, 0.0, 1.0).astype(np.float32)
+
+
+def init_weight_from_teacher(model, teacher_z) -> torch.Tensor:
+    """Seed ``model.z`` from a teacher design at the model's current grid.
+
+    Bilinear resample, no clamp: teacher logits are unbounded. Occupancy
+    seeding clamps to ``[0, 1]`` because a sketch is ink; a teacher is a
+    continuation of the same design parameter.
+    """
+    height, width = int(model.z.shape[-2]), int(model.z.shape[-1])
+    field = _as_numpy(teacher_z).astype(np.float32)
+    if field.ndim == 3:
+        field = np.squeeze(field, axis=0)
+    if field.ndim != 2:
+        raise ValueError(
+            f'teacher design must be 2-D after squeeze, got {field.shape}')
+    tensor = torch.as_tensor(field, dtype=torch.float32)
+    if tensor.shape[-2] != height or tensor.shape[-1] != width:
+        tensor = torch.nn.functional.interpolate(
+            tensor.view(1, 1, tensor.shape[-2], tensor.shape[-1]),
+            size=(height, width),
+            mode='bilinear',
+            align_corners=False,
+        ).view(height, width)
+    image = tensor.to(device=model.z.device)
+    if image.ndim == 2:
+        image = image.unsqueeze(0)
+    model.z = torch.nn.Parameter(image.contiguous(), requires_grad=True)
+    return model.z
 
 
 def _as_single_channel_field(field: torch.Tensor) -> torch.Tensor:
@@ -577,6 +719,41 @@ def apply_sketch_config(
             ).view(nely, nelx)
         allowed = np.maximum(occ_t.detach().cpu().numpy(), sites)
         init_weight_with_occupancy(model, allowed)
+    return model
+
+
+def apply_motif_layout_config(
+    model,
+    layout,
+    teacher_field,
+    *,
+    scale_fracs: Sequence[float],
+):
+    """Attach a teacher-distilled scaffold as the spatial mass prior.
+
+    ``layout.enabled`` False is a no-op so a Venice-preset model stays
+    bit-identical. Motif/patch sketch terms stay off: this is layout
+    redistribution, not Gram/patch matching. ``init_from_teacher`` overwrites
+    ``model.z`` with a bilinear downsample of the unbounded teacher design.
+    """
+    if not bool(getattr(layout, 'enabled', False)):
+        return model
+    scaffold = motif_layout_scaffold(
+        teacher_field,
+        scale_fracs=scale_fracs,
+        threshold=float(layout.threshold),
+        envelope_sigma_frac=float(layout.envelope_sigma_frac),
+        combine=str(layout.combine),
+    )
+    model.enable_sketch_prior(
+        scaffold,
+        weight=float(layout.weight),
+        weight_end=getattr(layout, 'weight_end', None),
+        motif_weight=0.0,
+        patch_weight=0.0,
+    )
+    if bool(getattr(layout, 'init_from_teacher', False)):
+        init_weight_from_teacher(model, teacher_field)
     return model
 
 

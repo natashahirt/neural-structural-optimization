@@ -688,5 +688,143 @@ class SketchWeightAnnealTest(absltest.TestCase):
         float(np.mean(guided_density)), _VOLFRAC, atol=_VOLUME_ATOL)
 
 
+class MotifLayoutScaffoldTest(absltest.TestCase):
+
+  def test_extraction_is_deterministic_and_bounded(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_scaffold)
+
+    teacher = _left_half_occupancy()
+    fracs = (1.0, 0.25, 0.0625)
+    a = motif_layout_scaffold(teacher, scale_fracs=fracs)
+    b = motif_layout_scaffold(teacher, scale_fracs=fracs)
+    np.testing.assert_array_equal(a, b)
+    self.assertEqual(a.shape, teacher.shape)
+    self.assertGreaterEqual(float(a.min()), 0.0)
+    self.assertLessEqual(float(a.max()), 1.0)
+    self.assertGreater(float(a.mean()), float(teacher.mean()))
+
+  def test_storey_member_scaffold_is_sparser_than_building_envelope(self):
+    from neural_structural_optimization.experiment import (
+        physical_motif_scale_fracs)
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_scaffold)
+
+    teacher = _left_half_occupancy(height=256, width=128)
+    building, storey, member = physical_motif_scale_fracs(256, 64)
+    fat = motif_layout_scaffold(teacher, scale_fracs=(building, storey, member))
+    layout = motif_layout_scaffold(teacher, scale_fracs=(storey, member))
+    self.assertLess(float(layout.mean()), float(fat.mean()))
+    self.assertLess(float(layout.mean()), 0.85)
+
+  def test_physical_scale_sigmas_match_building_storey_member(self):
+    from neural_structural_optimization.experiment import (
+        physical_motif_scale_fracs)
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_envelope_sigmas)
+
+    fracs = physical_motif_scale_fracs(256, 64)
+    self.assertEqual(fracs, (1.0, 0.25, 0.0625))
+    self.assertEqual(
+        motif_layout_envelope_sigmas(256, fracs, 0.25),
+        (64.0, 16.0, 4.0))
+
+  def test_broader_scale_envelope_covers_more_area(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_scaffold)
+
+    teacher = np.zeros((_HEIGHT, _WIDTH), dtype=np.float32)
+    teacher[_HEIGHT // 2, _WIDTH // 2] = 1.0
+    building = motif_layout_scaffold(
+        teacher, scale_fracs=(1.0,), envelope_sigma_frac=0.25)
+    member = motif_layout_scaffold(
+        teacher, scale_fracs=(0.0625,), envelope_sigma_frac=0.25)
+    self.assertGreater(float(building.mean()), float(member.mean()))
+
+  def test_empty_ink_is_rejected(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_scaffold)
+
+    with self.assertRaisesRegex(ValueError, 'empty'):
+      motif_layout_scaffold(
+          np.zeros((_HEIGHT, _WIDTH), dtype=np.float32),
+          scale_fracs=(1.0,),
+          threshold=0.5)
+
+  def test_load_site_union_does_not_punish_loaded_void(self):
+    occupancy = np.zeros((_HEIGHT, _WIDTH), dtype=np.float32)
+    occupancy[:, : _WIDTH // 2] = 1.0
+    load_sites = np.zeros((_HEIGHT, _WIDTH), dtype=np.float32)
+    load_sites[-1, -1] = 1.0
+    density = torch.zeros(_HEIGHT, _WIDTH)
+    density[-1, -1] = 1.0
+    loss_without = float(sketch_mass_prior_loss(
+        density, torch.as_tensor(occupancy)))
+    loss_with = float(sketch_mass_prior_loss(
+        density, torch.as_tensor(occupancy),
+        load_sites=torch.as_tensor(load_sites)))
+    self.assertAlmostEqual(loss_without, 1.0, places=5)
+    self.assertAlmostEqual(loss_with, 0.0, places=5)
+
+  def test_apply_layout_is_noop_when_disabled(self):
+    from neural_structural_optimization.experiment import MotifLayoutConfig
+    from neural_structural_optimization.models.loss_sketch import (
+        apply_motif_layout_config)
+
+    model = PixelModel(structural_params=_params(), seed=0)
+    before = model.z.detach().clone()
+    apply_motif_layout_config(
+        model, MotifLayoutConfig(), _left_half_occupancy(),
+        scale_fracs=(1.0,))
+    self.assertIsNone(model.sketch_occupancy_full)
+    torch.testing.assert_close(model.z.detach(), before)
+
+  def test_apply_layout_attaches_scaffold_and_keeps_motif_terms_off(self):
+    from neural_structural_optimization.experiment import MotifLayoutConfig
+    from neural_structural_optimization.models.loss_sketch import (
+        apply_motif_layout_config, motif_layout_scaffold)
+
+    teacher = _left_half_occupancy()
+    fracs = (1.0, 0.25)
+    expected = motif_layout_scaffold(teacher, scale_fracs=fracs)
+    model = PixelModel(structural_params=_params(), seed=0)
+    apply_motif_layout_config(
+        model,
+        MotifLayoutConfig(
+            enabled=True, init_from_teacher=False, weight=12.0, weight_end=3.0),
+        teacher,
+        scale_fracs=fracs,
+    )
+    self.assertIsNotNone(model.sketch_occupancy_full)
+    np.testing.assert_allclose(
+        model.sketch_occupancy_full.numpy(), expected, atol=1e-6)
+    self.assertEqual(model.sketch_weight_start, 12.0)
+    self.assertEqual(model.sketch_weight_end, 3.0)
+    self.assertEqual(model.sketch_motif_weight_peak, 0.0)
+    self.assertEqual(model.sketch_patch_weight_peak, 0.0)
+
+  def test_init_from_teacher_resamples_without_clamping(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        init_weight_from_teacher)
+
+    teacher = np.full((_HEIGHT, _WIDTH), 2.5, dtype=np.float32)
+    teacher[0, 0] = -4.0
+    model = PixelModel(structural_params=_params(), seed=0)
+    init_weight_from_teacher(model, teacher)
+    z = model.z.detach().cpu().numpy()[0]
+    self.assertEqual(z.shape, (_HEIGHT, _WIDTH))
+    self.assertGreater(float(z.max()), 1.0)
+    self.assertLess(float(z.min()), 0.0)
+
+  def test_venice_preset_layout_is_off(self):
+    from neural_structural_optimization.experiment import MotifLayoutConfig
+
+    cfg = venice_250214()
+    self.assertFalse(cfg.layout.enabled)
+    self.assertEqual(cfg.layout, MotifLayoutConfig())
+    restored = ExperimentConfig.from_json(cfg.to_json())
+    self.assertEqual(restored.layout, cfg.layout)
+
+
 if __name__ == '__main__':
   absltest.main()

@@ -164,6 +164,14 @@ class MotifScaleClipPathTest(absltest.TestCase):
             loss_both, loss_venice + extra, rtol=1e-4, atol=1e-4)
         self.assertGreater(float(loss_both), float(loss_venice))
 
+    def test_forward_still_takes_raw_image_only(self):
+        import inspect
+        from neural_structural_optimization.models.loss_clip import CLIPLoss
+
+        params = inspect.signature(CLIPLoss.forward).parameters
+        self.assertEqual(list(params), ['self', 'image'])
+        self.assertNotIn('motif_image', params)
+
 
 if __name__ == '__main__':
     absltest.main()
