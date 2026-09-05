@@ -257,6 +257,34 @@ class SketchConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class MotifLayoutConfig:
+    """Soft occupancy scaffold distilled from a raw motif teacher.
+
+    Off by default so Venice stays bit-identical. This is not a user sketch:
+    a CLIP-generated teacher field is converted into bounded envelopes at
+    physically derived scales. The student keeps raw multi-scale CLIP
+    decoration and uses ``sketch_mass_prior_loss`` only to redistribute the
+    fixed volume budget onto the scaffold.
+
+    ``scale_fracs`` empty derives storey and member from
+    :func:`physical_motif_scale_fracs` (the whole-building fraction is a CLIP
+    crop, not a layout envelope; a building-scale distance field fills the
+    facade). ``teacher_raw_path`` is optional; the two-pass runner can pass
+    the in-memory teacher field instead.
+    """
+
+    enabled: bool = False
+    teacher_raw_path: Optional[str] = None
+    threshold: float = 0.5
+    envelope_sigma_frac: float = 0.25
+    scale_fracs: tuple[float, ...] = ()
+    combine: str = 'max'
+    weight: float = 4000.0
+    weight_end: Optional[float] = 400.0
+    init_from_teacher: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
 class ExperimentConfig:
     """Immutable experiment. Sections compose existing objects; they do not
     invent a second density chain or a second loss algebra.
@@ -267,6 +295,8 @@ class ExperimentConfig:
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     clip: ClipConfig = dataclasses.field(default_factory=ClipConfig)
     sketch: SketchConfig = dataclasses.field(default_factory=SketchConfig)
+    layout: MotifLayoutConfig = dataclasses.field(
+        default_factory=MotifLayoutConfig)
     optimizer: OptimizerConfig = dataclasses.field(default_factory=OptimizerConfig)
     init: InitConfig = dataclasses.field(default_factory=InitConfig)
     run: RunConfig = dataclasses.field(default_factory=RunConfig)
@@ -394,6 +424,19 @@ class ExperimentConfig:
                 kwargs[name] = value
         return StructuralParams(**kwargs)
 
+    def resolved_layout_scale_fracs(self) -> tuple[float, ...]:
+        """Storey/member scaffold scales, from config or the problem.
+
+        An explicit ``layout.scale_fracs`` is used as authored. Otherwise the
+        building fraction is dropped: a whole-facade distance envelope is not
+        a layout prior. Building-scale CLIP crops stay on the decorative path.
+        """
+        if self.layout.scale_fracs:
+            return tuple(float(frac) for frac in self.layout.scale_fracs)
+        _building, storey, member = physical_motif_scale_fracs(
+            self.problem.height, self.problem.interval)
+        return (storey, member)
+
     def resolve(self) -> dict[str, Any]:
         """Effective settings, JSON-friendly, without loading CLIP or a model.
 
@@ -416,6 +459,9 @@ class ExperimentConfig:
             'coarse_interval': max(1, params.interval // divisor),
             'schedule_divisor': divisor,
         }
+        if self.layout.enabled:
+            payload['effective']['layout_scale_fracs'] = list(
+                self.resolved_layout_scale_fracs())
         return payload
 
     def validate(self) -> None:
@@ -512,6 +558,38 @@ class ExperimentConfig:
             if not sketch_path.exists():
                 raise ValueError(
                     f'sketch.path does not exist: {self.sketch.path}')
+        if self.layout.weight < 0.0:
+            raise ValueError(
+                f'layout.weight must be >= 0, got {self.layout.weight}')
+        if (self.layout.weight_end is not None
+                and self.layout.weight_end < 0.0):
+            raise ValueError(
+                f'layout.weight_end must be >= 0, got {self.layout.weight_end}')
+        if not 0.0 <= self.layout.threshold <= 1.0:
+            raise ValueError(
+                f'layout.threshold must be in [0, 1], got '
+                f'{self.layout.threshold}')
+        if self.layout.envelope_sigma_frac < 0.0:
+            raise ValueError(
+                f'layout.envelope_sigma_frac must be >= 0, got '
+                f'{self.layout.envelope_sigma_frac}')
+        if str(self.layout.combine).lower() not in ('max', 'mean'):
+            raise ValueError(
+                f"layout.combine must be 'max' or 'mean', got "
+                f'{self.layout.combine!r}')
+        for frac in self.layout.scale_fracs:
+            if not 0.0 < float(frac) <= 1.0:
+                raise ValueError(
+                    'layout.scale_fracs must be elevation fractions in '
+                    f'(0, 1], got {self.layout.scale_fracs}')
+        if self.layout.teacher_raw_path:
+            teacher_path = Path(self.layout.teacher_raw_path)
+            if not teacher_path.is_absolute():
+                teacher_path = Path(__file__).resolve().parents[1] / teacher_path
+            if not teacher_path.exists():
+                raise ValueError(
+                    f'layout.teacher_raw_path does not exist: '
+                    f'{self.layout.teacher_raw_path}')
 
     # -- serialization / overrides ------------------------------------------
 
@@ -540,6 +618,7 @@ class ExperimentConfig:
             'model': ModelConfig,
             'clip': ClipConfig,
             'sketch': SketchConfig,
+            'layout': MotifLayoutConfig,
             'optimizer': OptimizerConfig,
             'init': InitConfig,
             'run': RunConfig,
@@ -602,11 +681,34 @@ def venice_250214_motif_scale() -> ExperimentConfig:
         **{'clip.motif_scale_fracs': list(fracs), 'name': 'venice_250214_motif_scale'})
 
 
+def venice_250214_motif_layout() -> ExperimentConfig:
+    """Motif-scale CLIP decoration plus a teacher-derived layout scaffold.
+
+    The decorative CLIP path is :func:`venice_250214_motif_scale` (raw).
+    Layout is a separate occupancy prior distilled from a teacher field; it
+    is not a user sketch. Empty layout on :func:`venice_250214` stays
+    bit-identical to ``GOLDEN``.
+    """
+    return venice_250214_motif_scale().with_overrides({
+        'name': 'venice_250214_motif_layout',
+        'layout': {
+            'enabled': True,
+            'weight': 4000.0,
+            'weight_end': 400.0,
+            'threshold': 0.5,
+            'envelope_sigma_frac': 0.25,
+            'combine': 'max',
+            'init_from_teacher': True,
+        },
+    })
+
+
 PRESETS = {
     'venice_250214': venice_250214,
     'venice_250214_smoke': venice_250214_smoke,
     'smoke': venice_250214_smoke,
     'venice_250214_motif_scale': venice_250214_motif_scale,
+    'venice_250214_motif_layout': venice_250214_motif_layout,
 }
 
 
@@ -810,6 +912,8 @@ def _section_from_dict(section_cls, data: Mapping[str, Any]):
         kwargs['motif_scales'] = tuple(kwargs['motif_scales'])
     if section_cls is SketchConfig and 'patch_sizes' in kwargs:
         kwargs['patch_sizes'] = tuple(kwargs['patch_sizes'])
+    if section_cls is MotifLayoutConfig and 'scale_fracs' in kwargs:
+        kwargs['scale_fracs'] = tuple(kwargs['scale_fracs'])
     return section_cls(**kwargs)
 
 
