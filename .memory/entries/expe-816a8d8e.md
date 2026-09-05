@@ -15,7 +15,7 @@ files: neural_structural_optimization/models/loss_sketch.py@2c13e72, neural_stru
   script/resources/results/clip_motif_layout_no_occupancy/summary.json@2c13e72, script/resources/results/clip_motif_layout_no_occupancy/comparison.png@2c13e72
 session_id: sess-4872d00d
 created_at: '2026-09-05T22:34:16.969867+00:00'
-updated_at: '2026-09-05T22:34:16.969867+00:00'
+updated_at: '2026-09-05T22:34:25.510742+00:00'
 has_child_rationale: Completed teacher/student layout look against the raw motif teacher
   baseline.
 results: '[{"metric": "compliance", "value": 76.96536254882812, "split": "student-storey-member-scaffold",
@@ -38,5 +38,6 @@ results: '[{"metric": "compliance", "value": 76.96536254882812, "split": "studen
   80.04190063476562, "split": "teacher-motif-scale-no-occupancy", "source": "clip_motif_layout_no_occupancy/teacher/summary.json"},
   {"metric": "clip_loss_raw", "value": 0.747924268245697, "split": "teacher-motif-scale-no-occupancy",
   "source": "clip_motif_layout_no_occupancy/teacher/summary.json"}]'
+related_to: expe-2293aefa,expe-55c7caac
 ---
 Two-pass look at script/resources/results/clip_motif_layout_no_occupancy/. Teacher reused from this session's seed-12 motif-scale run (teacher/summary.json: compliance 80.0419, clip_loss_raw 0.7479, volume_actual 0.3220, mean density 0.3001, crop distances building/storey/member 0.3097/0.3577/0.3943) matching expe-2293aefa. Student: init from teacher, raw multi-scale CLIP on, storey+member soft scaffold annealed 4000 to 400. Converged in 57 steps (upsamples 12, 21). Recognizable jaw/teeth/skull language remains in student raw. Numeric gates held: mean physical density 0.3001, compliance 76.965 not worse than teacher 80.04. mass_on_scaffold 0.9994 at occupancy threshold 0.5; scaffold_mean 0.7668. Student clip_loss_raw 0.7701 vs teacher 0.7479; volume_actual 0.2931. Prior A/B dirs clip_motif_scale_no_occupancy and clip_motif_scale_physical_density_no_occupancy were not overwritten. Full suite 250 passed, 8 skipped.
