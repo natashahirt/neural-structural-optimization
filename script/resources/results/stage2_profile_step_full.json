@@ -1,0 +1,51 @@
+{
+  "preset": "venice_250214",
+  "grid": "128x256",
+  "num_augs": 32,
+  "device": "cpu",
+  "clip_model_name": "ViT-B/32",
+  "warmup": 1,
+  "repeats": 1,
+  "parts_s": {
+    "physics_forward": {
+      "mean_s": 0.457119191007223,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "clip_forward": {
+      "mean_s": 2.66134198801592,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "backward_combined": {
+      "mean_s": 4.079171234974638,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "optimizer_step": {
+      "mean_s": 0.0005262120394036174,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "physics_backward_only": {
+      "mean_s": 0.19543414999498054,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "clip_backward_only": {
+      "mean_s": 4.65102167398436,
+      "std_s": 0.0,
+      "n": 1
+    },
+    "combined_step": {
+      "mean_s": 8.662947248027194,
+      "std_s": 0.0,
+      "n": 1
+    }
+  },
+  "clip_share_s": 7.31236366200028,
+  "physics_share_s": 0.6525533410022035,
+  "combined_step_mean_s": 8.662947248027194,
+  "dominant": "clip",
+  "recommendation": "CLIP owns the step. Treat num_augs, encoder, and device as config before adding more crop scales. Do not start an analytic compliance VJP from this profile."
+}

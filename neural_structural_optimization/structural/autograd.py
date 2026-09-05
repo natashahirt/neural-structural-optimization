@@ -159,11 +159,15 @@ def scatter1d(nonzero_values, nonzero_indices, array_len):
   return u_values[index_map]
 
 
-@caching.ndarray_safe_lru_cache(1)
+# Forward+adjoint reuse needs at least 1. Stage 2 leftover: a metrics eval
+# (second env, volume check) used to evict the factorization and force a
+# full refactor. A small N is cheap insurance and matches get_k_indices.
+SOLVER_CACHE_MAXSIZE = 8
+
+
+@caching.ndarray_safe_lru_cache(SOLVER_CACHE_MAXSIZE)
 def _get_solver(a_entries, a_indices, size, sym_pos):
   """Get a solver for applying the desired matrix factorization."""
-  # A cache size of one is sufficient to avoid re-computing the factorization in
-  # the backwawrds pass.
   a = scipy.sparse.coo_matrix((a_entries, a_indices), shape=(size,)*2).tocsc()
   if sym_pos and HAS_CHOLMOD:
     return sksparse.cholmod.cholesky(a).solve_A
