@@ -113,6 +113,35 @@ def _clip_diy_weights(H: int, W: int, patch_fracs: Sequence[float], device=None,
     w = global_weight * w_global + local_weight * w_local
     return (w / w.sum()).detach()
 
+
+def physical_scale_boxes(
+        H: int, W: int, height_frac: float, count: int,
+        device=None, dtype=None) -> torch.Tensor:
+    """Square crop boxes whose side is ``height_frac`` of the image height.
+
+    ``height_frac`` is a fraction of elevation height (the long axis after
+    Venice's short-side resize), not of ``min(H,W)``. Centers lie on a
+    deterministic grid so a look is not a new random crop policy.
+    Returns ``[N,4]`` as (cx, cy, w, h) in pixels.
+    """
+    if count < 1:
+        raise ValueError(f'count must be >= 1, got {count}')
+    if not 0.0 < float(height_frac) <= 1.0:
+        raise ValueError(
+            f'height_frac must be in (0, 1], got {height_frac}')
+    size = int(round(H * float(height_frac)))
+    size = max(1, min(int(size), int(H), int(W)))
+    half = size / 2.0
+    n_side = max(1, int(math.ceil(math.sqrt(count))))
+    xs = torch.linspace(half, W - half, n_side, device=device, dtype=dtype)
+    ys = torch.linspace(half, H - half, n_side, device=device, dtype=dtype)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    cx = gx.reshape(-1)[:count]
+    cy = gy.reshape(-1)[:count]
+    w = torch.full_like(cx, float(size))
+    h = torch.full_like(cy, float(size))
+    return torch.stack([cx, cy, w, h], dim=1)
+
 def _seamless_edges_loss(x_img: torch.Tensor) -> torch.Tensor:
     """Encourage wrap-around continuity."""
     y = x_img.unsqueeze(0) if x_img.dim() == 3 else x_img
@@ -509,9 +538,11 @@ class CLIPLoss(nn.Module):
       - If image_prompt is provided -> image-to-image conv-feature loss.
       - Else -> image-to-text loss vs combined positive (and optional negatives).
 
-    Passing `venice_compat` swaps the whole forward pipeline for the legacy
+    Passing `venice_compat` swaps the primary forward pipeline for the legacy
     Venice one (see :class:`VeniceClipPath`); both paths remain selectable so
-    the two behaviors can be compared.
+    the two behaviors can be compared. ``motif_scale_fracs`` adds a *second*
+    text-CLIP path of elevation-fraction crops and does not replace Venice
+    RandomResizedCrop when that preset is on.
 
     On the default path `forward` consumes an already-[0, 1] physical density
     (`Model.get_semantic_loss` runs `physical_density` first). It does not
@@ -558,6 +589,9 @@ class CLIPLoss(nn.Module):
         # VENICE_CLIP_PRESET, or an explicit VeniceClipPreset. See
         # `_enable_venice_compat` for exactly what it replaces and disables.
         venice_compat: Optional[VeniceClipPreset | bool] = None,
+        motif_scale_fracs: Tuple[float, ...] = (),
+        motif_scale_crops: int = 4,
+        motif_scale_weight: float = 1.0,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -653,6 +687,21 @@ class CLIPLoss(nn.Module):
         preset = _coerce_venice_clip_preset(venice_compat)
         if preset is not None:
             self._enable_venice_compat(preset)
+
+        self.motif_scale_fracs = tuple(float(f) for f in motif_scale_fracs)
+        self.motif_scale_crops = int(motif_scale_crops)
+        self.motif_scale_weight = float(motif_scale_weight)
+        self.last_motif_scale_losses: dict[str, float] = {}
+        if self.motif_scale_crops < 1:
+            raise ValueError(
+                f'motif_scale_crops must be >= 1, got {self.motif_scale_crops}')
+        if self.motif_scale_weight < 0.0:
+            raise ValueError(
+                f'motif_scale_weight must be >= 0, got {self.motif_scale_weight}')
+        for frac in self.motif_scale_fracs:
+            if not 0.0 < frac <= 1.0:
+                raise ValueError(
+                    f'motif_scale_fracs must be in (0, 1], got {motif_scale_fracs}')
 
     # ---- legacy compatibility seam ----
     def _validate_venice_compat_prompts(self) -> None:
@@ -950,17 +999,78 @@ class CLIPLoss(nn.Module):
 
         return L_pos + L_neg + L_low
 
+    def _physical_motif_scale_loss(self, image: torch.Tensor) -> torch.Tensor:
+        """Text-CLIP loss on elevation-fraction crops, recorded per scale.
+
+        Uses the same prompt bank as the primary path. Does not silhouette-
+        match a sketch image. Crops are square windows of side
+        ``frac * H`` after any Venice short-side resize.
+        """
+        self.last_motif_scale_losses = {}
+        if not self.motif_scale_fracs or self.e_pos is None:
+            x = _ensure_nchw(image)
+            return x.new_tensor(0.0)
+
+        x = _to_clip_rgb(_ensure_nchw(image))
+        if self.venice_preset is not None:
+            x = _resize_short_side(x, self.venice_preset.resize_short_side)
+        _, _, H, W = x.shape
+        per_scale = []
+        for frac in self.motif_scale_fracs:
+            boxes = physical_scale_boxes(
+                H, W, frac, self.motif_scale_crops,
+                device=x.device, dtype=x.dtype)
+            grid = _affine_grid_from_boxes(
+                H, W, boxes, (self.clip_input_res, self.clip_input_res))
+            crops = F.grid_sample(
+                x.repeat(boxes.size(0), 1, 1, 1),
+                grid, mode='bilinear', align_corners=False)
+            if self.venice_path is not None:
+                z_img = self.venice_path._encode_crops(crops)
+                d = torch.norm(z_img - self.e_pos[None, :], dim=1)
+                if self.venice_preset.use_arcsin_transform:
+                    d = torch.arcsin(d.clamp(0.0, 2.0 - 1e-6) * 0.5) ** 2
+                scale_loss = d.mean()
+            else:
+                crops = _preprocess_image_for_clip(
+                    crops, self.clip_input_res, self.clip_mean, self.clip_std)
+                z_img = F.normalize(self.clip_encoder(crops).float(), dim=-1)
+                if self.use_arcsin_transform:
+                    dist = torch.norm(
+                        z_img - self.e_pos[None, :], dim=1
+                    ).clamp(0.0, 2.0 - 1e-6)
+                    scale_loss = (torch.arcsin(dist * 0.5) ** 2).mean()
+                else:
+                    cos = (z_img * self.e_pos[None, :]).sum(dim=1).clamp(
+                        -1 + 1e-6, 1 - 1e-6)
+                    scale_loss = (1.0 - cos).mean()
+            key = f'frac={frac:.4f}'
+            self.last_motif_scale_losses[key] = float(scale_loss.detach())
+            per_scale.append(scale_loss)
+        stacked = torch.stack(per_scale)
+        self.last_motif_scale_losses['mean'] = float(stacked.detach().mean())
+        return stacked.mean()
+
     def forward(self, image: torch.Tensor):
+        extra = self._physical_motif_scale_loss(image)
         if self.venice_path is not None:
             # Legacy path: raw logits in, no output scale, no auxiliary terms.
-            return self.venice_path(image, self._E_pos_bank, self._pos_weights)
+            # Physical-scale crops are an additive second path; they do not
+            # replace RandomResizedCrop.
+            loss = self.venice_path(image, self._E_pos_bank, self._pos_weights)
+            if self.motif_scale_fracs:
+                loss = loss + self.motif_scale_weight * extra
+            return loss
 
         # Canonical path: already-[0, 1] physical density, not logits.
         # Model.get_semantic_loss runs physical_density first; a second
         # sigmoid here would be a different field.
         input_image = _ensure_nchw(image)
         clip_image = _gaussian_blur(input_image, sigma=self.preblur_sigma) if self.preblur_sigma > 0 else input_image
-        loss = (self.evaluate_image_to_image(clip_image, self.image_prompt) 
-                if self.image_prompt is not None 
+        loss = (self.evaluate_image_to_image(clip_image, self.image_prompt)
+                if self.image_prompt is not None
                 else self.evaluate_image_to_text(clip_image, self.use_arcsin_transform))
-        return (loss + _seamless_edges_loss(input_image) * 0.15) * 100
+        loss = (loss + _seamless_edges_loss(input_image) * 0.15) * 100
+        if self.motif_scale_fracs:
+            loss = loss + self.motif_scale_weight * extra
+        return loss

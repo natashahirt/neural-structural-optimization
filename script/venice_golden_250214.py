@@ -157,6 +157,9 @@ def build_clip_loss(config: VeniceGoldenConfig = GOLDEN) -> CLIPLoss:
         positive_prompts=[config.prompt],
         num_augs=config.num_augs,
         venice_compat=venice_clip_preset(config),
+        motif_scale_fracs=config.motif_scale_fracs,
+        motif_scale_crops=config.motif_scale_crops,
+        motif_scale_weight=config.motif_scale_weight,
     )
 
 
@@ -370,7 +373,7 @@ def save_replay_images(ds: xarray.Dataset, output_dir: Path) -> tuple[Path, Path
 
 def trajectory(ds: xarray.Dataset) -> dict:
     """Extract the per-step term breakdown as plain lists, for saving."""
-    return {
+    payload = {
         'converged': bool(ds.attrs['converged']),
         'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
         'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
@@ -380,6 +383,14 @@ def trajectory(ds: xarray.Dataset) -> dict:
         'clip_weight': [float(v) for v in ds['clip_weight'].values],
         'total_loss': [float(v) for v in ds['loss'].values],
     }
+    motif = {
+        name: [float(v) for v in ds[name].values]
+        for name in ds.data_vars
+        if str(name).startswith('clip_motif_')
+    }
+    if motif:
+        payload.update(motif)
+    return payload
 
 
 def main() -> int:

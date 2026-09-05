@@ -45,6 +45,25 @@ KNOWN_MODEL_KINDS = ('adaptive_pixel', 'pixel', 'cnn')
 KNOWN_OPTIMIZER_KINDS = ('adaptive_adam', 'adam', 'lbfgs')
 
 
+def physical_motif_scale_fracs(
+        height: int, interval: int, *, member_elems: float = 16.0) -> tuple[float, float, float]:
+    """Elevation fractions for building / storey / member CLIP crops.
+
+    ``height`` is the final grid's vertical element count (nely). ``interval``
+    is the storey spacing in elements. Member size is ``min(interval/4,
+    member_elems)`` so a 256-tall, interval-64 elevation yields
+    ``(1.0, 0.25, 0.0625)``. These are fractions of elevation height, not of
+    ``min(H, W)`` image crops. AdaptivePixel grid changes do not substitute.
+    """
+    if height < 1 or interval < 1:
+        raise ValueError(
+            f'physical_motif_scale_fracs needs height>=1 and interval>=1, '
+            f'got height={height}, interval={interval}')
+    storey = float(interval) / float(height)
+    member = min(float(interval) / 4.0, float(member_elems)) / float(height)
+    return (1.0, storey, member)
+
+
 # ---------------------------------------------------------------------------
 # Venice golden knobs. Moved here from script/venice_golden_250214.py so a
 # config-only import does not load that script's CLIP/torch builders. Values
@@ -92,6 +111,13 @@ class VeniceGoldenConfig:
     seed: int = 12
     device: str = 'cpu'
     invert_image: bool = True
+
+    # Empty: Venice RandomResizedCrop path only. Non-empty installs a second
+    # CLIP path of physical-scale crops (building / storey / member fractions
+    # of elevation height). Not a silent change to the golden preset.
+    motif_scale_fracs: tuple[float, ...] = ()
+    motif_scale_crops: int = 4
+    motif_scale_weight: float = 1.0
 
 
 GOLDEN = VeniceGoldenConfig()
@@ -143,7 +169,12 @@ class ModelConfig:
 
 @dataclasses.dataclass(frozen=True)
 class ClipConfig:
-    """Semantic guidance. ``enabled`` False is a structure-only run."""
+    """Semantic guidance. ``enabled`` False is a structure-only run.
+
+    ``motif_scale_fracs`` is a second CLIP path: square crops whose side is
+    that fraction of elevation height (building / storey / member). Empty
+    keeps Venice RandomResizedCrop (or the default pyramid) alone.
+    """
 
     enabled: bool = False
     venice_compat: bool = False
@@ -152,6 +183,9 @@ class ClipConfig:
     prompts: tuple[str, ...] = ()
     num_augs: int = 24
     clip_resize_short_side: int = 512
+    motif_scale_fracs: tuple[float, ...] = ()
+    motif_scale_crops: int = 4
+    motif_scale_weight: float = 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -277,6 +311,9 @@ class ExperimentConfig:
                 prompts=(golden.prompt,),
                 num_augs=golden.num_augs,
                 clip_resize_short_side=golden.clip_resize_short_side,
+                motif_scale_fracs=golden.motif_scale_fracs,
+                motif_scale_crops=golden.motif_scale_crops,
+                motif_scale_weight=golden.motif_scale_weight,
             ),
             optimizer=OptimizerConfig(
                 kind='adaptive_adam',
@@ -324,6 +361,9 @@ class ExperimentConfig:
             prompt=self.clip.prompts[0],
             num_augs=self.clip.num_augs,
             clip_resize_short_side=self.clip.clip_resize_short_side,
+            motif_scale_fracs=self.clip.motif_scale_fracs,
+            motif_scale_crops=self.clip.motif_scale_crops,
+            motif_scale_weight=self.clip.motif_scale_weight,
             clip_alpha=self.optimizer.clip_alpha,
             compliance_weight=self.optimizer.compliance_weight,
             lr=self.optimizer.lr,
@@ -452,6 +492,19 @@ class ExperimentConfig:
         if self.sketch.blur_sigma < 0.0:
             raise ValueError(
                 f'sketch.blur_sigma must be >= 0, got {self.sketch.blur_sigma}')
+        if self.clip.motif_scale_crops < 1:
+            raise ValueError(
+                f'clip.motif_scale_crops must be >= 1, got '
+                f'{self.clip.motif_scale_crops}')
+        if self.clip.motif_scale_weight < 0.0:
+            raise ValueError(
+                f'clip.motif_scale_weight must be >= 0, got '
+                f'{self.clip.motif_scale_weight}')
+        for frac in self.clip.motif_scale_fracs:
+            if not 0.0 < float(frac) <= 1.0:
+                raise ValueError(
+                    'clip.motif_scale_fracs must be elevation fractions in '
+                    f'(0, 1], got {self.clip.motif_scale_fracs}')
         if self.sketch.path:
             sketch_path = Path(self.sketch.path)
             if not sketch_path.is_absolute():
@@ -537,9 +590,23 @@ def venice_250214_smoke() -> ExperimentConfig:
         SMOKE, name='venice_250214_smoke')
 
 
+def venice_250214_motif_scale() -> ExperimentConfig:
+    """Golden Venice CLIP plus a second physical-scale crop path.
+
+    The 250214 RandomResizedCrop pipeline is unchanged. Extra crops are
+    elevation fractions (whole building / storey / member), not sketch
+    silhouette matching.
+    """
+    fracs = physical_motif_scale_fracs(GOLDEN.height, GOLDEN.interval)
+    return venice_250214().with_overrides(
+        **{'clip.motif_scale_fracs': list(fracs), 'name': 'venice_250214_motif_scale'})
+
+
 PRESETS = {
     'venice_250214': venice_250214,
     'venice_250214_smoke': venice_250214_smoke,
+    'smoke': venice_250214_smoke,
+    'venice_250214_motif_scale': venice_250214_motif_scale,
 }
 
 
@@ -633,6 +700,11 @@ def cli_main(argv: Optional[Sequence[str]] = None) -> int:
         action='store_true',
         help='print known preset names and exit',
     )
+    parser.add_argument(
+        '--smoke',
+        action='store_true',
+        help='use venice_250214_smoke (coarse grid, few augs, few steps)',
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.list_presets:
@@ -640,7 +712,7 @@ def cli_main(argv: Optional[Sequence[str]] = None) -> int:
             print(name)
         return 0
 
-    if args.print_config is None and args.run_preset is None and args.json_path is None:
+    if args.print_config is None and args.run_preset is None and args.json_path is None and not args.smoke:
         parser.print_help()
         print('\nPresets:', ', '.join(sorted(PRESETS)))
         return 2
@@ -665,6 +737,8 @@ def cli_main(argv: Optional[Sequence[str]] = None) -> int:
 def _config_from_cli(args: argparse.Namespace) -> ExperimentConfig:
     if args.json_path:
         return ExperimentConfig.from_json(Path(args.json_path).read_text())
+    if args.smoke:
+        return preset('venice_250214_smoke')
     name = args.run_preset or args.print_config or 'venice_250214'
     return preset(name)
 
@@ -730,6 +804,8 @@ def _section_from_dict(section_cls, data: Mapping[str, Any]):
     kwargs = dict(data)
     if section_cls is ClipConfig and 'prompts' in kwargs:
         kwargs['prompts'] = tuple(kwargs['prompts'])
+    if section_cls is ClipConfig and 'motif_scale_fracs' in kwargs:
+        kwargs['motif_scale_fracs'] = tuple(kwargs['motif_scale_fracs'])
     if section_cls is SketchConfig and 'motif_scales' in kwargs:
         kwargs['motif_scales'] = tuple(kwargs['motif_scales'])
     if section_cls is SketchConfig and 'patch_sizes' in kwargs:

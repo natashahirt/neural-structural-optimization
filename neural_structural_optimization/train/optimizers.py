@@ -199,6 +199,40 @@ def _attach_loss_terms(ds: xarray.Dataset, terms) -> xarray.Dataset:
     return ds
 
 
+def _snapshot_motif_scale_losses(model) -> dict:
+    """Copy per-scale CLIP contributions recorded on the last forward."""
+    clip = getattr(model, 'clip_loss', None)
+    losses = getattr(clip, 'last_motif_scale_losses', None)
+    if not losses:
+        return {}
+    return {str(key): float(value) for key, value in losses.items()}
+
+
+def _motif_scale_column(key: str) -> str:
+    """Stable xarray name for a ``last_motif_scale_losses`` key."""
+    if key == 'mean':
+        return 'clip_motif_mean'
+    sanitized = (
+        str(key).replace('frac=', 'f').replace('.', 'p').replace('=', '_'))
+    return f'clip_motif_{sanitized}'
+
+
+def _attach_motif_scale_terms(ds: xarray.Dataset, snapshots) -> xarray.Dataset:
+    """Add per-scale CLIP columns when the second path ran. No-op if empty."""
+    if not snapshots or not any(snapshots):
+        return ds
+    keys = []
+    for snap in snapshots:
+        for key in snap:
+            if key not in keys:
+                keys.append(key)
+    for key in keys:
+        ds[_motif_scale_column(key)] = (
+            ('step',),
+            [float(snap.get(key, float('nan'))) for snap in snapshots])
+    return ds
+
+
 class Adam_Optimizer(BaseOptimizer):
     """Adam optimization algorithm."""
     
@@ -389,6 +423,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         # every other per-run field, so a second call is a fresh run rather
         # than an append onto the first. See `_reset_run_state`.
         self.loss_terms = []
+        self.motif_scale_terms = []
         self.converged = False
 
     def _compose_loss(self, logits) -> VeniceLossTerms:
@@ -465,6 +500,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         self.tracker.losses.clear()
         self.tracker.frames.clear()
         self.loss_terms = []
+        self.motif_scale_terms = []
         self.resize_steps = []
         self.converged = False
         self.model.prev_loss = INITIAL_PREV_LOSS
@@ -506,6 +542,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
             compliance_value = step_terms.compliance_loss
             self.tracker.add_step(step_terms.total_loss, logits.detach().cpu().numpy())
             self.loss_terms.append(step_terms)
+            self.motif_scale_terms.append(_snapshot_motif_scale_losses(model))
             stage_of_step.append(len(stage_envs) - 1)
             pbar.set_postfix({'compliance': f'{compliance_value:.4f}',
                               'grid': f'{model.shape[2]}x{model.shape[1]}'})
@@ -549,15 +586,17 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         """
         recorded = len(self.tracker.losses)
         if not (len(self.tracker.frames) == len(stage_of_step)
-                == len(self.loss_terms) == recorded):
+                == len(self.loss_terms) == len(self.motif_scale_terms)
+                == recorded):
             raise RuntimeError(
                 'per-step series disagree after the run: '
                 f'{recorded} losses, {len(self.tracker.frames)} frames, '
-                f'{len(stage_of_step)} stage labels and '
-                f'{len(self.loss_terms)} loss breakdowns. Every one of them is '
-                'appended once per gradient step, so a mismatch means state '
-                'from another run leaked in; `optimize` clears all of them '
-                'before it starts.')
+                f'{len(stage_of_step)} stage labels, '
+                f'{len(self.loss_terms)} loss breakdowns and '
+                f'{len(self.motif_scale_terms)} motif-scale snapshots. Every '
+                'one of them is appended once per gradient step, so a mismatch '
+                'means state from another run leaked in; `optimize` clears all '
+                'of them before it starts.')
 
         _, height, width = self.model.full_shape
         designs = [
@@ -577,6 +616,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
 
         ds = xarray.Dataset(data, coords={'step': np.arange(len(losses))})
         _attach_loss_terms(ds, self.loss_terms)
+        _attach_motif_scale_terms(ds, self.motif_scale_terms)
         ds.attrs['resize_steps'] = list(self.resize_steps)
         ds.attrs['converged'] = int(self.converged)
         return ds
