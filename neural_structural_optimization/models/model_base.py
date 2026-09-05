@@ -13,6 +13,11 @@ from neural_structural_optimization.structural.problems import (
 )
 from .loss_structural import StructuralLoss, PhysicalDensity
 from .loss_clip import CLIPLoss
+from .loss_sketch import (
+    load_site_mask,
+    sketch_mass_prior_loss,
+    sketch_motif_loss,
+)
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
 from neural_structural_optimization.structural import api as topo_api
@@ -176,6 +181,16 @@ class Model(nn.Module):
 
         object.__setattr__(self, "clip_loss", None)  # placeholder
         self.clip_weight_default = 1.0
+        # Stage 6 mass prior. None/0 keeps every loss path bit-identical to a
+        # no-sketch run (no extra PhysicalDensity eval, no extra term).
+        self.sketch_occupancy_full = None
+        self.sketch_weight = 0.0
+        self.sketch_weight_start = 0.0
+        self.sketch_weight_end = None
+        self.sketch_motif_weight = 0.0
+        self.sketch_motif_weight_peak = 0.0
+        self.sketch_motif_weight_end = None
+        self.sketch_motif_scales = (1, 2, 4)
         if clip_loss is not None:
             clip_loss.clip_model = (
                 clip_loss.clip_model.to(self.device).eval().requires_grad_(False)
@@ -374,6 +389,223 @@ class Model(nn.Module):
             return self.clip_loss(logits)
         return self.clip_loss(self.get_physical_density(logits))
 
+    def enable_sketch_prior(
+        self,
+        occupancy: torch.Tensor | np.ndarray,
+        weight: float = 1.0,
+        weight_end: Optional[float] = None,
+        motif_weight: float = 0.0,
+        motif_weight_end: Optional[float] = None,
+        motif_scales: Tuple[int, ...] = (1, 2, 4),
+    ) -> "Model":
+        """Pull the canonical physical density toward a sketch occupancy map.
+
+        Occupancy is stored at whatever grid it was loaded on (the full
+        problem size). ``get_sketch_loss`` resamples it onto the current
+        logits, so a coarse AdaptivePixel stage sees a downsampled prior
+        rather than a missing one.
+
+        Args:
+            occupancy: ``(H, W)`` or ``(1, H, W)`` values in ``[0, 1]``. Ink
+                is 1. Not a Parameter: the sketch does not train.
+            weight: Multiplier on :func:`sketch_mass_prior_loss` at the
+                start of a run (coarse AdaptivePixel stage, or step 0).
+                0 disables the term without clearing the map.
+            weight_end: If set, the multiplier anneals toward this value
+                (finest stage, or last step). ``None`` keeps ``weight``
+                constant.
+            motif_weight: Peak multiplier on the translation-invariant
+                sketch motif loss. AdaptivePixel keeps it off at the coarse
+                stage and reaches this value after the first upsample.
+            motif_weight_end: Motif multiplier at the finest stage. ``None``
+                keeps ``motif_weight`` after it turns on.
+            motif_scales: Positive pooling scales used by the motif descriptor.
+
+        Returns:
+            This model, for chaining.
+        """
+        occ = torch.as_tensor(occupancy, dtype=torch.float32)
+        if occ.ndim == 3 and occ.shape[0] == 1:
+            occ = occ[0]
+        if occ.ndim != 2:
+            raise ValueError(
+                f'sketch occupancy must be 2-D, got shape {tuple(occ.shape)}')
+        self.sketch_occupancy_full = occ.clamp(0.0, 1.0).cpu().contiguous()
+        self.sketch_weight_start = float(weight)
+        self.sketch_weight_end = (
+            None if weight_end is None else float(weight_end))
+        self.sketch_weight = float(weight)
+        self.sketch_motif_weight_peak = float(motif_weight)
+        self.sketch_motif_weight_end = (
+            None if motif_weight_end is None else float(motif_weight_end))
+        self.sketch_motif_weight = (
+            float(motif_weight) if not hasattr(self, 'resize_num') else 0.0)
+        self.sketch_motif_scales = tuple(int(scale) for scale in motif_scales)
+        return self
+
+    def sketch_weight_at(
+        self,
+        *,
+        step: int = 0,
+        max_iterations: int = 1,
+    ) -> float:
+        """Sketch multiplier for the current AdaptivePixel stage, or step.
+
+        AdaptivePixel: linear in ``resizes / resize_num`` so the coarse
+        grid gets ``sketch_weight_start`` and the finest gets
+        ``sketch_weight_end``. PixelModel (no schedule): linear in
+        ``step / (max_iterations - 1)``. ``weight_end is None`` is constant.
+        """
+        start = float(self.sketch_weight_start)
+        end = self.sketch_weight_end
+        if end is None:
+            return start
+        end = float(end)
+        resize_num = getattr(self, 'resize_num', None)
+        resizes = getattr(self, 'resizes', None)
+        if resize_num is not None and int(resize_num) > 0 and resizes is not None:
+            t = float(resizes) / float(resize_num)
+            return (1.0 - t) * start + t * end
+        denom = max(int(max_iterations) - 1, 1)
+        t = float(step) / float(denom)
+        t = min(max(t, 0.0), 1.0)
+        return (1.0 - t) * start + t * end
+
+    def apply_sketch_schedule(
+        self,
+        *,
+        step: int = 0,
+        max_iterations: int = 1,
+    ) -> float:
+        """Set spatial and motif sketch weights for this optimization step."""
+        if self.sketch_occupancy_full is None:
+            return float(self.sketch_weight)
+        weight = self.sketch_weight_at(
+            step=step, max_iterations=max_iterations)
+        self.sketch_weight = weight
+        peak = float(self.sketch_motif_weight_peak)
+        motif_end = (
+            peak if self.sketch_motif_weight_end is None
+            else float(self.sketch_motif_weight_end))
+        resize_num = getattr(self, 'resize_num', None)
+        resizes = getattr(self, 'resizes', None)
+        if resize_num is not None and int(resize_num) > 0 and resizes is not None:
+            # Establish global shape without a texture-style term. Turn the
+            # motif on after the first upsample, then ease it toward the final
+            # value so compliance can clean up local members.
+            if int(resizes) == 0:
+                self.sketch_motif_weight = 0.0
+            elif int(resizes) >= int(resize_num):
+                self.sketch_motif_weight = motif_end
+            else:
+                progress = (int(resizes) - 1) / max(int(resize_num) - 1, 1)
+                self.sketch_motif_weight = (
+                    (1.0 - progress) * peak + progress * motif_end)
+        else:
+            self.sketch_motif_weight = peak
+        return weight
+
+    def _sketch_prior_active(self) -> bool:
+        return (
+            self.sketch_occupancy_full is not None
+            and float(self.sketch_weight) != 0.0
+        )
+
+    def _sketch_motif_active(self) -> bool:
+        return (
+            self.sketch_occupancy_full is not None
+            and float(self.sketch_motif_weight) != 0.0
+        )
+
+    def _sketch_guidance_active(self) -> bool:
+        return self._sketch_prior_active() or self._sketch_motif_active()
+
+    def _occupancy_on_density(self, density: torch.Tensor) -> torch.Tensor:
+        """Resample stored occupancy onto ``density``'s spatial grid."""
+        occ = self.sketch_occupancy_full.to(
+            device=density.device, dtype=density.dtype)
+        height, width = int(density.shape[-2]), int(density.shape[-1])
+        if occ.shape[-2] != height or occ.shape[-1] != width:
+            occ = F.interpolate(
+                occ.view(1, 1, occ.shape[-2], occ.shape[-1]),
+                size=(height, width),
+                mode='bilinear',
+                align_corners=False,
+            ).view(height, width)
+        while occ.ndim < density.ndim:
+            occ = occ.unsqueeze(0)
+        return occ.expand_as(density)
+
+    def _load_sites_on_density(self, density: torch.Tensor) -> torch.Tensor:
+        """One element per loaded node, resampled onto ``density``'s grid."""
+        nely = int(self.env.args['nely'])
+        nelx = int(self.env.args['nelx'])
+        mask_np = load_site_mask(
+            self.env.args['forces'], nely=nely, nelx=nelx)
+        sites = torch.as_tensor(
+            mask_np, device=density.device, dtype=density.dtype)
+        height, width = int(density.shape[-2]), int(density.shape[-1])
+        if sites.shape[-2] != height or sites.shape[-1] != width:
+            sites = F.interpolate(
+                sites.view(1, 1, sites.shape[-2], sites.shape[-1]),
+                size=(height, width),
+                mode='nearest',
+            ).view(height, width)
+        while sites.ndim < density.ndim:
+            sites = sites.unsqueeze(0)
+        return sites.expand_as(density)
+
+    def get_sketch_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Unweighted mass-prior loss on the canonical physical density.
+
+        Template is occupancy ∪ load-application pixels. Returns a zero
+        tensor (no ``PhysicalDensity`` eval) when the prior is off, so a
+        Venice-preset run without a sketch stays bit-identical.
+        """
+        if not self._sketch_prior_active():
+            return logits.new_tensor(0.0)
+        density = self.get_physical_density(logits)
+        occupancy = self._occupancy_on_density(density)
+        load_sites = self._load_sites_on_density(density)
+        return sketch_mass_prior_loss(
+            density, occupancy, load_sites=load_sites)
+
+    def get_sketch_motif_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Unweighted, translation-invariant local motif loss."""
+        if self.sketch_occupancy_full is None:
+            return logits.new_tensor(0.0)
+        density = self.get_physical_density(logits)
+        occupancy = self._occupancy_on_density(density)
+        return sketch_motif_loss(
+            density, occupancy, scales=self.sketch_motif_scales)
+
+    def add_sketch_term(
+        self, loss: torch.Tensor, logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add ``sketch_weight * get_sketch_loss`` when the prior is on.
+
+        Identity when the prior is off. Optimizer paths that compose the
+        total by hand (Adam/LBFGS ``clip_alpha``, AdaptiveAdam's default
+        ``_compose_loss``) must call this; paths that already go through
+        ``get_total_loss`` / ``get_venice_compat_losses`` must not, or the
+        term is applied twice.
+        """
+        if not self._sketch_guidance_active():
+            return loss
+        # Normal composition computes the physical density once even when
+        # spatial and motif guidance are both active.
+        density = self.get_physical_density(logits)
+        occupancy = self._occupancy_on_density(density)
+        total = loss
+        if self._sketch_prior_active():
+            load_sites = self._load_sites_on_density(density)
+            total = total + float(self.sketch_weight) * sketch_mass_prior_loss(
+                density, occupancy, load_sites=load_sites)
+        if self._sketch_motif_active():
+            total = total + float(self.sketch_motif_weight) * sketch_motif_loss(
+                density, occupancy, scales=self.sketch_motif_scales)
+        return total
+
     def enable_venice_compat_loss(
         self,
         algebra: VeniceLossAlgebra | bool = True,
@@ -409,7 +641,7 @@ class Model(nn.Module):
         :data:`VENICE_LOSS_ALGEBRA`.
         """
         algebra = self.venice_loss_algebra or VENICE_LOSS_ALGEBRA
-        return venice_compat_total_loss(
+        terms = venice_compat_total_loss(
             self.get_structural_loss(logits),
             self.get_semantic_loss(logits),
             clip_alpha=algebra.clip_alpha if clip_alpha is None else clip_alpha,
@@ -417,6 +649,8 @@ class Model(nn.Module):
                 algebra.compliance_weight if compliance_weight is None else compliance_weight
             ),
         )
+        return terms._replace(
+            total_loss=self.add_sketch_term(terms.total_loss, logits))
 
     def get_total_loss(
         self, 
@@ -478,11 +712,12 @@ class Model(nn.Module):
         structural_loss_eff = structural_loss if compliance_weight is None else (structural_loss * float(compliance_weight))
         semantic_loss = self.get_semantic_loss(logits)
         if self.clip_loss is None:
-            return structural_loss_eff
+            return self.add_sketch_term(structural_loss_eff, logits)
         base_w = self.clip_weight_default if clip_weight is None else float(clip_weight)
         if dynamic_clip_alpha is not None:
             # Couple CLIP guidance to current (optionally scaled) compliance
             w_eff = float(dynamic_clip_alpha) * structural_loss_eff.detach()
         else:
             w_eff = base_w
-        return structural_loss_eff + semantic_loss * w_eff
+        return self.add_sketch_term(
+            structural_loss_eff + semantic_loss * w_eff, logits)

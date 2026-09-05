@@ -1,0 +1,450 @@
+"""Sketch occupancy and the spatial mass-prior loss (Stage 6).
+
+A sketch is not a silhouette to match and not a CLIP image. It is a map of
+where the *global* volume budget is encouraged to sit: dark ink becomes
+occupancy 1, paper and faint construction drop out under a threshold, and a
+differentiable loss pulls the canonical physical density toward that map.
+Load-application pixels are unioned in so a force never sits on punished
+void (that is catastrophically compliant and snaps the run back to the
+default frame). Physics still holds ``volfrac``; this term only
+redistributes the budget.
+
+The occupancy loader uses PIL only (no torchvision, no CLIP) so a config-only
+import path can stay free of those packages. The loss itself is a few tensor
+ops on an already-computed density.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, Sequence, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+
+# Repo-relative directory of the Stage 6 corpus. Copied from the Venice
+# sibling so a hardfork clone does not read across repositories at runtime.
+SKETCH_DIR = Path('script/resources/input_images/sketches')
+SKETCH_CORPUS = ('1.jpg', '3.jpg', '6.jpg', '9.jpg', '11.jpg', '12.jpg')
+
+# After invert, paper sits near 0 and ink near 1. Measured on the six-sketch
+# corpus: median ink is 0.00-0.13, so 0.40 drops faint grids / ghost
+# rectangles while keeping occupancy in roughly 0.13-0.32, around a 0.3
+# volfrac. Not Otsu -- a fixed cut so two machines agree.
+DEFAULT_OCCUPANCY_THRESHOLD = 0.40
+
+
+def load_sketch_occupancy(
+    path: Union[str, Path],
+    height: int,
+    width: int,
+    *,
+    invert: bool = True,
+    threshold: float = DEFAULT_OCCUPANCY_THRESHOLD,
+    blur_sigma: float = 0.0,
+) -> np.ndarray:
+    """Turn a sketch image into a ``(height, width)`` occupancy map in ``[0, 1]``.
+
+    Pipeline: grayscale ? resize to the design grid ? invert so ink is 1 ?
+    threshold so paper and faint construction become 0 ? optional Gaussian
+    blur so the prior is not a hard stencil.
+
+    Args:
+        path: Sketch file (JPEG or PNG).
+        height: Target rows (``nely``).
+        width: Target columns (``nelx``).
+        invert: Dark ink becomes occupancy 1. True for pencil-on-paper.
+        threshold: Cut on the inverted intensities. Below this is paper.
+        blur_sigma: Gaussian sigma in *target-grid* pixels. 0 keeps the
+            binary map.
+
+    Returns:
+        float32 array of shape ``(height, width)``.
+
+    Raises:
+        FileNotFoundError: if ``path`` does not exist.
+        ValueError: if height/width are not positive or threshold is outside
+            ``[0, 1]``.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f'Sketch not found: {path}')
+    if height < 1 or width < 1:
+        raise ValueError(f'occupancy grid must be positive, got {height}x{width}')
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError(f'threshold must be in [0, 1], got {threshold!r}')
+
+    # PIL resize takes (width, height). Bilinear matches the Venice image
+    # seed's resampling family; occupancy is a prior, not a parity pin, so
+    # this does not have to be the same operator as F.interpolate.
+    image = Image.open(path).convert('L').resize((width, height), Image.BILINEAR)
+    gray = np.asarray(image, dtype=np.float64) / 255.0
+    ink = (1.0 - gray) if invert else gray
+    occupancy = (ink >= float(threshold)).astype(np.float64)
+    if blur_sigma and float(blur_sigma) > 0.0:
+        from scipy.ndimage import gaussian_filter
+        occupancy = np.clip(gaussian_filter(occupancy, sigma=float(blur_sigma)), 0.0, 1.0)
+    return occupancy.astype(np.float32)
+
+
+def load_site_mask(
+    forces: np.ndarray,
+    nely: int,
+    nelx: int,
+) -> np.ndarray:
+    """Elements that correspond to nodes with a nonzero force (Fx or Fy).
+
+    Loads live on nodes ``(nelx+1, nely+1, 2)``; density lives on elements
+    ``(nely, nelx)``. Each loaded node ``(ix, iy)`` maps to one element by
+    clamping into the grid. No extra radius: a full-width floor becomes one
+    row, a point load becomes one pixel. Accepts raveled forces as stored on
+    ``env.args['forces']``.
+    """
+    nely = int(nely)
+    nelx = int(nelx)
+    arr = np.asarray(forces, dtype=np.float64)
+    expected = (nelx + 1) * (nely + 1) * 2
+    if arr.size != expected:
+        raise ValueError(
+            f'forces size {arr.size} does not match ({nelx}+1)*({nely}+1)*2 '
+            f'= {expected}')
+    arr = arr.reshape(nelx + 1, nely + 1, 2)
+    loaded = np.any(np.abs(arr) > 0.0, axis=2)
+    ix, iy = np.nonzero(loaded)
+    mask = np.zeros((nely, nelx), dtype=np.float32)
+    if ix.size == 0:
+        return mask
+    mask[np.clip(iy, 0, nely - 1), np.clip(ix, 0, nelx - 1)] = 1.0
+    return mask
+
+
+def sketch_mass_prior_loss(
+    density: torch.Tensor,
+    occupancy: torch.Tensor,
+    load_sites: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fraction of physical mass that sits *off* the allowed template.
+
+    The template is occupancy, optionally unioned with load-application
+    pixels: ``allowed = max(occupancy, load_sites)``. Loads on void are
+    catastrophically compliant, so those pixels must not be punished or the
+    optimizer snaps back to the default frame. Between load sites, only the
+    sketch is allowed.
+
+    ``(density * (1 - allowed)).sum() / density.sum()``. Volume is already
+    constrained by ``PhysicalDensity``.
+    """
+    dens = density.reshape(-1)
+    occ = occupancy.reshape(-1)
+    if dens.numel() != occ.numel():
+        raise ValueError(
+            f'density and occupancy must have the same number of cells, '
+            f'got {tuple(density.shape)} vs {tuple(occupancy.shape)}')
+    allowed = occ
+    if load_sites is not None:
+        sites = load_sites.reshape(-1)
+        if sites.numel() != dens.numel():
+            raise ValueError(
+                f'density and load_sites must have the same number of cells, '
+                f'got {tuple(density.shape)} vs {tuple(load_sites.shape)}')
+        allowed = torch.maximum(occ, sites)
+    mass = dens.sum().clamp_min(1e-12)
+    return (dens * (1.0 - allowed)).sum() / mass
+
+
+def _as_single_channel_field(field: torch.Tensor) -> torch.Tensor:
+    """Return ``field`` as ``(N, 1, H, W)`` without breaking gradients."""
+    if field.ndim == 2:
+        return field[None, None]
+    if field.ndim == 3:
+        return field[:, None]
+    if field.ndim == 4 and field.shape[1] == 1:
+        return field
+    raise ValueError(
+        f'motif field must be (H,W), (N,H,W), or (N,1,H,W), got '
+        f'{tuple(field.shape)}')
+
+
+def _orientation_kernels(*, device, dtype) -> torch.Tensor:
+    """Sobel-like horizontal, vertical, and two diagonal edge filters."""
+    kernels = torch.tensor(
+        [
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            [[0, 1, 2], [-1, 0, 1], [-2, -1, 0]],
+            [[-2, -1, 0], [-1, 0, 1], [0, 1, 2]],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    kernels = kernels / kernels.abs().sum(dim=(1, 2), keepdim=True)
+    return kernels[:, None]
+
+
+def _normalized_gram(features: torch.Tensor) -> torch.Tensor:
+    """Translation-invariant orientation co-occurrence statistics."""
+    batch, channels = features.shape[:2]
+    flat = features.reshape(batch, channels, -1)
+    gram = torch.bmm(flat, flat.transpose(1, 2))
+    gram = gram / flat.shape[-1]
+    scale = gram.diagonal(dim1=1, dim2=2).sum(dim=1, keepdim=True)
+    return (gram / scale.clamp_min(1e-8).unsqueeze(-1)).reshape(batch, -1)
+
+
+def _lag_correlations(features: torch.Tensor) -> torch.Tensor:
+    """Per-orientation autocorrelation at local axial and diagonal lags."""
+    correlations = []
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1), (0, 2), (2, 0)):
+        if dy >= features.shape[-2] or abs(dx) >= features.shape[-1]:
+            continue
+        if dx >= 0:
+            a = features[..., :features.shape[-2] - dy or None,
+                         :features.shape[-1] - dx or None]
+            b = features[..., dy:, dx:]
+        else:
+            shift = -dx
+            a = features[..., :features.shape[-2] - dy or None, shift:]
+            b = features[..., dy:, :features.shape[-1] - shift]
+        numerator = (a * b).sum(dim=(-2, -1))
+        denominator = (
+            a.square().sum(dim=(-2, -1))
+            * b.square().sum(dim=(-2, -1))
+        ).sqrt().clamp_min(1e-8)
+        correlations.append(numerator / denominator)
+    if not correlations:
+        return features.new_zeros((features.shape[0], 0))
+    return torch.cat(correlations, dim=1)
+
+
+def sketch_motif_descriptor(
+    field: torch.Tensor,
+    *,
+    scales: Sequence[int] = (1, 2, 4),
+) -> torch.Tensor:
+    """Describe local structural language independently of its location.
+
+    Fixed orientation filters turn the field into horizontal, vertical, and
+    diagonal edge maps. Their normalized Gram matrices and short-lag
+    autocorrelations capture orientation mixtures, branching/co-occurrence,
+    and repeated spacing. Blank regions contribute exactly zero edge energy,
+    so they cannot dominate the descriptor as empty patches would.
+    """
+    x = _as_single_channel_field(field)
+    kernels = _orientation_kernels(device=x.device, dtype=x.dtype)
+    descriptors = []
+    for raw_scale in scales:
+        scale = int(raw_scale)
+        if scale < 1:
+            raise ValueError(f'motif scales must be positive, got {raw_scale}')
+        scaled = x
+        if scale > 1:
+            if scale > min(x.shape[-2:]):
+                continue
+            scaled = F.avg_pool2d(x, kernel_size=scale, stride=scale)
+        features = F.conv2d(scaled, kernels, padding=1).abs()
+        orientation_mass = features.mean(dim=(-2, -1))
+        orientation_mass = orientation_mass / orientation_mass.sum(
+            dim=1, keepdim=True).clamp_min(1e-8)
+        descriptors.extend([
+            orientation_mass,
+            _normalized_gram(features),
+            _lag_correlations(features),
+        ])
+    if not descriptors:
+        raise ValueError(
+            f'no motif scale fits field shape {tuple(x.shape[-2:])}')
+    return torch.cat(descriptors, dim=1)
+
+
+def sketch_motif_loss(
+    density: torch.Tensor,
+    occupancy: torch.Tensor,
+    *,
+    scales: Sequence[int] = (1, 2, 4),
+) -> torch.Tensor:
+    """Match the drawing's local motif statistics, not its pixel locations.
+
+    The reference is sketch occupancy only. Load-only collector rows are
+    deliberately absent: they belong to the spatial ``allowed`` template,
+    not to the drawing's recurrent structural language.
+    """
+    dens = _as_single_channel_field(density)
+    occ = _as_single_channel_field(occupancy).to(
+        device=dens.device, dtype=dens.dtype)
+    if dens.shape[-2:] != occ.shape[-2:]:
+        raise ValueError(
+            f'density and occupancy motif grids must match, got '
+            f'{tuple(dens.shape[-2:])} vs {tuple(occ.shape[-2:])}')
+    if occ.shape[0] == 1 and dens.shape[0] != 1:
+        occ = occ.expand(dens.shape[0], -1, -1, -1)
+    if dens.shape[0] != occ.shape[0]:
+        raise ValueError(
+            f'density and occupancy motif batches must match, got '
+            f'{dens.shape[0]} vs {occ.shape[0]}')
+    density_descriptor = sketch_motif_descriptor(dens, scales=scales)
+    reference_descriptor = sketch_motif_descriptor(occ, scales=scales)
+    return F.mse_loss(density_descriptor, reference_descriptor)
+
+
+def mass_fraction_on_occupancy(
+    density: Union[np.ndarray, torch.Tensor],
+    occupancy: Union[np.ndarray, torch.Tensor],
+    *,
+    threshold: float = 0.5,
+) -> float:
+    """Share of mass on cells whose occupancy is at least ``threshold``.
+
+    Used by the Stage 6 gate (guided run vs no-sketch control). Detaches
+    tensors; this is a metric, not a loss.
+    """
+    dens = _as_numpy(density).reshape(-1).astype(np.float64)
+    occ = _as_numpy(occupancy).reshape(-1).astype(np.float64)
+    if dens.size != occ.size:
+        raise ValueError(
+            f'density and occupancy must have the same number of cells, '
+            f'got {dens.size} vs {occ.size}')
+    mask = occ >= float(threshold)
+    mass = dens.sum()
+    if mass <= 0.0:
+        return 0.0
+    return float((dens * mask).sum() / mass)
+
+
+def occupancy_to_uint8(occupancy: np.ndarray) -> np.ndarray:
+    """Occupancy 1 ? white (material encouragement), 0 ? black (paper)."""
+    occ = np.clip(np.asarray(occupancy, dtype=np.float64), 0.0, 1.0)
+    return (occ * 255.0).round().astype(np.uint8)
+
+
+def save_sketch_visual(
+    path: Union[str, Path],
+    panels: Sequence[np.ndarray],
+) -> Path:
+    """Write one or more ``(H, W)`` fields as a side-by-side grayscale PNG.
+
+    Each panel is independently min-max scaled into ``[0, 1]`` if it is not
+    already in that range, then converted with :func:`occupancy_to_uint8`.
+    A standing preference of this repo is that a design run always leaves a
+    visual, not just a scalar.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    images = []
+    for panel in panels:
+        arr = np.asarray(panel, dtype=np.float64)
+        if arr.ndim != 2:
+            arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f'panel must be 2-D after squeeze, got {arr.shape}')
+        peak = float(np.max(arr))
+        if peak > 1.0 + 1e-6 or float(np.min(arr)) < -1e-6:
+            lo, hi = float(np.min(arr)), peak
+            arr = (arr - lo) / (hi - lo + 1e-12)
+        images.append(Image.fromarray(occupancy_to_uint8(arr), mode='L'))
+    if not images:
+        raise ValueError('save_sketch_visual needs at least one panel')
+    if len(images) == 1:
+        images[0].save(path)
+        return path
+    height = max(im.height for im in images)
+    width = sum(im.width for im in images)
+    canvas = Image.new('L', (width, height), color=0)
+    x = 0
+    for im in images:
+        canvas.paste(im, (x, 0))
+        x += im.width
+    canvas.save(path)
+    return path
+
+
+def init_weight_with_occupancy(model, occupancy) -> torch.Tensor:
+    """Seed ``model.z`` from an occupancy map at the model's current grid.
+
+    Same contract as the Venice image seeder: pixel space, current
+    resolution, carried up by AdaptivePixel bilinear upsample. Nearest
+    resample so a binary occupancy stays binary on a coarse stage. Does
+    not go through the JPEG loader.
+    """
+    height, width = int(model.z.shape[-2]), int(model.z.shape[-1])
+    occ = np.asarray(occupancy, dtype=np.float32)
+    if occ.ndim == 3:
+        occ = np.squeeze(occ, axis=0)
+    if occ.ndim != 2:
+        raise ValueError(
+            f'occupancy must be 2-D after squeeze, got {occ.shape}')
+    field = torch.as_tensor(occ, dtype=torch.float32)
+    if field.shape[-2] != height or field.shape[-1] != width:
+        field = torch.nn.functional.interpolate(
+            field.view(1, 1, field.shape[-2], field.shape[-1]),
+            size=(height, width),
+            mode='nearest',
+        ).view(height, width)
+    image = field.clamp(0.0, 1.0).to(device=model.z.device)
+    if image.ndim == 2:
+        image = image.unsqueeze(0)
+    model.z = torch.nn.Parameter(image.contiguous(), requires_grad=True)
+    return model.z
+
+
+def apply_sketch_config(
+    model,
+    sketch,
+    *,
+    height: int,
+    width: int,
+    repo_root: Optional[Union[str, Path]] = None,
+):
+    """Load occupancy at the *full* problem grid and attach it to ``model``.
+
+    Coarse stages resample inside ``Model.get_sketch_loss``. ``sketch.path is
+    None`` is a no-op so a Venice-preset model stays bit-identical.
+
+    ``init_from_occupancy`` overwrites ``model.z`` with occupancy ? load
+    pixels at the *current* (possibly coarse) grid.
+    """
+    if getattr(sketch, 'path', None) is None:
+        return model
+    path = Path(sketch.path)
+    if not path.is_absolute():
+        root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+        path = root / path
+    occupancy = load_sketch_occupancy(
+        path,
+        height=int(height),
+        width=int(width),
+        invert=bool(sketch.invert),
+        threshold=float(sketch.threshold),
+        blur_sigma=float(sketch.blur_sigma),
+    )
+    weight_end = getattr(sketch, 'weight_end', None)
+    model.enable_sketch_prior(
+        occupancy,
+        weight=float(sketch.weight),
+        weight_end=weight_end,
+        motif_weight=float(getattr(sketch, 'motif_weight', 0.0)),
+        motif_weight_end=getattr(sketch, 'motif_weight_end', None),
+        motif_scales=tuple(getattr(sketch, 'motif_scales', (1, 2, 4))),
+    )
+    if getattr(sketch, 'init_from_occupancy', False):
+        nely = int(model.env.args['nely'])
+        nelx = int(model.env.args['nelx'])
+        sites = load_site_mask(
+            model.env.args['forces'], nely=nely, nelx=nelx)
+        occ_t = torch.as_tensor(occupancy, dtype=torch.float32)
+        if occ_t.shape[-2] != nely or occ_t.shape[-1] != nelx:
+            occ_t = torch.nn.functional.interpolate(
+                occ_t.view(1, 1, occ_t.shape[-2], occ_t.shape[-1]),
+                size=(nely, nelx),
+                mode='nearest',
+            ).view(nely, nelx)
+        allowed = np.maximum(occ_t.detach().cpu().numpy(), sites)
+        init_weight_with_occupancy(model, allowed)
+    return model
+
+
+def _as_numpy(value: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)

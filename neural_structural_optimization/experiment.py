@@ -186,6 +186,37 @@ class RunConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SketchConfig:
+    """Spatial mass prior from a cleaned sketch occupancy map.
+
+    ``path is None`` leaves the prior off: every loss path is bit-identical
+    to a no-sketch run. When set, the sketch is thresholded into occupancy
+    (ink = 1) and the canonical physical density is pulled toward that map.
+    Global ``volfrac`` still belongs to physics; this only says WHERE the
+    budget sits. Not a CLIP term and not a silhouette match.
+
+    ``weight`` is the multiplier at the start of a run (coarse AdaptivePixel
+    stage). ``weight_end`` anneals toward the finest stage; ``None`` keeps
+    ``weight`` constant. ``init_from_occupancy`` seeds ``z`` from occupancy
+    union load pixels at the current grid (overwriting any image seed).
+    ``motif_weight`` adds a location-independent local orientation and
+    autocorrelation match after the coarse stage; it is conditioned on the
+    drawing occupancy, not the load-only collector rows.
+    """
+
+    path: Optional[str] = None
+    invert: bool = True
+    threshold: float = 0.40
+    blur_sigma: float = 0.0
+    weight: float = 1.0
+    weight_end: Optional[float] = None
+    init_from_occupancy: bool = False
+    motif_weight: float = 0.0
+    motif_weight_end: Optional[float] = None
+    motif_scales: tuple[int, ...] = (1, 2, 4)
+
+
+@dataclasses.dataclass(frozen=True)
 class ExperimentConfig:
     """Immutable experiment. Sections compose existing objects; they do not
     invent a second density chain or a second loss algebra.
@@ -195,6 +226,7 @@ class ExperimentConfig:
     problem: ProblemConfig = dataclasses.field(default_factory=ProblemConfig)
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     clip: ClipConfig = dataclasses.field(default_factory=ClipConfig)
+    sketch: SketchConfig = dataclasses.field(default_factory=SketchConfig)
     optimizer: OptimizerConfig = dataclasses.field(default_factory=OptimizerConfig)
     init: InitConfig = dataclasses.field(default_factory=InitConfig)
     run: RunConfig = dataclasses.field(default_factory=RunConfig)
@@ -369,6 +401,39 @@ class ExperimentConfig:
         if self.clip.enabled and self.clip.venice_compat and not self.clip.prompts:
             raise ValueError(
                 'Venice CLIP needs at least one prompt; clip.prompts is empty.')
+        if self.sketch.weight < 0.0:
+            raise ValueError(
+                f'sketch.weight must be >= 0, got {self.sketch.weight}')
+        if self.sketch.weight_end is not None and self.sketch.weight_end < 0.0:
+            raise ValueError(
+                f'sketch.weight_end must be >= 0, got {self.sketch.weight_end}')
+        if self.sketch.motif_weight < 0.0:
+            raise ValueError(
+                f'sketch.motif_weight must be >= 0, got '
+                f'{self.sketch.motif_weight}')
+        if (self.sketch.motif_weight_end is not None
+                and self.sketch.motif_weight_end < 0.0):
+            raise ValueError(
+                f'sketch.motif_weight_end must be >= 0, got '
+                f'{self.sketch.motif_weight_end}')
+        if (not self.sketch.motif_scales
+                or any(int(scale) < 1 for scale in self.sketch.motif_scales)):
+            raise ValueError(
+                f'sketch.motif_scales must contain positive integers, got '
+                f'{self.sketch.motif_scales}')
+        if not 0.0 <= self.sketch.threshold <= 1.0:
+            raise ValueError(
+                f'sketch.threshold must be in [0, 1], got {self.sketch.threshold}')
+        if self.sketch.blur_sigma < 0.0:
+            raise ValueError(
+                f'sketch.blur_sigma must be >= 0, got {self.sketch.blur_sigma}')
+        if self.sketch.path:
+            sketch_path = Path(self.sketch.path)
+            if not sketch_path.is_absolute():
+                sketch_path = Path(__file__).resolve().parents[1] / sketch_path
+            if not sketch_path.exists():
+                raise ValueError(
+                    f'sketch.path does not exist: {self.sketch.path}')
 
     # -- serialization / overrides ------------------------------------------
 
@@ -396,6 +461,7 @@ class ExperimentConfig:
             'problem': ProblemConfig,
             'model': ModelConfig,
             'clip': ClipConfig,
+            'sketch': SketchConfig,
             'optimizer': OptimizerConfig,
             'init': InitConfig,
             'run': RunConfig,
@@ -639,6 +705,8 @@ def _section_from_dict(section_cls, data: Mapping[str, Any]):
     kwargs = dict(data)
     if section_cls is ClipConfig and 'prompts' in kwargs:
         kwargs['prompts'] = tuple(kwargs['prompts'])
+    if section_cls is SketchConfig and 'motif_scales' in kwargs:
+        kwargs['motif_scales'] = tuple(kwargs['motif_scales'])
     return section_cls(**kwargs)
 
 
