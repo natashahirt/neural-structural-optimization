@@ -9,6 +9,13 @@ unless explicitly requested.
     PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --corpus
 
 Writes labeled panels under ``script/resources/results/stage6_sketch<id>_init_anneal/``.
+
+Pass ``--motif-scale`` to keep that occupancy recipe and add the physical-scale
+CLIP path (building / storey / member elevation fractions). That writes under
+``script/resources/results/clip_motif_scale_sketch<id>/`` and does not overwrite
+the Stage 6 selected look.
+
+    PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --sketch 12 --motif-scale
 """
 
 from __future__ import annotations
@@ -26,7 +33,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from neural_structural_optimization.experiment import GOLDEN, SketchConfig
+from neural_structural_optimization.experiment import (
+    GOLDEN,
+    SketchConfig,
+    venice_250214_motif_scale,
+)
 from neural_structural_optimization.models.loss_sketch import (
     SKETCH_CORPUS,
     SKETCH_DIR,
@@ -108,10 +119,37 @@ def _sketch_rel(name: str) -> Path:
     return SKETCH_DIR / name
 
 
-def _output_dir_for(name: str) -> Path:
+def _output_dir_for(name: str, *, motif_scale: bool = False) -> Path:
+    stem = _sketch_stem(name)
+    folder = (
+        f'clip_motif_scale_sketch{stem}'
+        if motif_scale else
+        f'stage6_sketch{stem}_init_anneal')
+    return REPO_ROOT / 'script' / 'resources' / 'results' / folder
+
+
+def _stage6_baseline_run(name: str) -> Path:
     return (
         REPO_ROOT / 'script' / 'resources' / 'results'
-        / f'stage6_sketch{_sketch_stem(name)}_init_anneal')
+        / 'SUCCESS_sketch_to_structure'
+        / f'stage6_sketch{_sketch_stem(name)}_init_anneal'
+        / 'sketch_run.png')
+
+
+def _clip_config(*, motif_scale: bool):
+    if motif_scale:
+        return venice_250214_motif_scale().to_venice_golden()
+    return GOLDEN
+
+
+def _last_clip_motif_terms(ds) -> dict:
+    """Final-step per-scale CLIP columns, if the second path ran."""
+    out = {}
+    for name in ds.data_vars:
+        key = str(name)
+        if key.startswith('clip_motif_'):
+            out[key] = float(ds[name][-1])
+    return out
 
 
 def _occupancy(name: str) -> np.ndarray:
@@ -171,6 +209,7 @@ def run_sketch_on_golden(
     sketch_weight_end: float = DEFAULT_SKETCH_WEIGHT_END,
     output_dir: Path | None = None,
     comparisons: tuple[tuple[str, Path], ...] = (),
+    motif_scale: bool = False,
 ) -> dict:
     import torch
 
@@ -178,14 +217,15 @@ def run_sketch_on_golden(
 
     sketch_name = _sketch_name(sketch_name)
     stem = _sketch_stem(sketch_name)
+    config = _clip_config(motif_scale=motif_scale)
     if output_dir is None:
-        output_dir = _output_dir_for(sketch_name)
+        output_dir = _output_dir_for(sketch_name, motif_scale=motif_scale)
 
     golden = _load_golden_script()
     configure_torch_threads()
-    clip_loss = golden.build_clip_loss(GOLDEN)
-    golden.seed_everything(GOLDEN.seed)
-    model = golden.build_model(clip_loss, GOLDEN)
+    clip_loss = golden.build_clip_loss(config)
+    golden.seed_everything(config.seed)
+    model = golden.build_model(clip_loss, config)
     apply_sketch_config(
         model,
         SketchConfig(
@@ -194,13 +234,13 @@ def run_sketch_on_golden(
             weight_end=sketch_weight_end,
             init_from_occupancy=True,
         ),
-        height=GOLDEN.height,
-        width=GOLDEN.width,
+        height=config.height,
+        width=config.width,
         repo_root=REPO_ROOT,
     )
-    golden.seed_everything(GOLDEN.seed)
+    golden.seed_everything(config.seed)
     ds = golden.attach_final_raw_design(
-        golden.build_optimizer(model, GOLDEN).optimize(), model)
+        golden.build_optimizer(model, config).optimize(), model)
 
     occupancy = _occupancy(sketch_name)
     density = model.get_physical_density(model()).detach().cpu().numpy()
@@ -268,6 +308,10 @@ def run_sketch_on_golden(
         'sketch_weight_start': DEFAULT_SKETCH_WEIGHT,
         'sketch_weight_end': sketch_weight_end,
         'init_from_occupancy': True,
+        'motif_scale': motif_scale,
+        'motif_scale_fracs': list(config.motif_scale_fracs),
+        'motif_scale_crops': config.motif_scale_crops,
+        'motif_scale_weight': config.motif_scale_weight,
         'mass_on_occupancy': mass_fraction_on_occupancy(density, occupancy),
         'mass_on_allowed': mass_fraction_on_occupancy(density, allowed),
         'spatial_mass_loss': spatial_mass_loss,
@@ -279,6 +323,7 @@ def run_sketch_on_golden(
         'compliance': float(ds['compliance'][-1]),
         'clip_loss': float(ds['clip_loss'][-1]),
         'total_loss': float(ds['loss'][-1]),
+        **_last_clip_motif_terms(ds),
         'paths': {
             'replay': str(replay_path),
             'density': str(density_path),
@@ -341,6 +386,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar='LABEL=PATH',
         help='add a labeled prior run to comparison.png',
     )
+    parser.add_argument(
+        '--motif-scale',
+        action='store_true',
+        help=(
+            'add physical-scale CLIP crops (building/storey/member) on top of '
+            'Venice RandomResizedCrop; writes to clip_motif_scale_sketch<id>/'),
+    )
     args = parser.parse_args(argv)
     if args.weight_end < 0:
         parser.error('weights must be non-negative')
@@ -362,22 +414,33 @@ def main(argv: list[str] | None = None) -> int:
         comparisons.append((label, path))
     summaries = []
     for name in sketches:
-        output_dir = args.output_dir or _output_dir_for(name)
+        output_dir = args.output_dir or _output_dir_for(
+            name, motif_scale=args.motif_scale)
         if not output_dir.is_absolute():
             output_dir = REPO_ROOT / output_dir
+        sketch_comparisons = list(comparisons)
+        if args.motif_scale:
+            baseline = _stage6_baseline_run(name)
+            if baseline.is_file() and all(path != baseline for _, path in sketch_comparisons):
+                sketch_comparisons.append(('Stage 6 occupancy init', baseline))
         paths = save_occupancy_preview(output_dir, name)
         print(f'Wrote occupancy to {paths["occupancy"]}')
         print(f'Wrote occupancy vs reference to {paths["preview"]}')
         if args.occupancy_only:
             continue
+        extra = (
+            ', motif-scale CLIP on'
+            if args.motif_scale else '')
         print(
             f'Running Venice 250214 skeletons + sketch {Path(name).stem} '
-            f'(init occupancy, {DEFAULT_SKETCH_WEIGHT}->{args.weight_end})...')
+            f'(init occupancy, {DEFAULT_SKETCH_WEIGHT}->{args.weight_end}'
+            f'{extra})...')
         summary = run_sketch_on_golden(
             sketch_name=name,
             sketch_weight_end=args.weight_end,
             output_dir=output_dir,
-            comparisons=tuple(comparisons),
+            comparisons=tuple(sketch_comparisons),
+            motif_scale=args.motif_scale,
         )
         print(json.dumps(summary, indent=2))
         summaries.append(summary)
