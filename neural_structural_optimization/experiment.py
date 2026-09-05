@@ -202,6 +202,8 @@ class SketchConfig:
     ``motif_weight`` adds a location-independent local orientation and
     autocorrelation match after the coarse stage; it is conditioned on the
     drawing occupancy, not the load-only collector rows.
+    ``patch_weight`` optionally adds a stronger local patch-vocabulary match
+    with the same stage shape.
     """
 
     path: Optional[str] = None
@@ -214,6 +216,10 @@ class SketchConfig:
     motif_weight: float = 0.0
     motif_weight_end: Optional[float] = None
     motif_scales: tuple[int, ...] = (1, 2, 4)
+    patch_weight: float = 0.0
+    patch_weight_end: Optional[float] = None
+    patch_sizes: tuple[int, ...] = (7, 15)
+    patch_stride: int = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -421,6 +427,25 @@ class ExperimentConfig:
             raise ValueError(
                 f'sketch.motif_scales must contain positive integers, got '
                 f'{self.sketch.motif_scales}')
+        if self.sketch.patch_weight < 0.0:
+            raise ValueError(
+                f'sketch.patch_weight must be >= 0, got '
+                f'{self.sketch.patch_weight}')
+        if (self.sketch.patch_weight_end is not None
+                and self.sketch.patch_weight_end < 0.0):
+            raise ValueError(
+                f'sketch.patch_weight_end must be >= 0, got '
+                f'{self.sketch.patch_weight_end}')
+        if (not self.sketch.patch_sizes
+                or any(int(size) < 3 or int(size) % 2 == 0
+                       for size in self.sketch.patch_sizes)):
+            raise ValueError(
+                f'sketch.patch_sizes must contain odd integers >= 3, got '
+                f'{self.sketch.patch_sizes}')
+        if int(self.sketch.patch_stride) < 1:
+            raise ValueError(
+                f'sketch.patch_stride must be >= 1, got '
+                f'{self.sketch.patch_stride}')
         if not 0.0 <= self.sketch.threshold <= 1.0:
             raise ValueError(
                 f'sketch.threshold must be in [0, 1], got {self.sketch.threshold}')
@@ -707,6 +732,8 @@ def _section_from_dict(section_cls, data: Mapping[str, Any]):
         kwargs['prompts'] = tuple(kwargs['prompts'])
     if section_cls is SketchConfig and 'motif_scales' in kwargs:
         kwargs['motif_scales'] = tuple(kwargs['motif_scales'])
+    if section_cls is SketchConfig and 'patch_sizes' in kwargs:
+        kwargs['patch_sizes'] = tuple(kwargs['patch_sizes'])
     return section_cls(**kwargs)
 
 

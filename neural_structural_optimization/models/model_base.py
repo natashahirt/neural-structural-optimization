@@ -17,6 +17,7 @@ from .loss_sketch import (
     load_site_mask,
     sketch_mass_prior_loss,
     sketch_motif_loss,
+    sketch_patch_vocabulary_loss,
 )
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
@@ -191,6 +192,11 @@ class Model(nn.Module):
         self.sketch_motif_weight_peak = 0.0
         self.sketch_motif_weight_end = None
         self.sketch_motif_scales = (1, 2, 4)
+        self.sketch_patch_weight = 0.0
+        self.sketch_patch_weight_peak = 0.0
+        self.sketch_patch_weight_end = None
+        self.sketch_patch_sizes = (7, 15)
+        self.sketch_patch_stride = 2
         if clip_loss is not None:
             clip_loss.clip_model = (
                 clip_loss.clip_model.to(self.device).eval().requires_grad_(False)
@@ -397,6 +403,10 @@ class Model(nn.Module):
         motif_weight: float = 0.0,
         motif_weight_end: Optional[float] = None,
         motif_scales: Tuple[int, ...] = (1, 2, 4),
+        patch_weight: float = 0.0,
+        patch_weight_end: Optional[float] = None,
+        patch_sizes: Tuple[int, ...] = (7, 15),
+        patch_stride: int = 2,
     ) -> "Model":
         """Pull the canonical physical density toward a sketch occupancy map.
 
@@ -420,6 +430,11 @@ class Model(nn.Module):
             motif_weight_end: Motif multiplier at the finest stage. ``None``
                 keeps ``motif_weight`` after it turns on.
             motif_scales: Positive pooling scales used by the motif descriptor.
+            patch_weight: Peak multiplier for local patch-vocabulary matching.
+            patch_weight_end: Patch multiplier at the finest stage. ``None``
+                keeps ``patch_weight`` after it turns on.
+            patch_sizes: Odd local patch widths used by vocabulary matching.
+            patch_stride: Spatial stride used when extracting vocabulary patches.
 
         Returns:
             This model, for chaining.
@@ -441,6 +456,13 @@ class Model(nn.Module):
         self.sketch_motif_weight = (
             float(motif_weight) if not hasattr(self, 'resize_num') else 0.0)
         self.sketch_motif_scales = tuple(int(scale) for scale in motif_scales)
+        self.sketch_patch_weight_peak = float(patch_weight)
+        self.sketch_patch_weight_end = (
+            None if patch_weight_end is None else float(patch_weight_end))
+        self.sketch_patch_weight = (
+            float(patch_weight) if not hasattr(self, 'resize_num') else 0.0)
+        self.sketch_patch_sizes = tuple(int(size) for size in patch_sizes)
+        self.sketch_patch_stride = int(patch_stride)
         return self
 
     def sketch_weight_at(
@@ -503,6 +525,21 @@ class Model(nn.Module):
                     (1.0 - progress) * peak + progress * motif_end)
         else:
             self.sketch_motif_weight = peak
+        patch_peak = float(self.sketch_patch_weight_peak)
+        patch_end = (
+            patch_peak if self.sketch_patch_weight_end is None
+            else float(self.sketch_patch_weight_end))
+        if resize_num is not None and int(resize_num) > 0 and resizes is not None:
+            if int(resizes) == 0:
+                self.sketch_patch_weight = 0.0
+            elif int(resizes) >= int(resize_num):
+                self.sketch_patch_weight = patch_end
+            else:
+                progress = (int(resizes) - 1) / max(int(resize_num) - 1, 1)
+                self.sketch_patch_weight = (
+                    (1.0 - progress) * patch_peak + progress * patch_end)
+        else:
+            self.sketch_patch_weight = patch_peak
         return weight
 
     def _sketch_prior_active(self) -> bool:
@@ -517,8 +554,18 @@ class Model(nn.Module):
             and float(self.sketch_motif_weight) != 0.0
         )
 
+    def _sketch_patch_active(self) -> bool:
+        return (
+            self.sketch_occupancy_full is not None
+            and float(self.sketch_patch_weight) != 0.0
+        )
+
     def _sketch_guidance_active(self) -> bool:
-        return self._sketch_prior_active() or self._sketch_motif_active()
+        return (
+            self._sketch_prior_active()
+            or self._sketch_motif_active()
+            or self._sketch_patch_active()
+        )
 
     def _occupancy_on_density(self, density: torch.Tensor) -> torch.Tensor:
         """Resample stored occupancy onto ``density``'s spatial grid."""
@@ -579,6 +626,21 @@ class Model(nn.Module):
         return sketch_motif_loss(
             density, occupancy, scales=self.sketch_motif_scales)
 
+    def get_sketch_patch_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Unweighted, translation-invariant patch-vocabulary loss."""
+        if self.sketch_occupancy_full is None:
+            return logits.new_tensor(0.0)
+        density = self.get_physical_density(logits)
+        occupancy = self._occupancy_on_density(density)
+        load_sites = self._load_sites_on_density(density)
+        return sketch_patch_vocabulary_loss(
+            density,
+            occupancy,
+            load_sites=load_sites,
+            patch_sizes=self.sketch_patch_sizes,
+            stride=self.sketch_patch_stride,
+        )
+
     def add_sketch_term(
         self, loss: torch.Tensor, logits: torch.Tensor,
     ) -> torch.Tensor:
@@ -597,13 +659,26 @@ class Model(nn.Module):
         density = self.get_physical_density(logits)
         occupancy = self._occupancy_on_density(density)
         total = loss
-        if self._sketch_prior_active():
+        load_sites = None
+        if self._sketch_prior_active() or self._sketch_patch_active():
             load_sites = self._load_sites_on_density(density)
+        if self._sketch_prior_active():
             total = total + float(self.sketch_weight) * sketch_mass_prior_loss(
                 density, occupancy, load_sites=load_sites)
         if self._sketch_motif_active():
             total = total + float(self.sketch_motif_weight) * sketch_motif_loss(
                 density, occupancy, scales=self.sketch_motif_scales)
+        if self._sketch_patch_active():
+            total = (
+                total
+                + float(self.sketch_patch_weight) * sketch_patch_vocabulary_loss(
+                    density,
+                    occupancy,
+                    load_sites=load_sites,
+                    patch_sizes=self.sketch_patch_sizes,
+                    stride=self.sketch_patch_stride,
+                )
+            )
         return total
 
     def enable_venice_compat_loss(

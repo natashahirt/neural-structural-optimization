@@ -288,6 +288,138 @@ def sketch_motif_loss(
     return F.mse_loss(density_descriptor, reference_descriptor)
 
 
+def _sample_patch_columns(
+    patches: torch.Tensor,
+    valid: torch.Tensor,
+    limit: int,
+) -> torch.Tensor:
+    """Select evenly spaced valid patch columns deterministically."""
+    indices = torch.nonzero(valid, as_tuple=False).flatten()
+    if indices.numel() > int(limit):
+        positions = torch.linspace(
+            0, indices.numel() - 1, int(limit), device=indices.device)
+        indices = indices[positions.long()]
+    return patches[:, indices]
+
+
+def _normalized_patch_vocabulary(
+    field: torch.Tensor,
+    *,
+    patch_size: int,
+    stride: int,
+    limit: int,
+) -> torch.Tensor:
+    """Extract nonblank, contrast-normalized patches as vocabulary rows."""
+    patches = F.unfold(
+        field,
+        kernel_size=patch_size,
+        padding=patch_size // 2,
+        stride=stride,
+    )
+    # Motif runs use one structural design at a time. Flattening batch into
+    # columns keeps the helper general without introducing batch pairings.
+    patches = patches.permute(1, 0, 2).reshape(patches.shape[1], -1)
+    means = patches.mean(dim=0, keepdim=True)
+    centered = patches - means
+    contrast = centered.square().mean(dim=0).sqrt()
+    mass = means[0]
+    valid = (
+        (mass.detach() > 0.02)
+        & (mass.detach() < 0.98)
+        & (contrast.detach() > 0.025)
+    )
+    selected = _sample_patch_columns(centered, valid, limit)
+    if selected.shape[1] == 0:
+        return selected.transpose(0, 1)
+    normalized = selected / selected.square().sum(
+        dim=0, keepdim=True).sqrt().clamp_min(1e-6)
+    return normalized.transpose(0, 1)
+
+
+def sketch_patch_vocabulary_loss(
+    density: torch.Tensor,
+    occupancy: torch.Tensor,
+    load_sites: Optional[torch.Tensor] = None,
+    *,
+    patch_sizes: Sequence[int] = (7, 15),
+    stride: int = 2,
+    temperature: float = 0.01,
+    max_design_patches: int = 1024,
+    max_reference_patches: int = 256,
+) -> torch.Tensor:
+    """Softly match local design patches to the sketch's patch vocabulary.
+
+    Unlike global Gram statistics, this asks each sampled nonblank design
+    patch to resemble an actual nonblank drawing patch, while the reverse
+    direction keeps the drawing's vocabulary represented. Patch positions are
+    discarded, so matching remains translation-invariant. Required load-only
+    pixels are removed from the design descriptor and never enter the
+    reference vocabulary; the loss therefore does not fight collector rows.
+    """
+    dens = _as_single_channel_field(density)
+    occ = _as_single_channel_field(occupancy).to(
+        device=dens.device, dtype=dens.dtype)
+    if dens.shape != occ.shape:
+        if occ.shape[0] == 1 and dens.shape[0] != 1:
+            occ = occ.expand(dens.shape[0], -1, -1, -1)
+        if dens.shape != occ.shape:
+            raise ValueError(
+                f'density and occupancy patch grids must match, got '
+                f'{tuple(dens.shape)} vs {tuple(occ.shape)}')
+    design = dens
+    if load_sites is not None:
+        sites = _as_single_channel_field(load_sites).to(
+            device=dens.device, dtype=dens.dtype)
+        if sites.shape[0] == 1 and dens.shape[0] != 1:
+            sites = sites.expand(dens.shape[0], -1, -1, -1)
+        if sites.shape != dens.shape:
+            raise ValueError(
+                f'density and load_sites patch grids must match, got '
+                f'{tuple(dens.shape)} vs {tuple(sites.shape)}')
+        load_only = sites * (occ < 0.5).to(dens.dtype)
+        design = dens * (1.0 - load_only)
+
+    if int(stride) < 1:
+        raise ValueError(f'patch stride must be positive, got {stride}')
+    if float(temperature) <= 0.0:
+        raise ValueError(
+            f'patch temperature must be positive, got {temperature}')
+    losses = []
+    for raw_size in patch_sizes:
+        size = int(raw_size)
+        if size < 3 or size % 2 == 0:
+            raise ValueError(
+                f'patch sizes must be odd integers >= 3, got {raw_size}')
+        if size > min(dens.shape[-2:]):
+            continue
+        design_patches = _normalized_patch_vocabulary(
+            design,
+            patch_size=size,
+            stride=int(stride),
+            limit=int(max_design_patches),
+        )
+        reference_patches = _normalized_patch_vocabulary(
+            occ,
+            patch_size=size,
+            stride=int(stride),
+            limit=int(max_reference_patches),
+        )
+        if design_patches.shape[0] == 0 or reference_patches.shape[0] == 0:
+            continue
+        similarity = design_patches @ reference_patches.transpose(0, 1)
+        design_best = (
+            torch.softmax(similarity / temperature, dim=1) * similarity
+        ).sum(dim=1)
+        reference_best = (
+            torch.softmax(similarity / temperature, dim=0) * similarity
+        ).sum(dim=0)
+        losses.append(
+            1.0 - 0.5 * (design_best.mean() + reference_best.mean()))
+    if not losses:
+        return dens.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
 def mass_fraction_on_occupancy(
     density: Union[np.ndarray, torch.Tensor],
     occupancy: Union[np.ndarray, torch.Tensor],
@@ -426,6 +558,10 @@ def apply_sketch_config(
         motif_weight=float(getattr(sketch, 'motif_weight', 0.0)),
         motif_weight_end=getattr(sketch, 'motif_weight_end', None),
         motif_scales=tuple(getattr(sketch, 'motif_scales', (1, 2, 4))),
+        patch_weight=float(getattr(sketch, 'patch_weight', 0.0)),
+        patch_weight_end=getattr(sketch, 'patch_weight_end', None),
+        patch_sizes=tuple(getattr(sketch, 'patch_sizes', (7, 15))),
+        patch_stride=int(getattr(sketch, 'patch_stride', 2)),
     )
     if getattr(sketch, 'init_from_occupancy', False):
         nely = int(model.env.args['nely'])

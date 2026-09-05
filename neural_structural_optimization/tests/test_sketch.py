@@ -33,6 +33,7 @@ from neural_structural_optimization.models.loss_sketch import (
     sketch_mass_prior_loss,
     sketch_motif_descriptor,
     sketch_motif_loss,
+    sketch_patch_vocabulary_loss,
 )
 from neural_structural_optimization.models.model_pixel import PixelModel
 from neural_structural_optimization.structural.problems import StructuralParams
@@ -261,6 +262,58 @@ class MotifPriorMathTest(absltest.TestCase):
     self.assertGreater(float(density.grad.abs().sum()), 0.0)
 
 
+class PatchVocabularyMathTest(absltest.TestCase):
+
+  def test_translated_sketch_scores_better_than_repeated_columns(self):
+    reference = torch.as_tensor(load_sketch_occupancy(
+        _SKETCH_ROOT / '12.jpg', height=128, width=64))
+    translated = torch.zeros_like(reference)
+    translated[:, 5:] = reference[:, :-5]
+    columns = torch.zeros_like(reference)
+    columns[:, ::8] = 1.0
+    translation_loss = sketch_patch_vocabulary_loss(translated, reference)
+    column_loss = sketch_patch_vocabulary_loss(columns, reference)
+    self.assertLess(float(translation_loss), 0.3)
+    self.assertGreater(float(column_loss), 2.0 * float(translation_loss))
+
+  def test_horizontal_rows_score_worse_than_drawing_vocabulary(self):
+    reference = torch.as_tensor(load_sketch_occupancy(
+        _SKETCH_ROOT / '12.jpg', height=128, width=64))
+    rows = torch.zeros_like(reference)
+    rows[::8, :] = 1.0
+    self.assertGreater(
+        float(sketch_patch_vocabulary_loss(rows, reference)), 0.6)
+
+  def test_load_only_pixels_receive_no_patch_gradient(self):
+    occupancy = torch.zeros(32, 32)
+    occupancy[5:27, 14:18] = 1.0
+    sites = torch.zeros_like(occupancy)
+    sites[8, :] = 1.0
+    density = torch.rand(32, 32, requires_grad=True)
+    loss = sketch_patch_vocabulary_loss(
+        density, occupancy, load_sites=sites, patch_sizes=(7,))
+    loss.backward()
+    load_only = sites.bool() & ~occupancy.bool()
+    self.assertAlmostEqual(
+        float(density.grad[load_only].abs().sum()), 0.0, places=7)
+
+  def test_gradients_are_finite_and_nonzero(self):
+    reference = MotifPriorMathTest._vee(32, 32)
+    density = torch.rand(32, 32, requires_grad=True)
+    loss = sketch_patch_vocabulary_loss(
+        density, reference, patch_sizes=(7, 15))
+    loss.backward()
+    self.assertTrue(bool(torch.isfinite(density.grad).all()))
+    self.assertGreater(float(density.grad.abs().sum()), 0.0)
+
+  def test_blank_reference_is_a_differentiable_noop(self):
+    density = torch.rand(32, 32, requires_grad=True)
+    loss = sketch_patch_vocabulary_loss(density, torch.zeros(32, 32))
+    loss.backward()
+    self.assertEqual(float(loss), 0.0)
+    self.assertEqual(float(density.grad.abs().sum()), 0.0)
+
+
 class ExperimentConfigSketchTest(absltest.TestCase):
 
   def test_venice_preset_has_the_prior_off(self):
@@ -270,6 +323,7 @@ class ExperimentConfigSketchTest(absltest.TestCase):
     self.assertIsNone(cfg.sketch.weight_end)
     self.assertFalse(cfg.sketch.init_from_occupancy)
     self.assertEqual(cfg.sketch.motif_weight, 0.0)
+    self.assertEqual(cfg.sketch.patch_weight, 0.0)
     restored = ExperimentConfig.from_json(cfg.to_json())
     self.assertEqual(restored.sketch, cfg.sketch)
 
@@ -283,6 +337,10 @@ class ExperimentConfigSketchTest(absltest.TestCase):
         'sketch.motif_weight': 1200.0,
         'sketch.motif_weight_end': 400.0,
         'sketch.motif_scales': [1, 2],
+        'sketch.patch_weight': 40.0,
+        'sketch.patch_weight_end': 20.0,
+        'sketch.patch_sizes': [7, 15],
+        'sketch.patch_stride': 2,
     })
     self.assertEqual(cfg.sketch.weight, 4000.0)
     self.assertEqual(cfg.sketch.weight_end, 400.0)
@@ -290,6 +348,9 @@ class ExperimentConfigSketchTest(absltest.TestCase):
     self.assertEqual(cfg.sketch.motif_weight, 1200.0)
     self.assertEqual(cfg.sketch.motif_weight_end, 400.0)
     self.assertEqual(cfg.sketch.motif_scales, (1, 2))
+    self.assertEqual(cfg.sketch.patch_weight, 40.0)
+    self.assertEqual(cfg.sketch.patch_weight_end, 20.0)
+    self.assertEqual(cfg.sketch.patch_sizes, (7, 15))
     cfg.validate()
     restored = ExperimentConfig.from_json(cfg.to_json())
     self.assertEqual(restored, cfg)
@@ -575,10 +636,33 @@ class SketchWeightAnnealTest(absltest.TestCase):
     model.apply_sketch_schedule()
     self.assertEqual(model.sketch_motif_weight, 400.0)
 
-  def test_zero_weight_motif_preserves_add_term_identity(self):
+  def test_patch_is_off_coarse_peaks_after_upsample_then_moderates(self):
     model = PixelModel(structural_params=_params(), seed=0)
     model.enable_sketch_prior(
-        _left_half_occupancy(), weight=0.0, motif_weight=0.0)
+        _left_half_occupancy(),
+        weight=1.0,
+        patch_weight=80.0,
+        patch_weight_end=30.0,
+    )
+    model.resize_num = 2
+    model.resizes = 0
+    model.apply_sketch_schedule()
+    self.assertEqual(model.sketch_patch_weight, 0.0)
+    model.resizes = 1
+    model.apply_sketch_schedule()
+    self.assertEqual(model.sketch_patch_weight, 80.0)
+    model.resizes = 2
+    model.apply_sketch_schedule()
+    self.assertEqual(model.sketch_patch_weight, 30.0)
+
+  def test_zero_weight_motifs_preserve_add_term_identity(self):
+    model = PixelModel(structural_params=_params(), seed=0)
+    model.enable_sketch_prior(
+        _left_half_occupancy(),
+        weight=0.0,
+        motif_weight=0.0,
+        patch_weight=0.0,
+    )
     base_loss = torch.tensor(3.0)
     self.assertIs(model.add_sketch_term(base_loss, model()), base_loss)
 

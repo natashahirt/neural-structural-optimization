@@ -33,6 +33,7 @@ from neural_structural_optimization.models.loss_sketch import (
     mass_fraction_on_occupancy,
     sketch_mass_prior_loss,
     sketch_motif_loss,
+    sketch_patch_vocabulary_loss,
 )
 
 SKETCH_REL = SKETCH_DIR / '12.jpg'
@@ -145,6 +146,10 @@ def run_sketch_on_golden(
     motif_weight: float = 0.0,
     motif_weight_end: float | None = None,
     motif_scales: tuple[int, ...] = (1, 2, 4),
+    patch_weight: float = 0.0,
+    patch_weight_end: float | None = None,
+    patch_sizes: tuple[int, ...] = (7, 15),
+    patch_stride: int = 2,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     comparisons: tuple[tuple[str, Path], ...] = (),
 ) -> dict:
@@ -167,6 +172,10 @@ def run_sketch_on_golden(
             motif_weight=motif_weight,
             motif_weight_end=motif_weight_end,
             motif_scales=motif_scales,
+            patch_weight=patch_weight,
+            patch_weight_end=patch_weight_end,
+            patch_sizes=patch_sizes,
+            patch_stride=patch_stride,
         ),
         height=GOLDEN.height,
         width=GOLDEN.width,
@@ -214,9 +223,12 @@ def run_sketch_on_golden(
                 Image.open(path).convert('L').resize(
                     size, Image.Resampling.NEAREST),
             ))
-    run_title = (
-        f'Global {sketch_weight_end:g} + motif'
-        if motif_weight else f'Global end {sketch_weight_end:g}')
+    if patch_weight:
+        run_title = f'Global {sketch_weight_end:g} + patch motif'
+    elif motif_weight:
+        run_title = f'Global {sketch_weight_end:g} + motif'
+    else:
+        run_title = f'Global end {sketch_weight_end:g}'
     comparison_panels.append((run_title, replay))
     if loadpixels_img is not None and not comparisons:
         comparison_panels.append(('Load-pixel-only baseline', loadpixels_img))
@@ -238,6 +250,13 @@ def run_sketch_on_golden(
         density_t, occupancy_t, load_sites=load_sites_t))
     motif_loss = float(sketch_motif_loss(
         density_t, occupancy_t, scales=motif_scales))
+    patch_loss = float(sketch_patch_vocabulary_loss(
+        density_t,
+        occupancy_t,
+        load_sites=load_sites_t,
+        patch_sizes=patch_sizes,
+        stride=patch_stride,
+    ))
     summary = {
         'steps': int(ds.sizes['step']),
         'converged': bool(ds.attrs['converged']),
@@ -248,6 +267,10 @@ def run_sketch_on_golden(
         'motif_weight_peak': motif_weight,
         'motif_weight_end': motif_weight_end,
         'motif_scales': list(motif_scales),
+        'patch_weight_peak': patch_weight,
+        'patch_weight_end': patch_weight_end,
+        'patch_sizes': list(patch_sizes),
+        'patch_stride': patch_stride,
         'mass_on_occupancy': mass_fraction_on_occupancy(density, occupancy),
         'mass_on_allowed': mass_fraction_on_occupancy(density, allowed),
         'spatial_mass_loss': spatial_mass_loss,
@@ -256,6 +279,10 @@ def run_sketch_on_golden(
         'weighted_motif_loss': (
             (motif_weight if motif_weight_end is None else motif_weight_end)
             * motif_loss),
+        'patch_loss': patch_loss,
+        'weighted_patch_loss': (
+            (patch_weight if patch_weight_end is None else patch_weight_end)
+            * patch_loss),
         'load_site_frac': float(load_sites.mean()),
         'allowed_frac': float(allowed.mean()),
         'mean_physical_density': float(np.mean(density)),
@@ -291,6 +318,14 @@ def main(argv: list[str] | None = None) -> int:
         default='1,2,4',
         help='comma-separated pooling scales for the motif descriptor',
     )
+    parser.add_argument('--patch-weight', type=float, default=0.0)
+    parser.add_argument('--patch-weight-end', type=float)
+    parser.add_argument(
+        '--patch-sizes',
+        default='7,15',
+        help='comma-separated odd patch widths',
+    )
+    parser.add_argument('--patch-stride', type=int, default=2)
     parser.add_argument(
         '--output-dir',
         type=Path,
@@ -304,13 +339,22 @@ def main(argv: list[str] | None = None) -> int:
         help='add a labeled prior run to comparison.png',
     )
     args = parser.parse_args(argv)
-    if args.weight_end < 0 or args.motif_weight < 0:
+    if (args.weight_end < 0 or args.motif_weight < 0
+            or args.patch_weight < 0):
         parser.error('weights must be non-negative')
     motif_scales = tuple(
         int(value.strip()) for value in args.motif_scales.split(',')
         if value.strip())
     if not motif_scales or any(scale < 1 for scale in motif_scales):
         parser.error('--motif-scales must contain positive integers')
+    patch_sizes = tuple(
+        int(value.strip()) for value in args.patch_sizes.split(',')
+        if value.strip())
+    if (not patch_sizes
+            or any(size < 3 or size % 2 == 0 for size in patch_sizes)):
+        parser.error('--patch-sizes must contain odd integers >= 3')
+    if args.patch_stride < 1:
+        parser.error('--patch-stride must be positive')
     output_dir = args.output_dir or DEFAULT_OUTPUT_DIR
     if not output_dir.is_absolute():
         output_dir = REPO_ROOT / output_dir
@@ -331,12 +375,16 @@ def main(argv: list[str] | None = None) -> int:
     print(
         'Running Venice 250214 + sketch 12 '
         f'(init occupancy, {DEFAULT_SKETCH_WEIGHT}->{args.weight_end}, '
-        f'motif peak={args.motif_weight})...')
+        f'motif peak={args.motif_weight}, patch peak={args.patch_weight})...')
     summary = run_sketch_on_golden(
         sketch_weight_end=args.weight_end,
         motif_weight=args.motif_weight,
         motif_weight_end=args.motif_weight_end,
         motif_scales=motif_scales,
+        patch_weight=args.patch_weight,
+        patch_weight_end=args.patch_weight_end,
+        patch_sizes=patch_sizes,
+        patch_stride=args.patch_stride,
         output_dir=output_dir,
         comparisons=tuple(comparisons),
     )
