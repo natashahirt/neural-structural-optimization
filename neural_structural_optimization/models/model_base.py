@@ -19,6 +19,7 @@ from .loss_sketch import (
     sketch_motif_loss,
     sketch_patch_vocabulary_loss,
 )
+from .loss_semantic_prior import SemanticSpatialPrior, cosine_alignment
 from .config import DEFAULT_MAX_ANALYSIS_DIM
 from .utils import set_random_seed
 from neural_structural_optimization.structural import api as topo_api
@@ -197,6 +198,13 @@ class Model(nn.Module):
         self.sketch_patch_weight_end = None
         self.sketch_patch_sizes = (7, 15)
         self.sketch_patch_stride = 2
+        # Live CLIP/SDS occupancy. None keeps every loss path bit-identical.
+        self.semantic_prior = None
+        self._last_compliance = None
+        self._last_semantic_loss = None
+        self._last_semantic_prior_loss = None
+        self._opt_step = 0
+        self._opt_max_iterations = 1
         if clip_loss is not None:
             clip_loss.clip_model = (
                 clip_loss.clip_model.to(self.device).eval().requires_grad_(False)
@@ -367,7 +375,9 @@ class Model(nn.Module):
             env = self.analysis_env
 
         # Use NumPy/HIPS-autograd bridge (faster/stable on CPU)
-        return StructuralLoss.apply(z, env).mean()
+        loss = StructuralLoss.apply(z, env).mean()
+        self._last_compliance = loss
+        return loss
 
     def get_physical_density(self, logits: torch.Tensor) -> torch.Tensor:
         """The canonical density: filtered, volume-constrained, same as render.
@@ -390,10 +400,15 @@ class Model(nn.Module):
         The Venice preset still passes raw logits, matching the golden run.
         """
         if self.clip_loss is None:
-            return logits.new_tensor(0.0)
+            loss = logits.new_tensor(0.0)
+            self._last_semantic_loss = loss
+            return loss
         if self._clip_sees_raw_design():
-            return self.clip_loss(logits)
-        return self.clip_loss(self.get_physical_density(logits))
+            loss = self.clip_loss(logits)
+        else:
+            loss = self.clip_loss(self.get_physical_density(logits))
+        self._last_semantic_loss = loss
+        return loss
 
     def enable_sketch_prior(
         self,
@@ -464,6 +479,68 @@ class Model(nn.Module):
         self.sketch_patch_sizes = tuple(int(size) for size in patch_sizes)
         self.sketch_patch_stride = int(patch_stride)
         return self
+
+    def enable_semantic_prior(self, prior: SemanticSpatialPrior) -> "Model":
+        """Opt-in live CLIP/SDS occupancy. ``None``-equivalent is not passing this.
+
+        Zero ``weight`` with no ``auto_ratio`` remains a no-op, matching a
+        model that never called this method.
+        """
+        self.semantic_prior = prior
+        self._last_semantic_prior_loss = None
+        return self
+
+    def _semantic_prior_active(self) -> bool:
+        prior = self.semantic_prior
+        return prior is not None and prior.is_active()
+
+    def _refresh_semantic_prior(self, logits: torch.Tensor) -> None:
+        prior = self.semantic_prior
+        if prior is None or not prior.is_active():
+            return
+        density = self.get_physical_density(logits)
+        prior.update(
+            density,
+            resizes=getattr(self, 'resizes', None),
+            resize_num=getattr(self, 'resize_num', None),
+            step=int(self._opt_step),
+            max_iterations=int(self._opt_max_iterations),
+        )
+        occupancy = prior.blended_occupancy(density)
+        load_sites = self._load_sites_on_density(density)
+        prior_loss = sketch_mass_prior_loss(
+            density, occupancy, load_sites=load_sites)
+        self._last_semantic_prior_loss = prior_loss
+        if prior.auto_ratio is not None and not prior._calibrated:
+            g_prior = torch.autograd.grad(
+                prior_loss, logits, retain_graph=True, allow_unused=True)[0]
+            compliance = self._last_compliance
+            if g_prior is not None and compliance is not None:
+                g_comp = torch.autograd.grad(
+                    compliance, logits, retain_graph=True, allow_unused=True)[0]
+                if g_comp is not None:
+                    prior.maybe_calibrate_weight(g_prior, g_comp)
+        if prior.record_alignment and self._last_compliance is not None:
+            g_comp = torch.autograd.grad(
+                self._last_compliance, logits, retain_graph=True,
+                allow_unused=True)[0]
+            semantic = self._last_semantic_loss
+            g_sem = None
+            if semantic is not None and semantic.requires_grad:
+                g_sem = torch.autograd.grad(
+                    semantic, logits, retain_graph=True, allow_unused=True)[0]
+            if g_comp is not None and g_sem is not None:
+                prior.last_metrics['grad_cosine'] = float(
+                    cosine_alignment(g_sem, g_comp))
+            if g_comp is not None and prior.last_clip_grad is not None:
+                pref = prior.last_clip_grad
+                while pref.ndim < g_comp.ndim:
+                    pref = pref.unsqueeze(0)
+                if pref.shape == g_comp.shape:
+                    want_material = pref > pref.median()
+                    compliance_wants = torch.relu(-g_comp) > 0
+                    overlap = (want_material & compliance_wants).float().mean()
+                    prior.last_metrics['clip_compliance_overlap'] = float(overlap)
 
     def sketch_weight_at(
         self,
@@ -644,23 +721,31 @@ class Model(nn.Module):
     def add_sketch_term(
         self, loss: torch.Tensor, logits: torch.Tensor,
     ) -> torch.Tensor:
-        """Add ``sketch_weight * get_sketch_loss`` when the prior is on.
+        """Add sketch and live semantic-prior terms when they are on.
 
-        Identity when the prior is off. Optimizer paths that compose the
-        total by hand (Adam/LBFGS ``clip_alpha``, AdaptiveAdam's default
-        ``_compose_loss``) must call this; paths that already go through
+        Identity when both are off. Optimizer paths that compose the
+        total by hand must call this; paths that already go through
         ``get_total_loss`` / ``get_venice_compat_losses`` must not, or the
         term is applied twice.
         """
-        if not self._sketch_guidance_active():
+        prior_on = self._semantic_prior_active()
+        if prior_on:
+            self._refresh_semantic_prior(logits)
+        if not self._sketch_guidance_active() and not prior_on:
             return loss
         # Normal composition computes the physical density once even when
-        # spatial and motif guidance are both active.
+        # spatial, motif, and live-semantic guidance are all active.
         density = self.get_physical_density(logits)
-        occupancy = self._occupancy_on_density(density)
+        occupancy = (
+            self._occupancy_on_density(density)
+            if self._sketch_guidance_active() else None)
         total = loss
         load_sites = None
-        if self._sketch_prior_active() or self._sketch_patch_active():
+        if (
+            self._sketch_prior_active()
+            or self._sketch_patch_active()
+            or prior_on
+        ):
             load_sites = self._load_sites_on_density(density)
         if self._sketch_prior_active():
             total = total + float(self.sketch_weight) * sketch_mass_prior_loss(
@@ -678,6 +763,13 @@ class Model(nn.Module):
                     patch_sizes=self.sketch_patch_sizes,
                     stride=self.sketch_patch_stride,
                 )
+            )
+        if prior_on:
+            total = total + float(self.semantic_prior.weight) * (
+                self._last_semantic_prior_loss
+                if self._last_semantic_prior_loss is not None
+                else self.semantic_prior.mass_prior_loss(
+                    density, load_sites=load_sites)
             )
         return total
 
@@ -716,9 +808,12 @@ class Model(nn.Module):
         :data:`VENICE_LOSS_ALGEBRA`.
         """
         algebra = self.venice_loss_algebra or VENICE_LOSS_ALGEBRA
+        structural = self.get_structural_loss(logits)
+        self._last_compliance = structural
+        semantic = self.get_semantic_loss(logits)
         terms = venice_compat_total_loss(
-            self.get_structural_loss(logits),
-            self.get_semantic_loss(logits),
+            structural,
+            semantic,
             clip_alpha=algebra.clip_alpha if clip_alpha is None else clip_alpha,
             compliance_weight=(
                 algebra.compliance_weight if compliance_weight is None else compliance_weight
@@ -784,6 +879,7 @@ class Model(nn.Module):
             ).total_loss
 
         structural_loss = self.get_structural_loss(logits)
+        self._last_compliance = structural_loss
         structural_loss_eff = structural_loss if compliance_weight is None else (structural_loss * float(compliance_weight))
         semantic_loss = self.get_semantic_loss(logits)
         if self.clip_loss is None:

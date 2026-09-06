@@ -50,6 +50,8 @@ CLIP_DYNAMIC_WEIGHT_MAX = 2000.0
 
 def _apply_sketch_schedule(model, step: int, max_iterations: int) -> None:
     """Advance the sketch-weight anneal for this step, if the model has one."""
+    model._opt_step = int(step)
+    model._opt_max_iterations = int(max_iterations)
     apply = getattr(model, 'apply_sketch_schedule', None)
     if apply is not None:
         apply(step=step, max_iterations=max_iterations)
@@ -228,6 +230,34 @@ def _attach_motif_scale_terms(ds: xarray.Dataset, snapshots) -> xarray.Dataset:
                 keys.append(key)
     for key in keys:
         ds[_motif_scale_column(key)] = (
+            ('step',),
+            [float(snap.get(key, float('nan'))) for snap in snapshots])
+    return ds
+
+
+def _snapshot_semantic_prior(model) -> dict:
+    """Copy live-prior diagnostics recorded on the last refresh."""
+    prior = getattr(model, 'semantic_prior', None)
+    if prior is None or not getattr(prior, 'last_metrics', None):
+        return {}
+    snap = {str(key): float(value) for key, value in prior.last_metrics.items()}
+    loss = getattr(model, '_last_semantic_prior_loss', None)
+    if loss is not None:
+        snap['prior_loss'] = float(loss.detach())
+    return snap
+
+
+def _attach_semantic_prior_terms(ds: xarray.Dataset, snapshots) -> xarray.Dataset:
+    """Add live-prior columns when the path ran. No-op if empty."""
+    if not snapshots or not any(snapshots):
+        return ds
+    keys = []
+    for snap in snapshots:
+        for key in snap:
+            if key not in keys:
+                keys.append(key)
+    for key in keys:
+        ds[f'semantic_{key}'] = (
             ('step',),
             [float(snap.get(key, float('nan'))) for snap in snapshots])
     return ds
@@ -424,6 +454,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         # than an append onto the first. See `_reset_run_state`.
         self.loss_terms = []
         self.motif_scale_terms = []
+        self.semantic_prior_terms = []
         self.converged = False
 
     def _compose_loss(self, logits) -> VeniceLossTerms:
@@ -501,6 +532,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         self.tracker.frames.clear()
         self.loss_terms = []
         self.motif_scale_terms = []
+        self.semantic_prior_terms = []
         self.resize_steps = []
         self.converged = False
         self.model.prev_loss = INITIAL_PREV_LOSS
@@ -543,6 +575,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
             self.tracker.add_step(step_terms.total_loss, logits.detach().cpu().numpy())
             self.loss_terms.append(step_terms)
             self.motif_scale_terms.append(_snapshot_motif_scale_losses(model))
+            self.semantic_prior_terms.append(_snapshot_semantic_prior(model))
             stage_of_step.append(len(stage_envs) - 1)
             pbar.set_postfix({'compliance': f'{compliance_value:.4f}',
                               'grid': f'{model.shape[2]}x{model.shape[1]}'})
@@ -587,13 +620,15 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         recorded = len(self.tracker.losses)
         if not (len(self.tracker.frames) == len(stage_of_step)
                 == len(self.loss_terms) == len(self.motif_scale_terms)
+                == len(self.semantic_prior_terms)
                 == recorded):
             raise RuntimeError(
                 'per-step series disagree after the run: '
                 f'{recorded} losses, {len(self.tracker.frames)} frames, '
                 f'{len(stage_of_step)} stage labels, '
-                f'{len(self.loss_terms)} loss breakdowns and '
-                f'{len(self.motif_scale_terms)} motif-scale snapshots. Every '
+                f'{len(self.loss_terms)} loss breakdowns, '
+                f'{len(self.motif_scale_terms)} motif-scale snapshots and '
+                f'{len(self.semantic_prior_terms)} semantic-prior snapshots. Every '
                 'one of them is appended once per gradient step, so a mismatch '
                 'means state from another run leaked in; `optimize` clears all '
                 'of them before it starts.')
@@ -617,6 +652,7 @@ class AdaptiveAdam_Optimizer(BaseOptimizer):
         ds = xarray.Dataset(data, coords={'step': np.arange(len(losses))})
         _attach_loss_terms(ds, self.loss_terms)
         _attach_motif_scale_terms(ds, self.motif_scale_terms)
+        _attach_semantic_prior_terms(ds, self.semantic_prior_terms)
         ds.attrs['resize_steps'] = list(self.resize_steps)
         ds.attrs['converged'] = int(self.converged)
         return ds
