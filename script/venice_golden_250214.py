@@ -27,8 +27,10 @@ wrong:
 """
 
 import argparse
+import dataclasses
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -316,7 +318,51 @@ def attach_final_raw_design(
     """
     raw = model.z.detach().cpu().numpy()[0]
     ds['final_design_raw'] = (('raw_y', 'raw_x'), raw)
+    density = model.get_physical_density(model.z).detach().cpu().numpy()
+    density = np.asarray(density, dtype=np.float32)
+    while density.ndim > 2:
+        density = density[0]
+    if density.shape != raw.shape:
+        raise ValueError(
+            f'physical density shape {density.shape} does not match raw '
+            f'{raw.shape}')
+    ds['final_physical_density'] = (('raw_y', 'raw_x'), density)
     return ds
+
+
+def prompt_slug(prompt: str) -> str:
+    """Filesystem token for a CLIP prompt. Empty after stripping is rejected."""
+    stripped = prompt.strip()
+    if not stripped:
+        raise ValueError('prompt must be non-empty')
+    slug = re.sub(r'[^a-z0-9]+', '_', stripped.lower()).strip('_')
+    if not slug:
+        raise ValueError(f'prompt {prompt!r} has no filesystem-safe characters')
+    return slug
+
+
+def motif_scale_run_config(prompt: Optional[str] = None) -> VeniceGoldenConfig:
+    """Neutral-init motif-scale config. ``prompt`` overrides CLIP text only."""
+    config = venice_250214_motif_scale().to_venice_golden()
+    if prompt is None:
+        return config
+    stripped = prompt.strip()
+    if not stripped:
+        raise ValueError('prompt must be non-empty')
+    if stripped == config.prompt:
+        return config
+    return dataclasses.replace(config, prompt=stripped)
+
+
+def motif_scale_results_dir(
+    prompt: str,
+    repo_root: Path = REPO_ROOT,
+) -> Path:
+    """Skeletons keeps the existing dir; any other prompt gets its own folder."""
+    base = repo_root / 'script' / 'resources' / 'results'
+    if prompt.strip() == GOLDEN.prompt:
+        return base / 'clip_motif_scale_neutral_init'
+    return base / f'clip_motif_scale_neutral_init_{prompt_slug(prompt)}'
 
 
 def venice_volume_ratio(field, threshold: float = 0.9) -> float:
@@ -407,10 +453,23 @@ def _venice_display_raw(ds: xarray.Dataset, size: tuple[int, int]):
     return image
 
 
+def _ink_black(field: np.ndarray, size: tuple[int, int]):
+    """Material=black panel for a [0, 1] field, sized to the reference JPEG."""
+    from PIL import Image
+
+    arr = np.clip(np.asarray(field, dtype=np.float64), 0.0, 1.0)
+    image = Image.fromarray(
+        (255.0 * (1.0 - arr)).clip(0, 255).astype(np.uint8), mode='L')
+    if image.size != size:
+        image = image.resize(size, Image.Resampling.NEAREST)
+    return image
+
+
 def save_motif_scale_look(
     ds: xarray.Dataset,
     output_dir: Path,
     *,
+    replay_title: str = 'Motif-scale CLIP, neutral init',
     extra_panels: tuple[tuple[str, Path], ...] = (),
 ) -> tuple[Path, Path]:
     """Write the no-occupancy motif-scale look next to Venice and any priors."""
@@ -425,8 +484,13 @@ def save_motif_scale_look(
 
     panels: list[tuple[str, Image.Image]] = [
         ('Venice 250214 RRC', reference),
-        ('Motif-scale CLIP, neutral init', replay),
+        (replay_title, replay),
     ]
+    if 'final_physical_density' in ds:
+        density = np.asarray(ds['final_physical_density'].values, dtype=np.float32)
+        density_img = _ink_black(density, size)
+        density_img.save(output_dir / 'physical_density.png')
+        panels.append(('Physical density', density_img))
     for title, path in extra_panels:
         if path.is_file():
             panels.append((
@@ -489,8 +553,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         action='store_true',
         help=(
             'Venice CLIP plus physical-scale crops; no sketch occupancy. '
-            'Neutral init (no Venice frame image). Writes '
-            'script/resources/results/clip_motif_scale_neutral_init/'),
+            'Neutral init (no Venice frame image). Default output is '
+            'script/resources/results/clip_motif_scale_neutral_init/ for '
+            'the skeletons prompt; other prompts get a sibling directory.'),
+    )
+    parser.add_argument(
+        '--prompt',
+        help=(
+            'CLIP text prompt. Requires --motif-scale. Default is the '
+            'preset prompt (skeletons). GOLDEN replay ignores this.'),
     )
     parser.add_argument(
         '--output-dir',
@@ -498,12 +569,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         help='result directory (relative paths resolve from the repository root)',
     )
     args = parser.parse_args(argv)
+    if args.prompt is not None and not args.motif_scale:
+        parser.error('--prompt requires --motif-scale')
 
     if args.motif_scale:
-        config = venice_250214_motif_scale().to_venice_golden()
-        default_dir = (
-            REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_neutral_init')
+        config = motif_scale_run_config(args.prompt)
+        default_dir = motif_scale_results_dir(config.prompt)
     else:
         config = GOLDEN
         default_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
@@ -514,7 +585,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(
-        'Running Venice 250214 skeletons'
+        f'Running Venice 250214 {config.prompt!r}'
         + (' + motif-scale CLIP (no occupancy)' if args.motif_scale else '')
         + '...')
     ds = run(config)
@@ -523,19 +594,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_path.write_text(json.dumps(trajectory(ds), indent=2))
     print(f'\nWrote replay trajectory to {output_path}')
     if args.motif_scale:
-        occupancy_look = (
+        skeletons_prior = (
             REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_sketch12' / 'sketch_run.png')
-        image_seeded_look = (
-            REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_no_occupancy' / 'sketch_run.png')
+            / 'clip_motif_scale_neutral_init' / 'sketch_run.png')
+        extra_panels = ()
+        if config.prompt != GOLDEN.prompt and skeletons_prior.is_file():
+            extra_panels = (
+                ('Neutral-init skeletons (prior)', skeletons_prior),
+            )
         replay_image, comparison_image = save_motif_scale_look(
             ds,
             output_dir,
-            extra_panels=(
-                ('Image-seeded motif-scale (prior)', image_seeded_look),
-                ('Occupancy + motif-scale (prior)', occupancy_look),
-            ),
+            replay_title=f'Motif-scale CLIP, {config.prompt}',
+            extra_panels=extra_panels,
         )
         summary = {
             'clip_prompt': config.prompt,
@@ -551,6 +622,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             'converged': bool(ds.attrs['converged']),
             'resize_steps': [int(s) for s in ds.attrs['resize_steps']],
             'volume_actual': venice_volume_ratio(ds['final_design_raw'].values),
+            'mean_physical_density': (
+                float(np.mean(ds['final_physical_density'].values))
+                if 'final_physical_density' in ds else None),
             'compliance': float(ds['compliance'][-1]),
             'clip_loss': float(ds['clip_loss'][-1]),
             'clip_loss_raw': float(ds['clip_loss_raw'][-1]),
@@ -559,6 +633,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             'paths': {
                 'replay': str(replay_image),
                 'comparison': str(comparison_image),
+                'physical_density': str(output_dir / 'physical_density.png'),
             },
         }
         (output_dir / 'summary.json').write_text(

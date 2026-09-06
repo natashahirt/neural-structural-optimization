@@ -104,9 +104,54 @@ class MotifScalePresetDoesNotSilentChangeGoldenTest(absltest.TestCase):
             physical_motif_scale_fracs(GOLDEN.height, GOLDEN.interval))
         golden = cfg.to_venice_golden()
         self.assertNotEqual(golden, GOLDEN)
+        self.assertTrue(golden.neutral_init)
         self.assertEqual(golden.prompt, GOLDEN.prompt)
         self.assertEqual(golden.num_augs, GOLDEN.num_augs)
         self.assertEqual(golden.clip_resize_short_side, GOLDEN.clip_resize_short_side)
+
+
+class MotifScalePromptOverrideTest(absltest.TestCase):
+
+    def test_slug_is_filesystem_safe(self):
+        golden_script = _load_golden_script()
+        self.assertEqual(
+            golden_script.prompt_slug('butterfly wing venation'),
+            'butterfly_wing_venation')
+
+    def test_empty_prompt_is_rejected(self):
+        golden_script = _load_golden_script()
+        with self.assertRaises(ValueError):
+            golden_script.prompt_slug('   ')
+        with self.assertRaises(ValueError):
+            golden_script.motif_scale_run_config('   ')
+
+    def test_skeletons_keeps_the_existing_results_dir(self):
+        golden_script = _load_golden_script()
+        path = golden_script.motif_scale_results_dir('skeletons')
+        self.assertEqual(path.name, 'clip_motif_scale_neutral_init')
+
+    def test_other_prompt_gets_a_sibling_dir(self):
+        golden_script = _load_golden_script()
+        path = golden_script.motif_scale_results_dir('butterfly wing venation')
+        self.assertEqual(
+            path.name,
+            'clip_motif_scale_neutral_init_butterfly_wing_venation')
+
+    def test_prompt_override_does_not_change_the_preset_default(self):
+        golden_script = _load_golden_script()
+        self.assertEqual(
+            venice_250214_motif_scale().to_venice_golden().prompt,
+            GOLDEN.prompt)
+        overridden = golden_script.motif_scale_run_config(
+            'butterfly wing venation')
+        self.assertEqual(overridden.prompt, 'butterfly wing venation')
+        self.assertTrue(overridden.neutral_init)
+        self.assertEqual(
+            overridden.motif_scale_fracs,
+            physical_motif_scale_fracs(GOLDEN.height, GOLDEN.interval))
+        self.assertEqual(
+            venice_250214_motif_scale().to_venice_golden().prompt,
+            GOLDEN.prompt)
 
 
 class MotifScaleClipPathTest(absltest.TestCase):
