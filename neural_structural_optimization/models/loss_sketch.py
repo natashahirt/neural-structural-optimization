@@ -176,6 +176,39 @@ def teacher_ink_from_raw(field: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
     return np.clip(arr, 0.0, 1.0).astype(np.float32)
 
 
+def rank_ink_from_raw(field: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    """Map a field to ``[0, 1]`` by rank so a cut is a percentile of pixels.
+
+    CLIP-only dreams are unbounded logits: clamping them to ``[0, 1]`` can
+    mark a third of the grid as solid ink, and a storey-scale envelope then
+    fills the facade. Rank ink makes ``threshold=0.7`` mean "the top 30%",
+    independent of logit scale. Ties share a rank.
+    """
+    arr = _as_numpy(field).astype(np.float64)
+    if arr.ndim == 3:
+        arr = np.squeeze(arr, axis=0)
+    if arr.ndim != 2:
+        raise ValueError(
+            f'teacher field must be 2-D after squeeze, got {arr.shape}')
+    flat = arr.reshape(-1)
+    order = np.argsort(flat, kind='mergesort')
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.linspace(0.0, 1.0, flat.size, dtype=np.float64)
+    return ranks.reshape(arr.shape).astype(np.float32)
+
+
+def _ink_from_field(
+    field: Union[np.ndarray, torch.Tensor],
+    ink_mode: str,
+) -> np.ndarray:
+    mode = str(ink_mode).lower()
+    if mode == 'clamp':
+        return teacher_ink_from_raw(field)
+    if mode == 'rank':
+        return rank_ink_from_raw(field)
+    raise ValueError(f"ink_mode must be 'clamp' or 'rank', got {ink_mode!r}")
+
+
 def motif_layout_envelope_sigmas(
     height: int,
     scale_fracs: Sequence[float],
@@ -222,24 +255,25 @@ def motif_layout_scaffold(
     threshold: float = 0.5,
     envelope_sigma_frac: float = 0.25,
     combine: str = 'max',
+    ink_mode: str = 'clamp',
 ) -> np.ndarray:
     """Soft multiscale occupancy envelope from teacher ink.
 
-    Threshold the clamped teacher field, then build a bounded distance
-    envelope at each physically derived scale and combine them. This is a
-    layout prior, not a silhouette match: fine decorative holes survive at
-    member scale while storey/building scales thicken the allowed region.
-    Deterministic; no CLIP. Does not union load sites -- that happens when
-    the mass prior is applied.
+    Threshold the teacher field, then build a bounded distance envelope at
+    each physically derived scale and combine them. This is a layout prior,
+    not a silhouette match. Deterministic; no CLIP. Does not union load
+    sites -- that happens when the mass prior is applied.
 
     Args:
         teacher_field: Raw design or density, any 2-D (or ``(1, H, W)``) array.
         scale_fracs: Elevation fractions in ``(0, 1]``. Empty is rejected;
             resolve :func:`physical_motif_scale_fracs` at the caller.
-        threshold: Cut on clamped ink in ``[0, 1]``.
+        threshold: Cut on ink in ``[0, 1]``.
         envelope_sigma_frac: Envelope width as a fraction of each scale's
             pixel size (``frac * height``).
         combine: ``'max'`` (thicker union of scales) or ``'mean'``.
+        ink_mode: ``'clamp'`` (default, density-like teachers) or ``'rank'``
+            (unbounded CLIP dreams).
 
     Returns:
         float32 array of shape ``(H, W)`` in ``[0, 1]``.
@@ -249,7 +283,7 @@ def motif_layout_scaffold(
     combine = str(combine).lower()
     if combine not in ('max', 'mean'):
         raise ValueError(f"combine must be 'max' or 'mean', got {combine!r}")
-    ink = teacher_ink_from_raw(teacher_field)
+    ink = _ink_from_field(teacher_field, ink_mode)
     height, width = ink.shape
     sigmas = motif_layout_envelope_sigmas(
         height, scale_fracs, envelope_sigma_frac)
@@ -310,6 +344,7 @@ def motif_layout_threshold_for_allowed_mean(
     target_mean: float = DEFAULT_SCAFFOLD_ALLOWED_MEAN,
     envelope_sigma_frac: float = 0.25,
     combine: str = 'max',
+    ink_mode: str = 'clamp',
     abs_tol: float = 0.03,
     max_iter: int = 24,
 ) -> tuple[float, np.ndarray]:
@@ -318,6 +353,8 @@ def motif_layout_threshold_for_allowed_mean(
     Higher threshold -> sparser ink -> lower allowed area. Empty-ink thresholds
     are treated as too high. Raises if no cut lands within ``abs_tol`` of
     the target - that is a field that cannot become a Stage-6-like prior.
+    ``envelope_sigma_frac=0`` with ``ink_mode='rank'`` is one elevation
+    occupancy, no storey dilation.
     """
     if not 0.0 < float(target_mean) < 1.0:
         raise ValueError(
@@ -335,6 +372,7 @@ def motif_layout_threshold_for_allowed_mean(
                 threshold=mid,
                 envelope_sigma_frac=envelope_sigma_frac,
                 combine=combine,
+                ink_mode=ink_mode,
             )
         except ValueError:
             hi = mid

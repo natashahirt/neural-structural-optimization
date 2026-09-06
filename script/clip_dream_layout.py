@@ -5,14 +5,17 @@ a field that had already seen compliance. Their scaffolds therefore endorsed
 the physics load path (spatial_mass_loss 0.0078 vs Stage 6's 0.31-0.60). This
 script inverts the order:
 
-1. Dream: AdaptivePixel at the coarse 32x64 grid, CLIP loss only, no FEA.
-2. Upsample the dream field to 128x256 and extract a storey/member scaffold
-   whose allowed-area mean is targeted at 0.75 (Stage 6's band).
-3. Gate: score a physics-layout proxy against that scaffold. If
+1. Dream: AdaptivePixel at the coarse 32x64 grid, CLIP on the *whole
+   elevation* only (Venice RandomResizedCrop; no storey/member crops),
+   no FEA. Load-site collectors stay off during the dream so floors are
+   not frames; they are unioned when the mass prior is applied.
+2. Upsample that one drawing to 128x256 and threshold it like a sketch
+   (rank ink, no storey envelope) so occupancy is one connected elevation.
+3. Gate: score a physics-layout proxy against that occupancy. If
    ``spatial_mass_loss < 0.25`` the prior is tautological again - stop.
-4. Physics: Venice AdaptiveAdam + motif-scale CLIP, Stage 6 occupancy recipe
-   (init from occupancy ? load pixels, anneal 4000?400). Not seeded from a
-   physics teacher.
+4. Physics: Venice AdaptiveAdam + the same whole-building CLIP, Stage 6
+   occupancy recipe (init from occupancy union load pixels, anneal
+   4000 to 400). Not seeded from a physics teacher.
 
     PYTHONPATH="$PWD" python script/clip_dream_layout.py --dream-only
     PYTHONPATH="$PWD" python script/clip_dream_layout.py
@@ -24,6 +27,7 @@ them from this script.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib.util
 import json
 import sys
@@ -32,6 +36,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -39,10 +44,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from neural_structural_optimization import configure_torch_threads
-from neural_structural_optimization.experiment import (
-    VeniceGoldenConfig,
-    venice_250214_motif_scale,
-)
+from neural_structural_optimization.experiment import VeniceGoldenConfig
 from neural_structural_optimization.models.loss_sketch import (
     DEFAULT_SCAFFOLD_ALLOWED_MEAN,
     DEFAULT_TAUTOLOGY_MIN_MASS_OFF,
@@ -50,6 +52,7 @@ from neural_structural_optimization.models.loss_sketch import (
     load_site_mask,
     mass_fraction_on_occupancy,
     motif_layout_threshold_for_allowed_mean,
+    rank_ink_from_raw,
     resample_field,
     scaffold_spatial_mass_loss,
 )
@@ -74,7 +77,22 @@ def dream_results_dir(prompt: str, repo_root: Path = REPO_ROOT, golden=None) -> 
     golden = golden or _load_golden()
     return (
         repo_root / 'script' / 'resources' / 'results'
-        / f'clip_dream_layout_{golden.prompt_slug(prompt)}')
+        / f'clip_dream_layout_whole_{golden.prompt_slug(prompt)}')
+
+
+def whole_building_dream_config(prompt: str, golden) -> VeniceGoldenConfig:
+    """Motif-scale prompt, but CLIP sees the whole elevation only.
+
+    ``motif_scale_fracs=()`` drops storey/member crops. ``union_load_sites``
+    is False so floor collectors are not painted as frames; they are unioned
+    into occupancy when the mass prior is applied.
+    """
+    config = golden.motif_scale_run_config(prompt)
+    return dataclasses.replace(
+        config,
+        motif_scale_fracs=(),
+        union_load_sites=False,
+    )
 
 
 def build_dream_model(config: VeniceGoldenConfig, golden):
@@ -96,18 +114,44 @@ def run_clip_dream(
     *,
     steps: int,
     lr: float,
-) -> list[float]:
-    """Adam on ``get_semantic_loss`` only. Returns the per-step CLIP losses."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    control_height: int = 16,
+    control_width: int = 8,
+) -> tuple[list[float], torch.Tensor]:
+    """Optimize a low-dimensional field decoded smoothly to the model grid.
+
+    The 16x8 control has 128 variables instead of 2,048 independent pixels.
+    Bilinear expansion plus one local average makes coherent regions cheap and
+    removes the single-pixel texture move that dominated the direct dream.
+    """
+    if control_height < 2 or control_width < 2:
+        raise ValueError('control grid dimensions must both be >= 2')
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(model.seed))
+    control = torch.full(
+        (1, 1, control_height, control_width),
+        float(model.env.args['volfrac']),
+        device=model.device,
+    )
+    noise = torch.rand(control.shape, generator=generator)
+    control = torch.nn.Parameter(
+        control + 0.01 * (2.0 * noise.to(model.device) - 1.0))
+    optimizer = torch.optim.Adam([control], lr=lr)
     losses = []
     for _ in tqdm(range(int(steps)), desc='CLIP dream (no FEA)'):
         optimizer.zero_grad(set_to_none=True)
-        logits = model()
+        logits = F.interpolate(
+            control,
+            size=model.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        logits = F.avg_pool2d(logits, kernel_size=3, stride=1, padding=1)
+        logits = logits[:, 0]
         loss = model.get_semantic_loss(logits)
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach()))
-    return losses
+    return losses, logits.detach()
 
 
 def extract_dream_scaffold(
@@ -115,14 +159,21 @@ def extract_dream_scaffold(
     *,
     height: int,
     width: int,
-    scale_fracs: tuple[float, ...],
     target_mean: float = DEFAULT_SCAFFOLD_ALLOWED_MEAN,
 ):
-    """Upsample the coarse dream and pick an ink cut for ``target_mean``."""
+    """Upsample the coarse dream and cut one elevation occupancy.
+
+    Rank ink (logits are unbounded) and no distance envelope: the occupancy
+    is the drawing, the way a Stage 6 sketch is one picture of the building.
+    ``scale_fracs=(1.0,)`` is required by the extractor and unused at
+    ``envelope_sigma_frac=0``.
+    """
     upsampled = resample_field(dream_field, height, width)
     threshold, scaffold = motif_layout_threshold_for_allowed_mean(
         upsampled,
-        scale_fracs=scale_fracs,
+        scale_fracs=(1.0,),
+        envelope_sigma_frac=0.0,
+        ink_mode='rank',
         target_mean=target_mean,
     )
     return upsampled, threshold, scaffold
@@ -153,10 +204,53 @@ def evaluate_tautology_gate(
     }
 
 
-def _save_field_png(path: Path, field: np.ndarray) -> Path:
+def evaluate_dream_geometry(
+    field: np.ndarray,
+    occupancy: np.ndarray,
+    *,
+    max_neighbor_contrast_ratio: float = 0.5,
+) -> dict:
+    """Check that a dream is smooth and its occupancy spans the elevation."""
+    from scipy import ndimage
+
+    arr = np.asarray(field, dtype=np.float64)
+    std = max(float(arr.std()), 1e-12)
+    dx = float(np.abs(np.diff(arr, axis=1)).mean())
+    dy = float(np.abs(np.diff(arr, axis=0)).mean())
+    contrast_ratio = max(dx, dy) / std
+
+    binary = np.asarray(occupancy) >= 0.5
+    labels, count = ndimage.label(binary)
+    spanning_label = 0
+    top = set(labels[0][labels[0] > 0].tolist())
+    bottom = set(labels[-1][labels[-1] > 0].tolist())
+    shared = top & bottom
+    if shared:
+        spanning_label = max(
+            shared, key=lambda value: int(np.count_nonzero(labels == value)))
+    spanning_fraction = (
+        float(np.count_nonzero(labels == spanning_label)) / binary.size
+        if spanning_label else 0.0)
+    smooth = contrast_ratio <= float(max_neighbor_contrast_ratio)
+    return {
+        'neighbor_contrast_ratio': contrast_ratio,
+        'max_neighbor_contrast_ratio': float(max_neighbor_contrast_ratio),
+        'smooth': bool(smooth),
+        'component_count': int(count),
+        'top_to_bottom_connected': bool(spanning_label),
+        'spanning_component_fraction': spanning_fraction,
+        'passed': bool(smooth and spanning_label),
+    }
+
+
+def _save_field_png(path: Path, field: np.ndarray, *, rank: bool = False) -> Path:
     from PIL import Image
 
-    arr = np.clip(np.asarray(field, dtype=np.float64), 0.0, 1.0)
+    arr = np.asarray(field, dtype=np.float64)
+    if rank:
+        arr = rank_ink_from_raw(arr).astype(np.float64)
+    else:
+        arr = np.clip(arr, 0.0, 1.0)
     Image.fromarray(
         (255.0 * (1.0 - arr)).clip(0, 255).astype(np.uint8), mode='L',
     ).save(path)
@@ -166,8 +260,9 @@ def _save_field_png(path: Path, field: np.ndarray) -> Path:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            'CLIP-only coarse dream ? occupancy scaffold ? Stage 6 physics. '
-            'Stops before physics if the tautology gate fails.'))
+            'CLIP-only coarse dream of the whole elevation, then occupancy '
+            'and Stage 6 physics. Stops before physics if the tautology gate '
+            'fails.'))
     parser.add_argument(
         '--prompt', default=DEFAULT_PROMPT,
         help=f'CLIP text prompt (default {DEFAULT_PROMPT!r})')
@@ -175,6 +270,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         '--dream-steps', type=int, default=DEFAULT_DREAM_STEPS)
     parser.add_argument(
         '--dream-lr', type=float, default=DEFAULT_DREAM_LR)
+    parser.add_argument('--control-height', type=int, default=16)
+    parser.add_argument('--control-width', type=int, default=8)
     parser.add_argument(
         '--target-allowed-mean', type=float,
         default=DEFAULT_SCAFFOLD_ALLOWED_MEAN)
@@ -196,41 +293,51 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     golden = _load_golden()
-    config = golden.motif_scale_run_config(args.prompt)
+    config = whole_building_dream_config(args.prompt, golden)
     output_dir = args.output_dir or dream_results_dir(config.prompt, golden=golden)
     if not output_dir.is_absolute():
         output_dir = REPO_ROOT / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    experiment = venice_250214_motif_scale()
-    scale_fracs = experiment.resolved_layout_scale_fracs()
+    if config.motif_scale_fracs:
+        raise ValueError(
+            f'whole-building dream requires empty motif_scale_fracs, got '
+            f'{config.motif_scale_fracs}')
 
     configure_torch_threads()
     print(
-        f'CLIP dream at coarse AdaptivePixel, prompt={config.prompt!r}, '
-        f'{args.dream_steps} steps, lr={args.dream_lr:g}, no FEA.')
+        f'CLIP dream of the whole elevation, prompt={config.prompt!r}, '
+        f'{args.dream_steps} steps, lr={args.dream_lr:g}, no FEA, '
+        f'{args.control_height}x{args.control_width} smooth control, '
+        'no motif-scale crops, no load-site frames.')
     model = build_dream_model(config, golden)
-    dream_losses = run_clip_dream(
-        model, steps=args.dream_steps, lr=args.dream_lr)
+    dream_losses, dream_logits = run_clip_dream(
+        model,
+        steps=args.dream_steps,
+        lr=args.dream_lr,
+        control_height=args.control_height,
+        control_width=args.control_width,
+    )
 
-    with torch.no_grad():
-        dream_coarse = np.asarray(model().detach().cpu().numpy(), dtype=np.float32)
+    dream_coarse = np.asarray(
+        dream_logits.cpu().numpy(), dtype=np.float32)
     while dream_coarse.ndim > 2:
         dream_coarse = dream_coarse[0]
     np.save(output_dir / 'dream_coarse.npy', dream_coarse)
-    _save_field_png(output_dir / 'dream_coarse.png', np.clip(dream_coarse, 0, 1))
+    _save_field_png(output_dir / 'dream_coarse.png', dream_coarse, rank=True)
 
     upsampled, threshold, scaffold = extract_dream_scaffold(
         dream_coarse,
         height=config.height,
         width=config.width,
-        scale_fracs=scale_fracs,
         target_mean=args.target_allowed_mean,
     )
     np.save(output_dir / 'dream_upsampled.npy', upsampled)
     np.save(output_dir / 'scaffold.npy', scaffold)
-    _save_field_png(output_dir / 'dream_upsampled.png', np.clip(upsampled, 0, 1))
+    _save_field_png(output_dir / 'dream_upsampled.png', upsampled, rank=True)
     _save_field_png(output_dir / 'scaffold.png', scaffold)
+    geometry = evaluate_dream_geometry(upsampled, scaffold)
+    print(json.dumps({'dream_geometry': geometry}, indent=2))
 
     baseline_path = args.baseline
     if not baseline_path.is_absolute():
@@ -262,7 +369,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 'dream_clip_loss': dream_losses[-1],
                 'scaffold_threshold': threshold,
                 'scaffold_mean': float(scaffold.mean()),
-                'scale_fracs': list(scale_fracs),
+                'motif_scale_fracs': [],
+                'union_load_sites': config.union_load_sites,
+                'control_grid': [args.control_height, args.control_width],
+                'dream_geometry': geometry,
                 'gate': gate,
                 'stopped': 'tautology_gate',
             }
@@ -286,7 +396,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             'dream_clip_loss': dream_losses[-1],
             'scaffold_threshold': threshold,
             'scaffold_mean': float(scaffold.mean()),
-            'scale_fracs': list(scale_fracs),
+            'motif_scale_fracs': [],
+            'union_load_sites': config.union_load_sites,
+            'control_grid': [args.control_height, args.control_width],
+            'dream_geometry': geometry,
             'gate': gate,
             'stopped': 'dream_only',
         }
@@ -295,7 +408,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f'Dream-only complete. Artifacts in {output_dir}')
         return 0
 
-    print('Physics pass: motif-scale CLIP + Stage 6 occupancy anneal...')
+    print('Physics pass: whole-building CLIP + Stage 6 occupancy anneal...')
     golden.seed_everything(config.seed)
     clip_loss = golden.build_clip_loss(config)
     golden.seed_everything(config.seed)
@@ -335,7 +448,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         'dream_clip_loss': dream_losses[-1],
         'scaffold_threshold': threshold,
         'scaffold_mean': float(scaffold.mean()),
-        'scale_fracs': list(scale_fracs),
+        'motif_scale_fracs': [],
+        'union_load_sites': config.union_load_sites,
+        'control_grid': [args.control_height, args.control_width],
+        'dream_geometry': geometry,
         'init_from_occupancy': True,
         'sketch_weight_start': 4000.0,
         'sketch_weight_end': 400.0,
