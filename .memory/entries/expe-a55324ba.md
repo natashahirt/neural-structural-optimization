@@ -15,7 +15,7 @@ files: neural_structural_optimization/models/loss_semantic_prior.py@8f1dafb, neu
   script/resources/results/clip_saliency_compliance_human_skull_hierarchical/summary.json@8f1dafb
 session_id: sess-655cccb4
 created_at: '2026-09-06T19:46:48.896663+00:00'
-updated_at: '2026-09-06T19:46:48.896663+00:00'
+updated_at: '2026-09-06T19:46:56.673341+00:00'
 results: '[{"metric": "preference_ink_fraction", "value": 0.4028, "unit": "fraction",
   "split": "human_skull_projected (beta=8, sigma=2, global)", "window": "final step
   of 40", "criterion": "below the beta=0 baseline 0.6824", "source": "clip_saliency_compliance_human_skull_projected"},
@@ -36,6 +36,7 @@ results: '[{"metric": "preference_ink_fraction", "value": 0.4028, "unit": "fract
   (beta=8, sigma=2, global)", "window": "final step of 40", "source": "clip_saliency_compliance_human_skull_projected"},
   {"metric": "component_count", "value": 7, "unit": "components", "split": "human_skull_hierarchical
   (beta=0 baseline)", "window": "final step of 40", "source": "clip_saliency_compliance_human_skull_hierarchical"}]'
+related_to: note-352e8ecf
 ---
 Closes the gray-drawing loophole from note-352e8ecf. Scales listed in `projection_scales` are now scored on a filter-then-project view of physical density (Gaussian blur for a minimum feature size, then a tanh Heaviside projection at eta=0.5), while physics keeps seeing the unprojected field. Projection is confined to the sculptural scale by default (`projection_scales=('global',)`), so the storey and member stages still score raw density and can resolve fine detail. `projection_beta=0` restores the previous behaviour exactly and the full suite stays green (296 passed, 8 skipped).
 
