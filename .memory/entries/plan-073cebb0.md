@@ -12,9 +12,10 @@ success: 'null'
 files: ''
 session_id: sess-c5f62176
 created_at: '2026-09-06T04:04:57.220192+00:00'
-updated_at: '2026-09-06T04:04:57.220192+00:00'
+updated_at: '2026-09-06T04:05:18.972492+00:00'
 has_child_rationale: User asked to build E1 now and park E2/E3; this is the load-path
   experiment.
+related_to: deci-a77885dc,plan-cbdb1948
 ---
 CLIP motif should inform the *load path*, not decorate a physics-chosen frame. Stage 6 sketches already do this via a spatial mass prior on physical density. The failed layout-distillation student (clip_motif_layout_no_occupancy) reused that prior but the scaffold was tautological: the teacher was itself a physics+CLIP run, so its ink already sat on the load path. Measured on that run: scaffold mean 0.7668 (Stage 6 templates are 0.64–0.83, so sparsity is not the difference), spatial_mass_loss 0.0078 vs Stage 6 residuals 0.31–0.60, mass_on_allowed 0.9994.
 
