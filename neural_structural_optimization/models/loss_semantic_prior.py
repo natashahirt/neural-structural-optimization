@@ -6,6 +6,10 @@ term attracts volume toward the evolving preference map. Preference is
 ``relu(-dL/d rho)`` on canonical physical density -- never inferred from
 displayed black/white polarity.
 
+Scales can optionally be scored on a filter-then-project view of the density
+so the motif cannot be satisfied by mechanically negligible gray. Physics
+always sees the unprojected field.
+
 Disabled / zero-weight is a no-op: no extra CLIP/SDS forwards, no extra
 ``PhysicalDensity`` eval, occupancy left unset.
 """
@@ -32,6 +36,10 @@ SDS_TIMESTEP_BANDS = {
     'member': (50, 200),
 }
 SDS_NUM_TIMESTEPS = 1000
+
+# Cells below this physical density carry little load, so preference mass
+# sitting there is semantic "ink" rather than structure.
+INK_DENSITY_THRESHOLD = 0.3
 
 
 def scale_fracs_for_grid(
@@ -69,6 +77,44 @@ def gaussian_blur2d(image: torch.Tensor, sigma: float) -> torch.Tensor:
     if squeezed:
         return x.view(image.shape)
     return x
+
+
+def heaviside_projection(
+    density: torch.Tensor,
+    beta: float,
+    eta: float = 0.5,
+) -> torch.Tensor:
+    """Smooth Heaviside projection about ``eta`` (Wang/Lazarov/Sigmund tanh form).
+
+    Stays differentiable, but ``d proj / d rho`` peaks at ``eta`` and decays
+    sharply in the faint tail. Scoring semantics on this view therefore pays
+    almost nothing for near-void density. ``beta <= 0`` is identity.
+    """
+    beta = float(beta)
+    if beta <= 0.0:
+        return density
+    eta = float(eta)
+    offset = float(np.tanh(beta * eta))
+    denom = offset + float(np.tanh(beta * (1.0 - eta)))
+    return (offset + torch.tanh(beta * (density - eta))) / denom
+
+
+def projected_density_view(
+    density: torch.Tensor,
+    *,
+    beta: float,
+    eta: float = 0.5,
+    filter_sigma: float = 0.0,
+) -> torch.Tensor:
+    """Filter-then-project view of density, for semantic scoring only.
+
+    The blur imposes a minimum feature size and the projection removes the
+    faint-gray tail, so the only way to improve the semantic score is to
+    commit material wider than ``filter_sigma`` at close to full density.
+    Physics still sees the unprojected field.
+    """
+    return heaviside_projection(
+        gaussian_blur2d(density, filter_sigma), beta, eta)
 
 
 def preference_from_score(
@@ -354,7 +400,15 @@ class DiffusionSDSProvider(SemanticScoreProvider):
 
 
 class SemanticSpatialPrior:
-    """EMA occupancy maps, one per physical scale, blended for the mass prior."""
+    """EMA occupancy maps, one per physical scale, blended for the mass prior.
+
+    Scales named in ``projection_scales`` are scored on a filter-then-project
+    view of the density instead of the raw field. That is the sculptural
+    setting: the motif can only score by committing material at member width,
+    not by laying down faint gray. Scales left out keep the raw view, so the
+    later detail stages can still resolve fine texture. ``projection_beta=0``
+    disables projection everywhere and restores the unprojected behaviour.
+    """
 
     def __init__(
         self,
@@ -367,6 +421,10 @@ class SemanticSpatialPrior:
         smooth_sigma: float = 1.5,
         curriculum: str = 'global_only',
         record_alignment: bool = False,
+        projection_beta: float = 0.0,
+        projection_eta: float = 0.5,
+        projection_filter_sigma: float = 0.0,
+        projection_scales: Sequence[str] = ('global',),
     ):
         if not 0.0 <= float(ema_decay) < 1.0:
             raise ValueError(f'ema_decay must be in [0, 1), got {ema_decay}')
@@ -374,6 +432,15 @@ class SemanticSpatialPrior:
             raise ValueError(
                 f"curriculum must be 'global_only', 'all', or 'hierarchical', "
                 f'got {curriculum!r}')
+        if not 0.0 < float(projection_eta) < 1.0:
+            raise ValueError(
+                f'projection_eta must be in (0, 1), got {projection_eta}')
+        projection_scales = tuple(str(name) for name in projection_scales)
+        unknown = set(projection_scales) - set(SCALE_NAMES)
+        if unknown:
+            raise ValueError(
+                f'unknown projection_scales {sorted(unknown)}, '
+                f'expected a subset of {SCALE_NAMES}')
         self.provider = provider
         self.scale_fracs = {str(k): float(v) for k, v in scale_fracs.items()}
         self.weight = float(weight)
@@ -382,6 +449,10 @@ class SemanticSpatialPrior:
         self.smooth_sigma = float(smooth_sigma)
         self.curriculum = str(curriculum)
         self.record_alignment = bool(record_alignment)
+        self.projection_beta = float(projection_beta)
+        self.projection_eta = float(projection_eta)
+        self.projection_filter_sigma = float(projection_filter_sigma)
+        self.projection_scales = projection_scales
         self.maps: dict[str, Optional[torch.Tensor]] = {name: None for name in SCALE_NAMES}
         self.last_instant: dict[str, torch.Tensor] = {}
         self.last_metrics: dict[str, float] = {}
@@ -392,6 +463,31 @@ class SemanticSpatialPrior:
         if self.auto_ratio is not None and not self._calibrated:
             return True
         return float(self.weight) != 0.0
+
+    def projects(self, scale: str) -> bool:
+        """Whether ``scale`` is scored on the filter-then-project view."""
+        return self.projection_beta > 0.0 and str(scale) in self.projection_scales
+
+    def _score_by_scale(
+        self,
+        density: torch.Tensor,
+        scales: Sequence[str],
+    ) -> dict[str, torch.Tensor]:
+        """Score each scale on its own view, projected or raw, of ``density``."""
+        projected = tuple(name for name in scales if self.projects(name))
+        raw = tuple(name for name in scales if name not in projected)
+        scores: dict[str, torch.Tensor] = {}
+        if raw:
+            scores.update(self.provider.score_by_scale(density, raw))
+        if projected:
+            view = projected_density_view(
+                density,
+                beta=self.projection_beta,
+                eta=self.projection_eta,
+                filter_sigma=self.projection_filter_sigma,
+            )
+            scores.update(self.provider.score_by_scale(view, projected))
+        return scores
 
     def active_scales(
         self,
@@ -452,7 +548,7 @@ class SemanticSpatialPrior:
         scales = self.active_scales(
             resizes=resizes, resize_num=resize_num,
             step=step, max_iterations=max_iterations)
-        scores = self.provider.score_by_scale(work, scales)
+        scores = self._score_by_scale(work, scales)
         height, width = int(work.shape[-2]), int(work.shape[-1])
         combined = None
         instant = {}
@@ -489,10 +585,31 @@ class SemanticSpatialPrior:
             'occupancy_mean': float(occupancy.mean()),
             'ema_delta': float(np.mean(delta) if delta else 0.0),
             'weight': float(self.weight),
+            'projection_beta': float(self.projection_beta),
+            'projected_scale_count': float(
+                sum(1 for name in scales if self.projects(name))),
+            'preference_ink_fraction': self._ink_fraction(work, combined),
         }
         for name in scales:
             self.last_metrics[f'occupancy_mean_{name}'] = float(self.maps[name].mean())
         return {name: self.maps[name] for name in scales}
+
+    @staticmethod
+    def _ink_fraction(
+        density: torch.Tensor,
+        preference: torch.Tensor,
+        threshold: float = INK_DENSITY_THRESHOLD,
+    ) -> float:
+        """Share of preference mass asking for material in near-void cells.
+
+        High values mean the motif is being satisfied by faint gray that
+        carries no load -- the failure mode projection is meant to close.
+        """
+        total = preference.sum()
+        if float(total) <= 0.0:
+            return 0.0
+        faint = (density.detach() < float(threshold)).to(preference.dtype)
+        return float((preference * faint).sum() / total)
 
     def blended_occupancy(self, density: torch.Tensor) -> torch.Tensor:
         """Detached ``[0, 1]`` occupancy on ``density``'s grid."""

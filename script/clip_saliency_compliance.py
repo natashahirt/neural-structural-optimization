@@ -6,7 +6,9 @@ Matched arms on a 32x64 (width x height) four-storey building:
 2. Venice scalar CLIP coupling
 3. scalar CLIP plus a live CLIP occupancy prior
 4. hierarchical (global -> storey -> member) CLIP prior
-5. frozen SDS prior through the same occupancy interface
+5. hierarchical prior whose sculptural scale is scored on a
+   filter-then-project view, so CLIP cannot draw with near-void gray
+6. frozen SDS prior through the same occupancy interface
 
 No generated reference image. Prior weights are set from the measured
 guidance-to-compliance gradient-norm ratio.
@@ -59,6 +61,10 @@ COARSE_HEIGHT = 64
 COARSE_INTERVAL = 16
 DEFAULT_STEPS = 60
 DEFAULT_AUTO_RATIO = 0.25
+# Sculptural projection: sharp enough to erase the faint tail without
+# flattening the mid-density gradient the prior still needs at neutral init.
+DEFAULT_PROJECTION_BETA = 8.0
+DEFAULT_PROJECTION_SIGMA = 2.0
 FULL_WIDTH = 128
 FULL_HEIGHT = 256
 FULL_INTERVAL = 64
@@ -137,7 +143,16 @@ def _results_dir(stem: str) -> Path:
     return path
 
 
-def _attach_prior(model, config: VeniceGoldenConfig, *, kind: str, curriculum: str):
+def _attach_prior(
+    model,
+    config: VeniceGoldenConfig,
+    *,
+    kind: str,
+    curriculum: str,
+    projection_beta: float = 0.0,
+    projection_filter_sigma: float = 0.0,
+    projection_scales: tuple[str, ...] = ('global',),
+):
     interval = int(model.env.args.get('interval', config.interval))
     height = int(model.full_params.height) if hasattr(model, 'full_params') else config.height
     fracs = scale_fracs_for_grid(height, interval)
@@ -164,6 +179,9 @@ def _attach_prior(model, config: VeniceGoldenConfig, *, kind: str, curriculum: s
         smooth_sigma=1.5,
         curriculum=curriculum,
         record_alignment=True,
+        projection_beta=projection_beta,
+        projection_filter_sigma=projection_filter_sigma,
+        projection_scales=projection_scales,
     )
     model.enable_semantic_prior(prior)
     return prior
@@ -200,6 +218,9 @@ def run_arm(
     prior_kind: Optional[str],
     curriculum: str = 'global_only',
     config: Optional[VeniceGoldenConfig] = None,
+    projection_beta: float = 0.0,
+    projection_filter_sigma: float = 0.0,
+    projection_scales: tuple[str, ...] = ('global',),
 ) -> dict:
     config = config or coarse_config(prompt)
     out = _results_dir(f'clip_saliency_compliance_{name}')
@@ -211,7 +232,11 @@ def run_arm(
     if prior_kind is not None:
         if clip_loss is None:
             raise ValueError('a semantic prior requires CLIP weights for the text embed / CLIP provider')
-        _attach_prior(model, config, kind=prior_kind, curriculum=curriculum)
+        _attach_prior(
+            model, config, kind=prior_kind, curriculum=curriculum,
+            projection_beta=projection_beta,
+            projection_filter_sigma=projection_filter_sigma,
+            projection_scales=projection_scales)
     ds = golden.build_optimizer(model, config).optimize()
     ds = golden.attach_final_raw_design(ds, model)
     validity, density, sites = _validity(model)
@@ -254,6 +279,12 @@ def run_arm(
         'clip_loss_raw': float(ds['clip_loss_raw'][-1]) if 'clip_loss_raw' in ds else None,
         'volume_actual': golden.venice_volume_ratio(ds['final_design_raw'].values),
         'prior_weight': None if prior is None else float(prior.weight),
+        'projection': None if prior is None else {
+            'beta': float(prior.projection_beta),
+            'eta': float(prior.projection_eta),
+            'filter_sigma': float(prior.projection_filter_sigma),
+            'scales': list(prior.projection_scales),
+        },
         'semantic_metrics_final': None if prior is None else dict(prior.last_metrics),
         'validity': validity,
         'paths': {
@@ -283,10 +314,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument('--skip-full', action='store_true')
     parser.add_argument(
         '--arms',
-        default='compliance,scalar_clip,clip_prior,hierarchical,venation,sds_prior',
+        default=(
+            'compliance,scalar_clip,clip_prior,hierarchical,projected,'
+            'venation,sds_prior'),
         help='Comma-separated arm names to run.',
     )
+    parser.add_argument(
+        '--projection-beta', type=float, default=DEFAULT_PROJECTION_BETA,
+        help='Heaviside sharpness for the sculptural arm. 0 disables projection.',
+    )
+    parser.add_argument(
+        '--projection-sigma', type=float, default=DEFAULT_PROJECTION_SIGMA,
+        help='Blur sigma in cells, imposing a minimum semantic feature size.',
+    )
+    parser.add_argument(
+        '--projection-scales', default='global',
+        help='Comma-separated scales scored on the projected view.',
+    )
     args = parser.parse_args(argv)
+    projection_scales = tuple(
+        name.strip() for name in args.projection_scales.split(',') if name.strip())
     wanted = {name.strip() for name in args.arms.split(',') if name.strip()}
     prompt = args.prompt
     config = coarse_config(prompt, max_iterations=args.steps)
@@ -316,6 +363,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             f'{golden.prompt_slug(prompt)}_hierarchical', prompt,
             with_clip=True, prior_kind='clip', curriculum='hierarchical',
             config=hier)
+
+    if 'projected' in wanted:
+        sculpt = dataclasses.replace(
+            config, resize_num=1, max_resize_iteration=max(args.steps // 3, 8),
+            max_iterations=args.steps)
+        summaries['projected'] = run_arm(
+            f'{golden.prompt_slug(prompt)}_projected', prompt,
+            with_clip=True, prior_kind='clip', curriculum='hierarchical',
+            projection_beta=args.projection_beta,
+            projection_filter_sigma=args.projection_sigma,
+            projection_scales=projection_scales,
+            config=sculpt)
 
     if 'venation' in wanted:
         venation = coarse_config('butterfly wing venation', max_iterations=args.steps)

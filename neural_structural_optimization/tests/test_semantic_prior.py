@@ -15,8 +15,10 @@ from neural_structural_optimization.models.loss_semantic_prior import (
     SemanticSpatialPrior,
     connectivity_metrics,
     gaussian_blur2d,
+    heaviside_projection,
     normalize_preference,
     preference_from_score,
+    projected_density_view,
     scale_fracs_for_grid,
 )
 from neural_structural_optimization.models.loss_structural import StructuralLoss
@@ -160,6 +162,143 @@ class EmaPriorTest(absltest.TestCase):
         self.assertAlmostEqual(fracs['global'], 1.0)
         self.assertAlmostEqual(fracs['storey'], 0.25)
         self.assertAlmostEqual(fracs['member'], 0.0625)
+
+
+def _prefers_material(density: torch.Tensor) -> torch.Tensor:
+    """Uniformly rewards material, so preference reflects only the view's slope."""
+    return -density.mean()
+
+
+class ProjectionTest(absltest.TestCase):
+    """The sculptural view: CLIP must commit material, not lay down gray."""
+
+    def test_zero_beta_is_identity(self):
+        field = torch.rand(6, 5)
+        torch.testing.assert_close(heaviside_projection(field, 0.0), field)
+        torch.testing.assert_close(
+            projected_density_view(field, beta=0.0, filter_sigma=0.0), field)
+
+    def test_projection_pushes_density_toward_zero_one(self):
+        field = torch.tensor([0.05, 0.5, 0.95])
+        projected = heaviside_projection(field, beta=8.0, eta=0.5)
+        self.assertLess(float(projected[0]), 0.02)
+        self.assertAlmostEqual(float(projected[1]), 0.5, places=5)
+        self.assertGreater(float(projected[2]), 0.98)
+
+    def test_faint_density_earns_far_less_preference_than_committed(self):
+        prior = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material),
+            scale_fracs={'global': 1.0},
+            weight=1.0,
+            ema_decay=0.0,
+            smooth_sigma=0.0,
+            curriculum='global_only',
+            projection_beta=8.0,
+            projection_filter_sigma=0.0,
+        )
+        density = torch.full((8, 8), 0.05)
+        density[:, 4:] = 0.5
+        prior.update(density)
+        pref = prior.maps['global']
+        self.assertGreater(float(pref[:, 4:].mean()), 20 * float(pref[:, :4].mean()))
+
+    def test_without_projection_faint_and_committed_score_alike(self):
+        prior = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material),
+            scale_fracs={'global': 1.0},
+            weight=1.0,
+            ema_decay=0.0,
+            smooth_sigma=0.0,
+            curriculum='global_only',
+        )
+        density = torch.full((8, 8), 0.05)
+        density[:, 4:] = 0.5
+        prior.update(density)
+        pref = prior.maps['global']
+        torch.testing.assert_close(pref[:, :4].mean(), pref[:, 4:].mean())
+
+    def test_filter_erases_features_below_the_minimum_size(self):
+        field = torch.zeros(16, 16)
+        field[:, 1:5] = 1.0  # wider than the filter
+        field[:, 12] = 1.0  # a single-cell stroke
+        view = projected_density_view(field, beta=8.0, filter_sigma=2.0)
+        self.assertGreater(float(view[8, 3]), 0.5)
+        self.assertLess(float(view[8, 12]), 0.1)
+
+    def test_projection_is_confined_to_the_sculptural_scales(self):
+        kwargs = dict(
+            scale_fracs={'global': 1.0, 'storey': 0.25},
+            weight=1.0,
+            ema_decay=0.0,
+            smooth_sigma=0.0,
+            curriculum='all',
+        )
+        density = torch.full((8, 8), 0.05)
+        density[:, 4:] = 0.5
+        baseline = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material), **kwargs)
+        sculpted = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material),
+            projection_beta=8.0,
+            projection_scales=('global',),
+            **kwargs,
+        )
+        baseline.update(density)
+        sculpted.update(density)
+        self.assertTrue(sculpted.projects('global'))
+        self.assertFalse(sculpted.projects('storey'))
+        self.assertFalse(sculpted.projects('member'))
+        # The detail scale is untouched; only the sculptural scale changes.
+        torch.testing.assert_close(sculpted.maps['storey'], baseline.maps['storey'])
+        self.assertGreater(
+            float((sculpted.maps['global'] - baseline.maps['global']).abs().max()),
+            1e-3)
+
+    def test_ink_fraction_separates_faint_from_committed_preference(self):
+        density = torch.tensor([[0.05, 0.9]])
+        faint = torch.tensor([[1.0, 0.0]])
+        committed = torch.tensor([[0.0, 1.0]])
+        self.assertAlmostEqual(
+            SemanticSpatialPrior._ink_fraction(density, faint), 1.0)
+        self.assertAlmostEqual(
+            SemanticSpatialPrior._ink_fraction(density, committed), 0.0)
+        self.assertEqual(
+            SemanticSpatialPrior._ink_fraction(density, torch.zeros(1, 2)), 0.0)
+
+    def test_projection_reduces_the_reported_ink_fraction(self):
+        kwargs = dict(
+            scale_fracs={'global': 1.0},
+            weight=1.0,
+            ema_decay=0.0,
+            smooth_sigma=0.0,
+            curriculum='global_only',
+        )
+        density = torch.full((8, 8), 0.05)
+        density[:, 4:] = 0.5
+        baseline = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material), **kwargs)
+        sculpted = SemanticSpatialPrior(
+            CallableScoreProvider(_prefers_material),
+            projection_beta=8.0, **kwargs)
+        baseline.update(density)
+        sculpted.update(density)
+        self.assertLess(
+            sculpted.last_metrics['preference_ink_fraction'],
+            baseline.last_metrics['preference_ink_fraction'])
+
+    def test_invalid_projection_settings_are_rejected(self):
+        with self.assertRaises(ValueError):
+            SemanticSpatialPrior(
+                CallableScoreProvider(_blob_score),
+                scale_fracs={'global': 1.0},
+                projection_eta=0.0,
+            )
+        with self.assertRaises(ValueError):
+            SemanticSpatialPrior(
+                CallableScoreProvider(_blob_score),
+                scale_fracs={'global': 1.0},
+                projection_scales=('facade',),
+            )
 
 
 class SdsProviderTest(absltest.TestCase):
