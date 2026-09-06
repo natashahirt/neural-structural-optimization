@@ -53,7 +53,10 @@ from neural_structural_optimization.models.loss_clip import VeniceClipPreset
 from neural_structural_optimization.models.model_base import VeniceLossAlgebra
 from neural_structural_optimization.structural.problems import StructuralParams
 from neural_structural_optimization.train import AdaptiveAdam_Optimizer
-from neural_structural_optimization.train.utils import init_weight_with_image
+from neural_structural_optimization.train.utils import (
+    init_weight_neutral,
+    init_weight_with_image,
+)
 
 # Copied out of the Venice tree (commit 97f9336) rather than referenced across
 # repositories. A golden run that reads its initial condition from a sibling
@@ -170,17 +173,20 @@ def build_model(
     config: VeniceGoldenConfig = GOLDEN,
     image_path: Optional[Path] = None,
 ) -> AdaptivePixelModel:
-    """Build the adaptive model, coarse-started and seeded from the image.
+    """Build the adaptive model, coarse-started and seeded.
+
+    The frozen Venice path seeds from an image. Motif research defaults
+    (``neutral_init``) use uniform volume fraction plus tiny noise instead.
 
     Args:
         clip_loss: the semantic loss, or None for a structure-only replay.
         config: the run configuration.
         image_path: override for the initial image; defaults to the copied
-            Venice asset.
+            Venice asset. Ignored when ``config.neutral_init`` is True.
 
     Returns:
         A model at the schedule's coarse resolution whose design parameter is
-        the initial image, with the legacy loss algebra enabled.
+        the seed field, with the legacy loss algebra enabled.
     """
     model = AdaptivePixelModel(
         structural_params=golden_structural_params(config),
@@ -201,11 +207,20 @@ def build_model(
         compliance_weight=config.compliance_weight,
     ))
 
-    init_weight_with_image(
-        model,
-        GOLDEN_IMAGE_PATH if image_path is None else image_path,
-        invert_image=config.invert_image,
-    )
+    if config.neutral_init:
+        init_weight_neutral(
+            model,
+            density=config.density,
+            seed=config.seed,
+            noise_amp=config.init_noise_amp,
+            union_load_sites=config.union_load_sites,
+        )
+    else:
+        init_weight_with_image(
+            model,
+            GOLDEN_IMAGE_PATH if image_path is None else image_path,
+            invert_image=config.invert_image,
+        )
     return model
 
 
@@ -410,7 +425,7 @@ def save_motif_scale_look(
 
     panels: list[tuple[str, Image.Image]] = [
         ('Venice 250214 RRC', reference),
-        ('Motif-scale CLIP, no occupancy', replay),
+        ('Motif-scale CLIP, neutral init', replay),
     ]
     for title, path in extra_panels:
         if path.is_file():
@@ -474,7 +489,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         action='store_true',
         help=(
             'Venice CLIP plus physical-scale crops; no sketch occupancy. '
-            'Writes script/resources/results/clip_motif_scale_no_occupancy/'),
+            'Neutral init (no Venice frame image). Writes '
+            'script/resources/results/clip_motif_scale_neutral_init/'),
     )
     parser.add_argument(
         '--output-dir',
@@ -487,7 +503,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         config = venice_250214_motif_scale().to_venice_golden()
         default_dir = (
             REPO_ROOT / 'script' / 'resources' / 'results'
-            / 'clip_motif_scale_no_occupancy')
+            / 'clip_motif_scale_neutral_init')
     else:
         config = GOLDEN
         default_dir = REPO_ROOT / 'script' / 'test_results_pytorch'
@@ -510,10 +526,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         occupancy_look = (
             REPO_ROOT / 'script' / 'resources' / 'results'
             / 'clip_motif_scale_sketch12' / 'sketch_run.png')
+        image_seeded_look = (
+            REPO_ROOT / 'script' / 'resources' / 'results'
+            / 'clip_motif_scale_no_occupancy' / 'sketch_run.png')
         replay_image, comparison_image = save_motif_scale_look(
             ds,
             output_dir,
             extra_panels=(
+                ('Image-seeded motif-scale (prior)', image_seeded_look),
                 ('Occupancy + motif-scale (prior)', occupancy_look),
             ),
         )
@@ -521,6 +541,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             'clip_prompt': config.prompt,
             'motif_scale': True,
             'occupancy': False,
+            'neutral_init': config.neutral_init,
+            'init_noise_amp': config.init_noise_amp,
+            'union_load_sites': config.union_load_sites,
             'motif_scale_fracs': list(config.motif_scale_fracs),
             'motif_scale_crops': config.motif_scale_crops,
             'motif_scale_weight': config.motif_scale_weight,

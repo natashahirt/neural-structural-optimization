@@ -110,6 +110,87 @@ def init_weight_with_image(
     return model.z
 
 
+DEFAULT_NEUTRAL_NOISE_AMP = 0.01
+
+
+def init_weight_neutral(
+    model,
+    density: float,
+    seed: int,
+    *,
+    noise_amp: float = DEFAULT_NEUTRAL_NOISE_AMP,
+    union_load_sites: bool = True,
+) -> torch.Tensor:
+    """Seed ``model.z`` with uniform volume fraction plus tiny deterministic noise.
+
+    No pre-authored frame. The field lives in ``[0, 1]`` pixel space at the
+    model's *current* (possibly coarse) grid, matching the image seeder's
+    contract. Optional load-application pixels are raised to 1 so a force
+    never starts on void.
+
+    Args:
+        model: a model exposing ``z`` of shape ``(1, height, width)`` and
+            ``env.args`` with ``mask`` / ``forces``.
+        density: target volume fraction.
+        seed: RNG seed for the symmetry-breaking noise.
+        noise_amp: half-width of uniform noise around ``density``.
+        union_load_sites: raise load-application elements to 1.
+
+    Returns:
+        The newly installed parameter.
+    """
+    if not 0.0 <= float(density) <= 1.0:
+        raise ValueError(f'density must be in [0, 1], got {density}')
+    if float(noise_amp) < 0.0:
+        raise ValueError(f'noise_amp must be >= 0, got {noise_amp}')
+    height, width = int(model.z.shape[-2]), int(model.z.shape[-1])
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(seed))
+    noise = (
+        torch.rand((1, height, width), generator=generator) * 2.0 - 1.0
+    ) * float(noise_amp)
+    field = torch.full((1, height, width), float(density)) + noise
+    mask_np = np.asarray(model.env.args.get('mask', 1.0), dtype=np.float32)
+    if mask_np.ndim == 0:
+        mask_np = np.full((height, width), float(mask_np), dtype=np.float32)
+    elif mask_np.ndim == 1:
+        mask_np = mask_np.reshape(height, width)
+    else:
+        mask_np = np.squeeze(mask_np)
+        if mask_np.ndim == 3 and mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        if mask_np.ndim != 2:
+            raise ValueError(
+                f'design mask must be 2-D after squeeze, got {mask_np.shape}')
+    mask = torch.as_tensor(mask_np, dtype=torch.float32)
+    if tuple(mask.shape) != (height, width):
+        mask = torch.nn.functional.interpolate(
+            mask.view(1, 1, mask.shape[-2], mask.shape[-1]),
+            size=(height, width),
+            mode='nearest',
+        ).view(height, width)
+    field = (field * mask.view(1, height, width)).clamp(0.0, 1.0)
+    if union_load_sites:
+        from neural_structural_optimization.models.loss_sketch import (
+            load_site_mask)
+        nely = int(model.env.args['nely'])
+        nelx = int(model.env.args['nelx'])
+        sites = torch.as_tensor(
+            load_site_mask(model.env.args['forces'], nely=nely, nelx=nelx),
+            dtype=torch.float32,
+        )
+        if tuple(sites.shape) != (height, width):
+            sites = torch.nn.functional.interpolate(
+                sites.view(1, 1, sites.shape[-2], sites.shape[-1]),
+                size=(height, width),
+                mode='nearest',
+            ).view(height, width)
+        field = torch.maximum(field, sites.view(1, height, width) * mask)
+    model.z = torch.nn.Parameter(
+        field.to(device=model.z.device).contiguous(), requires_grad=True)
+    return model.z
+
+
 def get_variables(model) -> np.ndarray:
     """Get flattened array from PyTorch model parameters."""
     return np.concatenate([

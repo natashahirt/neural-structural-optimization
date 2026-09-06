@@ -43,6 +43,7 @@ PHYSICS_PENAL = 3.0
 
 KNOWN_MODEL_KINDS = ('adaptive_pixel', 'pixel', 'cnn')
 KNOWN_OPTIMIZER_KINDS = ('adaptive_adam', 'adam', 'lbfgs')
+KNOWN_INIT_KINDS = ('image', 'neutral')
 
 
 def physical_motif_scale_fracs(
@@ -118,6 +119,13 @@ class VeniceGoldenConfig:
     motif_scale_fracs: tuple[float, ...] = ()
     motif_scale_crops: int = 4
     motif_scale_weight: float = 1.0
+
+    # False keeps the historical Venice image seed. True replaces it with
+    # uniform volfrac plus tiny deterministic noise (research default for
+    # motif runs). Not a silent change to GOLDEN.
+    neutral_init: bool = False
+    init_noise_amp: float = 0.01
+    union_load_sites: bool = True
 
 
 GOLDEN = VeniceGoldenConfig()
@@ -204,10 +212,19 @@ class OptimizerConfig:
 
 @dataclasses.dataclass(frozen=True)
 class InitConfig:
-    """Optional image seed, in [0, 1] pixel space."""
+    """How the design parameter is seeded, in [0, 1] pixel space.
 
+    ``kind='image'`` is the frozen Venice path: a resampled drawing.
+    ``kind='neutral'`` is the research default for motif runs: uniform
+    volume fraction plus tiny deterministic noise, with optional load-site
+    collectors. ``image is None`` is required for neutral.
+    """
+
+    kind: str = 'neutral'
     image: Optional[str] = None
     invert_image: bool = True
+    noise_amp: float = 0.01
+    union_load_sites: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -355,9 +372,21 @@ class ExperimentConfig:
                 max_resize_iteration=golden.max_resize_iteration,
                 convergence_threshold=golden.convergence_threshold,
             ),
-            init=InitConfig(
-                image=VENICE_250214_IMAGE,
-                invert_image=golden.invert_image,
+            init=(
+                InitConfig(
+                    kind='neutral',
+                    invert_image=golden.invert_image,
+                    noise_amp=golden.init_noise_amp,
+                    union_load_sites=golden.union_load_sites,
+                )
+                if golden.neutral_init else
+                InitConfig(
+                    kind='image',
+                    image=VENICE_250214_IMAGE,
+                    invert_image=golden.invert_image,
+                    noise_amp=golden.init_noise_amp,
+                    union_load_sites=golden.union_load_sites,
+                )
             ),
             run=RunConfig(
                 seed=golden.seed,
@@ -404,6 +433,9 @@ class ExperimentConfig:
             seed=self.run.seed,
             device=self.run.device,
             invert_image=self.init.invert_image,
+            neutral_init=self.init.kind == 'neutral',
+            init_noise_amp=self.init.noise_amp,
+            union_load_sites=self.init.union_load_sites,
         )
 
     # -- StructuralParams / effective settings ------------------------------
@@ -590,6 +622,19 @@ class ExperimentConfig:
                 raise ValueError(
                     f'layout.teacher_raw_path does not exist: '
                     f'{self.layout.teacher_raw_path}')
+        if self.init.kind not in KNOWN_INIT_KINDS:
+            raise ValueError(
+                f'unknown init.kind {self.init.kind!r}; '
+                f'expected one of {KNOWN_INIT_KINDS}')
+        if self.init.kind == 'image' and not self.init.image:
+            raise ValueError('init.kind="image" requires init.image')
+        if self.init.kind == 'neutral' and self.init.image:
+            raise ValueError(
+                'init.kind="neutral" cannot set init.image; the point is to '
+                'avoid a pre-authored frame')
+        if self.init.noise_amp < 0.0:
+            raise ValueError(
+                f'init.noise_amp must be >= 0, got {self.init.noise_amp}')
 
     # -- serialization / overrides ------------------------------------------
 
@@ -674,11 +719,17 @@ def venice_250214_motif_scale() -> ExperimentConfig:
 
     The 250214 RandomResizedCrop pipeline is unchanged. Extra crops are
     elevation fractions (whole building / storey / member), not sketch
-    silhouette matching.
+    silhouette matching. Neutral initialization is the research default:
+    no Venice frame seed, so CLIP can move coarse topology.
     """
     fracs = physical_motif_scale_fracs(GOLDEN.height, GOLDEN.interval)
     return venice_250214().with_overrides(
-        **{'clip.motif_scale_fracs': list(fracs), 'name': 'venice_250214_motif_scale'})
+        **{
+            'clip.motif_scale_fracs': list(fracs),
+            'name': 'venice_250214_motif_scale',
+            'init.kind': 'neutral',
+            'init.image': None,
+        })
 
 
 def venice_250214_motif_layout() -> ExperimentConfig:
