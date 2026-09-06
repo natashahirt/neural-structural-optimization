@@ -218,5 +218,34 @@ class MotifScaleClipPathTest(absltest.TestCase):
         self.assertNotIn('motif_image', params)
 
 
+class ClipDreamLayoutDirTest(absltest.TestCase):
+
+    def test_results_dir_is_a_sibling_of_the_pixel_motif_dirs(self):
+        spec = importlib.util.spec_from_file_location(
+            'clip_dream_layout',
+            _REPO_ROOT / 'script' / 'clip_dream_layout.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        golden_script = _load_golden_script()
+        path = module.dream_results_dir(
+            'butterfly wing venation', golden=golden_script)
+        self.assertEqual(path.name, 'clip_dream_layout_butterfly_wing_venation')
+
+    def test_gate_helper_agrees_with_the_mass_prior_loss(self):
+        spec = importlib.util.spec_from_file_location(
+            'clip_dream_layout',
+            _REPO_ROOT / 'script' / 'clip_dream_layout.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        scaffold = torch.zeros(8, 4)
+        scaffold[:, :2] = 1.0
+        density = torch.zeros(8, 4)
+        density[:, 2:] = 1.0
+        gate = module.evaluate_tautology_gate(
+            scaffold.numpy(), density.numpy())
+        self.assertGreaterEqual(gate['spatial_mass_loss'], 0.99)
+        self.assertTrue(gate['passed'])
+
+
 if __name__ == '__main__':
     absltest.main()

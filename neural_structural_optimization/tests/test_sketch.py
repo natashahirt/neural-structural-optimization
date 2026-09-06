@@ -826,5 +826,102 @@ class MotifLayoutScaffoldTest(absltest.TestCase):
     self.assertEqual(restored.layout, cfg.layout)
 
 
+class ClipDreamScaffoldGateTest(absltest.TestCase):
+  """E1 helpers: quantile scaffold and tautology gate. No CLIP, no FEA."""
+
+  def test_resample_is_identity_on_matching_grid(self):
+    from neural_structural_optimization.models.loss_sketch import resample_field
+
+    field = _left_half_occupancy()
+    np.testing.assert_array_equal(
+        resample_field(field, _HEIGHT, _WIDTH), field)
+
+  def test_resample_doubles_each_axis(self):
+    from neural_structural_optimization.models.loss_sketch import resample_field
+
+    field = _left_half_occupancy(height=8, width=4)
+    out = resample_field(field, 16, 8)
+    self.assertEqual(out.shape, (16, 8))
+    self.assertGreater(float(out[:, :4].mean()), float(out[:, 4:].mean()))
+
+  def test_threshold_search_hits_stage6_allowed_band(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        DEFAULT_SCAFFOLD_ALLOWED_MEAN,
+        motif_layout_threshold_for_allowed_mean,
+    )
+
+    # A 0/1 silhouette has only one ink set; the cut has to see a range.
+    ramp = np.tile(
+        np.linspace(0.0, 1.0, 32, dtype=np.float32), (64, 1))
+    threshold, scaffold = motif_layout_threshold_for_allowed_mean(
+        ramp,
+        scale_fracs=(0.25, 0.0625),
+        target_mean=DEFAULT_SCAFFOLD_ALLOWED_MEAN,
+        abs_tol=0.03,
+    )
+    self.assertGreater(threshold, 0.0)
+    self.assertLess(threshold, 1.0)
+    self.assertAlmostEqual(
+        float(scaffold.mean()), DEFAULT_SCAFFOLD_ALLOWED_MEAN, delta=0.03)
+
+  def test_empty_field_cannot_make_a_scaffold(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        motif_layout_threshold_for_allowed_mean,
+    )
+
+    with self.assertRaises(ValueError):
+      motif_layout_threshold_for_allowed_mean(
+          np.zeros((_HEIGHT, _WIDTH), dtype=np.float32),
+          scale_fracs=(0.25, 0.0625))
+
+  def test_matching_density_fails_the_tautology_gate(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        DEFAULT_TAUTOLOGY_MIN_MASS_OFF,
+        motif_layout_scaffold,
+        scaffold_spatial_mass_loss,
+    )
+
+    teacher = _left_half_occupancy(height=64, width=32)
+    scaffold = motif_layout_scaffold(
+        teacher, scale_fracs=(0.25, 0.0625), threshold=0.5)
+    # A density that already lives on the scaffold is the failed teacher.
+    self.assertLess(
+        scaffold_spatial_mass_loss(scaffold, scaffold),
+        DEFAULT_TAUTOLOGY_MIN_MASS_OFF)
+
+  def test_orthogonal_density_passes_the_tautology_gate(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        DEFAULT_TAUTOLOGY_MIN_MASS_OFF,
+        motif_layout_scaffold,
+        scaffold_spatial_mass_loss,
+    )
+
+    teacher = _left_half_occupancy(height=64, width=32)
+    scaffold = motif_layout_scaffold(
+        teacher, scale_fracs=(0.25, 0.0625), threshold=0.5)
+    other = np.zeros_like(teacher)
+    other[:, teacher.shape[1] // 2 :] = 1.0
+    self.assertGreaterEqual(
+        scaffold_spatial_mass_loss(other, scaffold),
+        DEFAULT_TAUTOLOGY_MIN_MASS_OFF)
+
+  def test_occupancy_init_does_not_copy_a_teacher_field(self):
+    from neural_structural_optimization.models.loss_sketch import (
+        apply_scaffold_as_occupancy_prior,
+    )
+
+    scaffold = _left_half_occupancy()
+    teacher = np.full((_HEIGHT, _WIDTH), 0.8, dtype=np.float32)
+    model = PixelModel(structural_params=_params(), seed=0)
+    apply_scaffold_as_occupancy_prior(
+        model, scaffold, weight=10.0, weight_end=1.0, init_from_occupancy=True)
+    z = model.z.detach().cpu().numpy()
+    while z.ndim > 2:
+      z = z[0]
+    self.assertGreater(float(z[:, : _WIDTH // 2].mean()),
+                       float(z[:, _WIDTH // 2 :].mean()))
+    self.assertFalse(np.allclose(z, teacher))
+
+
 if __name__ == '__main__':
   absltest.main()

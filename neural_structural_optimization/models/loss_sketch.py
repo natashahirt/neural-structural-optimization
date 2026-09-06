@@ -267,6 +267,111 @@ def motif_layout_scaffold(
     return np.clip(scaffold, 0.0, 1.0).astype(np.float32)
 
 
+# Stage 6 allowed templates measured 0.64-0.83 mean occupancy. Target the
+# middle of that band so a CLIP-dream scaffold is comparable, not sparser
+# by construction and not a filled facade.
+DEFAULT_SCAFFOLD_ALLOWED_MEAN = 0.75
+# Stage 6 converged with spatial_mass_loss 0.31-0.60 against its template.
+# The failed CLIP-teacher scaffold scored 0.0078 - tautological. A dream
+# scaffold must beat this floor against a physics-layout proxy before a
+# student run is worth spending.
+DEFAULT_TAUTOLOGY_MIN_MASS_OFF = 0.25
+
+
+def resample_field(
+    field: Union[np.ndarray, torch.Tensor],
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Bilinear resample a 2-D field to ``(height, width)``. No clamp.
+
+    Dream fields are unbounded design parameters, same contract as
+    :func:`init_weight_from_teacher`. Identity when the shape already matches.
+    """
+    if height < 1 or width < 1:
+        raise ValueError(f'target grid must be positive, got {height}x{width}')
+    arr = _as_numpy(field).astype(np.float32)
+    if arr.ndim == 3:
+        arr = np.squeeze(arr, axis=0)
+    if arr.ndim != 2:
+        raise ValueError(f'field must be 2-D after squeeze, got {arr.shape}')
+    if arr.shape == (height, width):
+        return arr
+    tensor = torch.as_tensor(arr)[None, None]
+    out = F.interpolate(
+        tensor, size=(height, width), mode='bilinear', align_corners=False)
+    return out[0, 0].detach().cpu().numpy().astype(np.float32)
+
+
+def motif_layout_threshold_for_allowed_mean(
+    teacher_field: Union[np.ndarray, torch.Tensor],
+    *,
+    scale_fracs: Sequence[float],
+    target_mean: float = DEFAULT_SCAFFOLD_ALLOWED_MEAN,
+    envelope_sigma_frac: float = 0.25,
+    combine: str = 'max',
+    abs_tol: float = 0.03,
+    max_iter: int = 24,
+) -> tuple[float, np.ndarray]:
+    """Binary-search the ink cut so ``scaffold.mean()`` hits ``target_mean``.
+
+    Higher threshold -> sparser ink -> lower allowed area. Empty-ink thresholds
+    are treated as too high. Raises if no cut lands within ``abs_tol`` of
+    the target - that is a field that cannot become a Stage-6-like prior.
+    """
+    if not 0.0 < float(target_mean) < 1.0:
+        raise ValueError(
+            f'target_mean must be in (0, 1), got {target_mean!r}')
+    if float(abs_tol) <= 0.0:
+        raise ValueError(f'abs_tol must be > 0, got {abs_tol!r}')
+    lo, hi = 0.0, 1.0
+    best: Optional[tuple[float, np.ndarray, float]] = None
+    for _ in range(int(max_iter)):
+        mid = 0.5 * (lo + hi)
+        try:
+            scaffold = motif_layout_scaffold(
+                teacher_field,
+                scale_fracs=scale_fracs,
+                threshold=mid,
+                envelope_sigma_frac=envelope_sigma_frac,
+                combine=combine,
+            )
+        except ValueError:
+            hi = mid
+            continue
+        mean = float(scaffold.mean())
+        best = (mid, scaffold, mean)
+        if abs(mean - float(target_mean)) <= float(abs_tol):
+            return mid, scaffold
+        if mean > float(target_mean):
+            lo = mid
+        else:
+            hi = mid
+    if best is None:
+        raise ValueError(
+            'could not extract a non-empty scaffold at any ink threshold')
+    threshold, scaffold, mean = best
+    if abs(mean - float(target_mean)) > float(abs_tol):
+        raise ValueError(
+            f'could not hit allowed_mean={float(target_mean):.3f} '
+            f'(got {mean:.3f} at threshold={threshold:.3f})')
+    return threshold, scaffold
+
+
+def scaffold_spatial_mass_loss(
+    density: Union[np.ndarray, torch.Tensor],
+    scaffold: Union[np.ndarray, torch.Tensor],
+    load_sites: Optional[Union[np.ndarray, torch.Tensor]] = None,
+) -> float:
+    """``sketch_mass_prior_loss`` as a detached scalar (the tautology gate)."""
+    dens = torch.as_tensor(_as_numpy(density), dtype=torch.float32)
+    occ = torch.as_tensor(_as_numpy(scaffold), dtype=torch.float32)
+    sites = None
+    if load_sites is not None:
+        sites = torch.as_tensor(_as_numpy(load_sites), dtype=torch.float32)
+    return float(sketch_mass_prior_loss(dens, occ, load_sites=sites).detach())
+
+
 def init_weight_from_teacher(model, teacher_z) -> torch.Tensor:
     """Seed ``model.z`` from a teacher design at the model's current grid.
 
@@ -754,6 +859,50 @@ def apply_motif_layout_config(
     )
     if bool(getattr(layout, 'init_from_teacher', False)):
         init_weight_from_teacher(model, teacher_field)
+    return model
+
+
+def apply_scaffold_as_occupancy_prior(
+    model,
+    scaffold,
+    *,
+    weight: float = 4000.0,
+    weight_end: Optional[float] = 400.0,
+    init_from_occupancy: bool = True,
+):
+    """Attach a CLIP-dream scaffold the way Stage 6 attaches a sketch.
+
+    Motif/patch terms stay off. ``init_from_occupancy`` seeds ``z`` from
+    occupancy union load pixels at the *current* grid - not from a physics
+    teacher, which is how the layout-distillation student became tautological.
+    """
+    occupancy = _as_numpy(scaffold).astype(np.float32)
+    if occupancy.ndim == 3:
+        occupancy = np.squeeze(occupancy, axis=0)
+    if occupancy.ndim != 2:
+        raise ValueError(
+            f'scaffold must be 2-D after squeeze, got {occupancy.shape}')
+    model.enable_sketch_prior(
+        occupancy,
+        weight=float(weight),
+        weight_end=weight_end,
+        motif_weight=0.0,
+        patch_weight=0.0,
+    )
+    if not init_from_occupancy:
+        return model
+    nely = int(model.env.args['nely'])
+    nelx = int(model.env.args['nelx'])
+    sites = load_site_mask(model.env.args['forces'], nely=nely, nelx=nelx)
+    occ_t = torch.as_tensor(occupancy, dtype=torch.float32)
+    if occ_t.shape[-2] != nely or occ_t.shape[-1] != nelx:
+        occ_t = F.interpolate(
+            occ_t.view(1, 1, occ_t.shape[-2], occ_t.shape[-1]),
+            size=(nely, nelx),
+            mode='nearest',
+        ).view(nely, nelx)
+    allowed = np.maximum(occ_t.detach().cpu().numpy(), sites)
+    init_weight_with_occupancy(model, allowed)
     return model
 
 
