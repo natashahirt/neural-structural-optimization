@@ -13,7 +13,7 @@ files: script/venice_golden_250214.py@739db61, script/resources/results/clip_mot
   script/resources/results/clip_motif_scale_no_occupancy/comparison.png@739db61, script/resources/results/clip_motif_scale_no_occupancy/sketch_run.png@739db61
 session_id: sess-ee90841b
 created_at: '2026-09-05T14:37:14.038742+00:00'
-updated_at: '2026-09-05T22:34:25.150822+00:00'
+updated_at: '2026-09-06T02:46:31.378776+00:00'
 results: '[{"metric": "compliance", "value": 80.04190063476562, "split": "venice-250214-motif-scale-no-occupancy",
   "window": "final-step", "source": "script/resources/results/clip_motif_scale_no_occupancy/summary.json"},
   {"metric": "clip_loss", "value": 598.6527709960938, "split": "venice-250214-motif-scale-no-occupancy",
@@ -30,7 +30,7 @@ results: '[{"metric": "compliance", "value": 80.04190063476562, "split": "venice
   "window": "final-step", "source": "script/resources/results/clip_motif_scale_no_occupancy/summary.json"},
   {"metric": "compliance", "value": 73.99691670938864, "split": "venice-250214-GOLDEN_FINAL",
   "window": "final-step", "source": "script/venice_golden_250214.py@739db61"}]'
-related_to: expe-79957d80,expe-083c1ce7,expe-816a8d8e
+related_to: expe-79957d80,expe-083c1ce7,expe-816a8d8e,expe-b544bb5e
 ---
 Venice 250214 skeletons + physical-scale CLIP crops, no sketch occupancy and no spatial anneal. Seed is the golden image. Fracs (1.0, 0.25, 0.0625), 4 crops/scale, weight 1.0. Wrote script/resources/results/clip_motif_scale_no_occupancy/.
 

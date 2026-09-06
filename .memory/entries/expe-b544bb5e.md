@@ -15,7 +15,7 @@ files: neural_structural_optimization/train/utils.py@3a308e6, neural_structural_
   script/resources/results/clip_motif_scale_neutral_init/sketch_run.png@3a308e6
 session_id: sess-c5f62176
 created_at: '2026-09-06T02:46:20.670105+00:00'
-updated_at: '2026-09-06T02:46:20.670105+00:00'
+updated_at: '2026-09-06T02:46:31.378776+00:00'
 has_child_rationale: Tests the decision that dropping the Venice image seed lets CLIP
   move coarse topology.
 results: '[{"metric": "compliance", "value": 71.77558898925781, "split": "clip_motif_scale_neutral_init",
@@ -36,6 +36,7 @@ results: '[{"metric": "compliance", "value": 71.77558898925781, "split": "clip_m
   "window": "final-step", "source": "script/resources/results/clip_motif_scale_neutral_init/summary.json"},
   {"metric": "steps", "value": 135, "split": "clip_motif_scale_neutral_init", "window":
   "full-run", "source": "script/resources/results/clip_motif_scale_neutral_init/summary.json"}]'
+related_to: expe-2293aefa
 ---
 Venice 250214 skeletons + physical-scale CLIP crops, no occupancy, **neutral init** (uniform volfrac + noise_amp=0.01, union_load_sites=true). Fracs (1.0, 0.25, 0.0625), 4 crops/scale, weight 1.0. Wrote `script/resources/results/clip_motif_scale_neutral_init/` — does not overwrite the image-seeded teacher at `clip_motif_scale_no_occupancy/`.
 
