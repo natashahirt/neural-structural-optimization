@@ -1,0 +1,36 @@
+---
+id: deci-886bbf44
+type: decision
+project: semantopology_hardfork
+parent_id: plan-6762b35e
+title: Measurement plumbing + compliance baseline before further CLIP layout work
+node_label: 'Measurement plumbing + compliance baseline before '
+tags: clip,measurement,plumbing,sds,coordinator
+status: active
+open_threads: 0
+success: 'null'
+files: neural_structural_optimization/models/loss_semantic_prior.py@a91aa20, neural_structural_optimization/tests/test_semantic_prior.py@a91aa20,
+  script/clip_saliency_compliance.py@a91aa20, script/clip_dream_layout.py@a91aa20,
+  script/stage6_sketch_on_golden.py@a91aa20, script/resources/results/clip_saliency_compliance/README.md@a91aa20,
+  script/resources/results/README.md@a91aa20
+session_id: sess-bd84de5d
+created_at: '2026-09-08T17:44:18.911633+00:00'
+updated_at: '2026-09-08T17:44:18.911633+00:00'
+has_child_rationale: Session outcome for the approved measurement-plumbing plan
+results: '[{"metric": "density_png_pixel", "value": 165, "split": "[0.25,0.35]-field",
+  "window": "fixed-[0,1]-ramp", "criterion": "mid-gray 165-191 not stretched", "source":
+  "reviewer-npy-roundtrip"}, {"metric": "density_png_pixel", "value": 191, "split":
+  "[0.25,0.35]-field", "window": "fixed-[0,1]-ramp", "criterion": "mid-gray 165-191
+  not stretched", "source": "reviewer-npy-roundtrip"}, {"metric": "occupancy_render_pixel",
+  "value": 243, "split": "occupancy-0.047", "window": "absolute-scale", "criterion":
+  "not-0-255", "source": "reviewer2"}, {"metric": "occupancy_render_pixel", "value":
+  237, "split": "occupancy-0.069", "window": "absolute-scale", "criterion": "not-0-255",
+  "source": "reviewer2"}]'
+---
+Coordinator run run-bf46a812 (1 of 3 extensions used, 0 failed) implemented the measurement contract that gates further CLIP layout work.
+
+Both CLIP pipelines (`clip_saliency_compliance` and `clip_dream_layout`) now save un-normalised physical density and the raw design as `.npy`. Density PNGs use a fixed [0, 1] ramp so contrast is comparable across runs. The pipelines share one metrics helper so summaries emit the same keys. SDS is opt-in only (not a default arm).
+
+A critic-triggered fix cycle restored the 48 tracked Stage 6 files under `SUCCESS_sketch_to_structure` (git R100), retargeted the corpus strip so a missing sketch raises FileNotFoundError instead of silently skipping, made occupancy render on an absolute scale, passed occupancy into saliency `report_design_metrics`, and added Stage 6 `save_design_arrays`.
+
+Reviewer confirmed `.npy` round-trips, a [0.25, 0.35] field renders mid-gray (pixels 165–191, not stretched), occupancy 0.047 vs 0.069 renders 243 vs 237 (not 0–255), and relocated metrics match on-disk summaries.
