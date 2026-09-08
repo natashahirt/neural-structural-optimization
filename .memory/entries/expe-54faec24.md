@@ -15,7 +15,7 @@ files: script/resources/results/clip_saliency_compliance/human_skull_projected_f
   script/resources/results/clip_saliency_compliance/butterfly_wing_venation_projected/summary.json@2455bfa
 session_id: sess-655cccb4
 created_at: '2026-09-06T20:08:13.321280+00:00'
-updated_at: '2026-09-06T20:08:13.321280+00:00'
+updated_at: '2026-09-08T17:45:39.056110+00:00'
 results: '[{"metric": "compliance", "value": 93.0694, "unit": "compliance", "split":
   "human_skull_projected_full (beta=8, sigma=2, global)", "window": "final step of
   80 at 128x256", "criterion": "compare to unprojected full replay 80.46", "source":
@@ -31,6 +31,7 @@ results: '[{"metric": "compliance", "value": 93.0694, "unit": "compliance", "spl
   {"metric": "compliance", "value": 199.3965, "unit": "compliance", "split": "butterfly_wing_venation_projected
   (beta=8, sigma=2, hierarchical)", "window": "final step of 40 at 32x64", "source":
   "clip_saliency_compliance/butterfly_wing_venation_projected"}]'
+related_to: expe-d7945d40
 ---
 128×256 hierarchical replay of the sculptural-projection prior (beta=8, sigma=2, global scale only; storey/member still score raw density). Same seed 12, 80 steps, volfrac 0.3, as the unprojected full replay in note-352e8ecf.
 
