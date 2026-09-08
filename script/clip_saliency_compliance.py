@@ -12,6 +12,12 @@ Matched arms on a 32x64 (width x height) four-storey building:
 
 No generated reference image. Prior weights are set from the measured
 guidance-to-compliance gradient-norm ratio.
+
+A "full replay" is not a weight reload. Coarse arms (32x64) are the
+causal test; if a prior arm stays connected and beats scalar CLIP on
+``clip_loss_raw``, the same mechanism is run again from scratch at
+128x256 so the motif is actually readable. Outputs live under
+``script/resources/results/clip_saliency_compliance/``.
 """
 
 from __future__ import annotations
@@ -137,8 +143,17 @@ def _stack_panels(path: Path, panels: list[tuple[str, np.ndarray]]) -> Path:
     return path
 
 
+FAMILY_DIR = REPO_ROOT / 'script' / 'resources' / 'results' / 'clip_saliency_compliance'
+
+
 def _results_dir(stem: str) -> Path:
-    path = REPO_ROOT / 'script' / 'resources' / 'results' / stem
+    """Arm directory under the saliency-compliance family.
+
+    ``stem`` may be a bare arm name (``human_skull_projected``) or the
+    legacy ``clip_saliency_compliance_<arm>`` prefix.
+    """
+    name = stem.removeprefix('clip_saliency_compliance_')
+    path = FAMILY_DIR / name
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -383,6 +398,43 @@ def main(argv: Optional[list[str]] = None) -> int:
             with_clip=True, prior_kind='clip', curriculum='global_only',
             config=venation)
 
+    if 'venation_projected' in wanted:
+        venation_sculpt = coarse_config(
+            'butterfly wing venation', max_iterations=args.steps,
+            resize_num=1, max_resize_iteration=max(args.steps // 3, 8))
+        summaries['venation_projected'] = run_arm(
+            'butterfly_wing_venation_projected', 'butterfly wing venation',
+            with_clip=True, prior_kind='clip', curriculum='hierarchical',
+            projection_beta=args.projection_beta,
+            projection_filter_sigma=args.projection_sigma,
+            projection_scales=projection_scales,
+            config=venation_sculpt)
+
+    if 'projected_full' in wanted:
+        full = VeniceGoldenConfig(
+            width=FULL_WIDTH,
+            height=FULL_HEIGHT,
+            interval=FULL_INTERVAL,
+            density=0.3,
+            resize_num=2,
+            prompt=prompt,
+            num_augs=8,
+            clip_alpha=10.0,
+            lr=0.2,
+            max_iterations=80,
+            max_resize_iteration=30,
+            seed=12,
+            motif_scale_fracs=(),
+            neutral_init=True,
+        )
+        summaries['projected_full'] = run_arm(
+            f'{golden.prompt_slug(prompt)}_projected_full', prompt,
+            with_clip=True, prior_kind='clip', curriculum='hierarchical',
+            projection_beta=args.projection_beta,
+            projection_filter_sigma=args.projection_sigma,
+            projection_scales=projection_scales,
+            config=full)
+
     if 'sds_prior' in wanted:
         summaries['sds_prior'] = run_arm(
             f'{golden.prompt_slug(prompt)}_sds_prior', prompt,
@@ -416,8 +468,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             with_clip=True, prior_kind='clip', curriculum='hierarchical',
             config=full)
 
-    index = _results_dir('clip_saliency_compliance_index')
-    (index / 'summary.json').write_text(json.dumps(summaries, indent=2) + '\n')
+    FAMILY_DIR.mkdir(parents=True, exist_ok=True)
+    (FAMILY_DIR / 'index.json').write_text(json.dumps(summaries, indent=2) + '\n')
     return 0
 
 

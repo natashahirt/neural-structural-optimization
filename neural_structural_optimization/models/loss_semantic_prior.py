@@ -117,6 +117,18 @@ def projected_density_view(
         gaussian_blur2d(density, filter_sigma), beta, eta)
 
 
+def sigma_for_min_feature(width: int, min_feature_frac: float) -> float:
+    """Blur sigma erasing features narrower than ``min_feature_frac * width``.
+
+    Expressed relative to the domain so the minimum feature stays physically
+    constant as the hierarchical curriculum upsamples the grid. A feature of
+    width ``w`` is suppressed by a Gaussian of roughly ``w / 2``.
+    """
+    if float(min_feature_frac) <= 0.0:
+        return 0.0
+    return max(0.5, 0.5 * float(min_feature_frac) * float(width))
+
+
 def preference_from_score(
     density: torch.Tensor,
     score: torch.Tensor,
