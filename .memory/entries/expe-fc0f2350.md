@@ -7,13 +7,13 @@ title: Coarse skull CLIP/SDS spatial-prior arms
 node_label: Coarse skull CLIP/SDS spatial-prior arms
 tags: clip,sds,spatial-prior,experiment,skull,venation
 status: active
-open_threads: 0
+open_threads: 3
 success: 'true'
 files: script/clip_saliency_compliance.py@ceb3f48, neural_structural_optimization/models/loss_semantic_prior.py@ceb3f48,
   script/resources/results/clip_saliency_compliance_index/summary.json@c94f3aa
 session_id: sess-5c3dbfc6
 created_at: '2026-09-06T18:42:16.508477+00:00'
-updated_at: '2026-09-06T18:42:16.508477+00:00'
+updated_at: '2026-09-08T17:45:45.971280+00:00'
 results: '[{"metric": "compliance", "value": 202.0467529296875, "split": "32x64-four-storey-40step",
   "window": "human-skull-compliance-only", "source": "clip_saliency_compliance_human_skull_compliance/summary.json"},
   {"metric": "compliance", "value": 238.31710815429688, "split": "32x64-four-storey-40step",
@@ -38,6 +38,7 @@ results: '[{"metric": "compliance", "value": 202.0467529296875, "split": "32x64-
   "window": "human-skull-full-replay", "criterion": "<=85", "source": "clip_saliency_compliance_human_skull_full_replay/summary.json"},
   {"metric": "clip_loss_raw", "value": 0.4026639759540558, "split": "128x256-80step-hierarchical-replay",
   "window": "human-skull-full-replay", "source": "clip_saliency_compliance_human_skull_full_replay/summary.json"}]'
+related_to: expe-d7945d40
 ---
 Matched 32x64 / 40-step arms on `human skull` (seed 12, volfrac 0.3, 4 storeys). Live prior is relu(-dL/d rho) EMA occupancy plus Stage-6 mass loss; FEA compliance is unmodified.
 
