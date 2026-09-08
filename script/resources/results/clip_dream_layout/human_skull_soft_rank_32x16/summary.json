@@ -1,0 +1,65 @@
+{
+  "prompt": "human skull",
+  "dream_steps": 64,
+  "dream_clip_loss": null,
+  "dream_clip_losses": [],
+  "dream_field_mean": 0.01943938434123993,
+  "scaffold_threshold": null,
+  "scaffold_mean": 0.5,
+  "scaffold_source": "soft_rank",
+  "project_in_loop": false,
+  "dream_volume": null,
+  "volume_weight": null,
+  "projection_sigma": null,
+  "projection_beta_max": null,
+  "motif_scale_fracs": [],
+  "union_load_sites": false,
+  "control_grid": [
+    16,
+    8
+  ],
+  "dream_geometry": {
+    "neighbor_contrast_ratio": 0.06625552079970709,
+    "max_neighbor_contrast_ratio": 0.5,
+    "smooth": true,
+    "component_count": 2,
+    "top_to_bottom_connected": false,
+    "spanning_component_fraction": 0.0,
+    "passed": false
+  },
+  "gate": {
+    "spatial_mass_loss": 0.5391337871551514,
+    "mass_on_scaffold": 0.42058158038173393,
+    "scaffold_mean": 0.5,
+    "min_mass_off": 0.25,
+    "passed": true
+  },
+  "stopped": "physics",
+  "parameterization": "adaptive_pixel",
+  "init_from_occupancy": true,
+  "sketch_weight_start": 4000.0,
+  "sketch_weight_end": 400.0,
+  "steps": 137,
+  "compliance": 78.41509246826172,
+  "clip_loss": 306.68316650390625,
+  "clip_loss_raw": 0.39110222458839417,
+  "volume_actual": 0.34820556640625,
+  "mean_physical_density": 0.2999937832355499,
+  "mass_on_scaffold": 0.7153436777210068,
+  "spatial_mass_loss": 0.32537776231765747,
+  "validity": {
+    "component_count": 1.0,
+    "top_to_bottom_connected": 1.0,
+    "support_to_load_connected": 1.0,
+    "floating_mass_fraction": 0.054883810094266745,
+    "spanning_mass_fraction": 0.9451161899057332,
+    "mean_physical_density": 0.2999937832355499
+  },
+  "paths": {
+    "replay": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/clip_dream_layout/human_skull_soft_rank_32x16/sketch_run.png",
+    "comparison": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/clip_dream_layout/human_skull_soft_rank_32x16/comparison.png",
+    "scaffold": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/clip_dream_layout/human_skull_soft_rank_32x16/scaffold.png",
+    "density_npy": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/clip_dream_layout/human_skull_soft_rank_32x16/physical_density.npy",
+    "raw_npy": "/Users/tashahirt/MIT Dropbox/Natasha Hirt/_MIT/DS Research/Semantopology/semantopology_hardfork/script/resources/results/clip_dream_layout/human_skull_soft_rank_32x16/final_design_raw.npy"
+  }
+}
