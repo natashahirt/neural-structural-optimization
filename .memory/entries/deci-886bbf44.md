@@ -6,7 +6,7 @@ parent_id: plan-6762b35e
 title: Measurement plumbing + compliance baseline before further CLIP layout work
 node_label: 'Measurement plumbing + compliance baseline before '
 tags: clip,measurement,plumbing,sds,coordinator
-status: active
+status: discarded
 open_threads: 0
 success: 'null'
 files: neural_structural_optimization/models/loss_semantic_prior.py@a91aa20, neural_structural_optimization/tests/test_semantic_prior.py@a91aa20,
@@ -15,7 +15,7 @@ files: neural_structural_optimization/models/loss_semantic_prior.py@a91aa20, neu
   script/resources/results/README.md@a91aa20
 session_id: sess-bd84de5d
 created_at: '2026-09-08T17:44:18.911633+00:00'
-updated_at: '2026-09-08T17:44:18.911633+00:00'
+updated_at: '2026-09-08T17:44:34.444541+00:00'
 has_child_rationale: Session outcome for the approved measurement-plumbing plan
 results: '[{"metric": "density_png_pixel", "value": 165, "split": "[0.25,0.35]-field",
   "window": "fixed-[0,1]-ramp", "criterion": "mid-gray 165-191 not stretched", "source":
