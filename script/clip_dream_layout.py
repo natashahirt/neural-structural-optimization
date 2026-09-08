@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -44,7 +43,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from neural_structural_optimization import configure_torch_threads
-from neural_structural_optimization.experiment import VeniceGoldenConfig
+from neural_structural_optimization.experiment import (
+    VeniceGoldenConfig,
+    _load_golden_script,
+)
+from neural_structural_optimization.models.loss_semantic_prior import (
+    heaviside_projection,
+    projected_density_view,
+    report_design_metrics,
+    save_design_arrays,
+    sigma_for_min_feature,
+)
 from neural_structural_optimization.models.loss_sketch import (
     DEFAULT_SCAFFOLD_ALLOWED_MEAN,
     DEFAULT_TAUTOLOGY_MIN_MASS_OFF,
@@ -60,21 +69,19 @@ from neural_structural_optimization.models.loss_sketch import (
 DEFAULT_PROMPT = 'butterfly wing venation'
 DEFAULT_DREAM_STEPS = 64
 DEFAULT_DREAM_LR = 0.2
+DEFAULT_PROJECTION_SIGMA = 2.0
+DEFAULT_PROJECTION_BETA_MAX = 8.0
+# Quadratic volume penalty. CLIP loss on this path is O(0.4); a 2% mean
+# miss then costs ~0.4 and a 5% miss dominates, so the term behaves like a
+# constraint without a dual variable. Weaker weights let projection saturate.
+DEFAULT_VOLUME_WEIGHT = 1000.0
 DEFAULT_PHYSICS_PROXY = (
     REPO_ROOT / 'script' / 'resources' / 'results'
     / 'clip_motif_layout_no_occupancy' / 'teacher' / 'physical_density.npy')
 
 
-def _load_golden():
-    script = REPO_ROOT / 'script' / 'venice_golden_250214.py'
-    spec = importlib.util.spec_from_file_location('venice_golden_250214', script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def dream_results_dir(prompt: str, repo_root: Path = REPO_ROOT, golden=None) -> Path:
-    golden = golden or _load_golden()
+    golden = golden or _load_golden_script()
     return (
         repo_root / 'script' / 'resources' / 'results'
         / f'clip_dream_layout_whole_{golden.prompt_slug(prompt)}')
@@ -109,6 +116,18 @@ def build_dream_model(config: VeniceGoldenConfig, golden):
     return model
 
 
+def _option_explicitly_passed(argv: Optional[list[str]], option: str) -> bool:
+    tokens = sys.argv[1:] if argv is None else list(argv)
+    prefix = option + '='
+    return any(token == option or token.startswith(prefix) for token in tokens)
+
+
+def _annealed_projection_beta(step: int, steps: int, beta_max: float) -> float:
+    """Linear continuation from 1.0 to ``beta_max`` over ``steps`` iterates."""
+    denom = max(int(steps) - 1, 1)
+    return 1.0 + (float(beta_max) - 1.0) * (int(step) / denom)
+
+
 def run_clip_dream(
     model,
     *,
@@ -116,12 +135,22 @@ def run_clip_dream(
     lr: float,
     control_height: int = 16,
     control_width: int = 8,
-) -> tuple[list[float], torch.Tensor]:
+    project_in_loop: bool = False,
+    projection_sigma: float = DEFAULT_PROJECTION_SIGMA,
+    projection_beta_max: float = DEFAULT_PROJECTION_BETA_MAX,
+    dream_volume: Optional[float] = None,
+    volume_weight: float = DEFAULT_VOLUME_WEIGHT,
+) -> tuple[list[float], torch.Tensor, torch.Tensor]:
     """Optimize a low-dimensional field decoded smoothly to the model grid.
 
     The 16x8 control has 128 variables instead of 2,048 independent pixels.
     Bilinear expansion plus one local average makes coherent regions cheap and
     removes the single-pixel texture move that dominated the direct dream.
+
+    ``project_in_loop`` swaps the 3x3 box blur for filter-then-project
+    (Gaussian + annealed Heaviside) and adds a quadratic volume penalty.
+    Off by default so prior runs stay bit-identical. Returns
+    ``(losses, decoded_field, control)``.
     """
     if control_height < 2 or control_width < 2:
         raise ValueError('control grid dimensions must both be >= 2')
@@ -137,7 +166,11 @@ def run_clip_dream(
         control + 0.01 * (2.0 * noise.to(model.device) - 1.0))
     optimizer = torch.optim.Adam([control], lr=lr)
     losses = []
-    for _ in tqdm(range(int(steps)), desc='CLIP dream (no FEA)'):
+    field = None
+    volume_target = (
+        float(model.env.args['volfrac'])
+        if dream_volume is None else float(dream_volume))
+    for step in tqdm(range(int(steps)), desc='CLIP dream (no FEA)'):
         optimizer.zero_grad(set_to_none=True)
         logits = F.interpolate(
             control,
@@ -145,13 +178,44 @@ def run_clip_dream(
             mode='bilinear',
             align_corners=False,
         )
-        logits = F.avg_pool2d(logits, kernel_size=3, stride=1, padding=1)
-        logits = logits[:, 0]
-        loss = model.get_semantic_loss(logits)
+        if project_in_loop:
+            # Density-like control, init at volfrac. A sigmoid centred at
+            # eta=0.5 keeps gradients alive outside [0, 1]; a clamp would
+            # freeze any pixel Adam pushed past the box and the volume term
+            # could not pull it back. Gain 4 maps volfrac=0.3 to ~0.31, so
+            # the starting mean is not shifted. Heaviside (inside
+            # projected_density_view) then supplies binarity. Sigma is
+            # cell-space, not sigma_for_min_feature's domain fraction.
+            density = torch.sigmoid(4.0 * (logits - 0.5))[:, 0]
+            beta = _annealed_projection_beta(
+                step, steps, projection_beta_max)
+            filter_sigma = float(projection_sigma)
+            if filter_sigma <= 0.0:
+                filter_sigma = sigma_for_min_feature(
+                    int(density.shape[-1]), 0.0)
+            # projected_density_view is gaussian_blur2d + heaviside_projection.
+            projected = projected_density_view(
+                density,
+                beta=beta,
+                eta=0.5,
+                filter_sigma=filter_sigma,
+            )
+            volume_loss = (
+                (projected.mean() - volume_target) ** 2
+                * float(volume_weight))
+            loss = model.get_semantic_loss(projected) + volume_loss
+            field = projected
+        else:
+            logits = F.avg_pool2d(logits, kernel_size=3, stride=1, padding=1)
+            logits = logits[:, 0]
+            loss = model.get_semantic_loss(logits)
+            field = logits
         loss.backward()
         optimizer.step()
         losses.append(float(loss.detach()))
-    return losses, logits.detach()
+    if field is None:
+        raise RuntimeError('CLIP dream produced no field (steps must be > 0)')
+    return losses, field.detach(), control.detach()
 
 
 def extract_dream_scaffold(
@@ -160,6 +224,7 @@ def extract_dream_scaffold(
     height: int,
     width: int,
     target_mean: float = DEFAULT_SCAFFOLD_ALLOWED_MEAN,
+    passthrough: bool = False,
 ):
     """Upsample the coarse dream and cut one elevation occupancy.
 
@@ -167,8 +232,15 @@ def extract_dream_scaffold(
     is the drawing, the way a Stage 6 sketch is one picture of the building.
     ``scale_fracs=(1.0,)`` is required by the extractor and unused at
     ``envelope_sigma_frac=0``.
+
+    ``passthrough`` skips the rank-cut: the in-loop projection already made a
+    near-binary field at the dream volume, and recutting to
+    ``target_allowed_mean`` would undo it. The upsample still runs so the
+    scaffold matches the physics grid.
     """
     upsampled = resample_field(dream_field, height, width)
+    if passthrough:
+        return upsampled, None, np.asarray(upsampled)
     threshold, scaffold = motif_layout_threshold_for_allowed_mean(
         upsampled,
         scale_fracs=(1.0,),
@@ -243,6 +315,50 @@ def evaluate_dream_geometry(
     }
 
 
+def _common_dream_summary(
+    *,
+    prompt: str,
+    args,
+    dream_losses: list[float],
+    dream_coarse: np.ndarray,
+    threshold,
+    scaffold: np.ndarray,
+    config,
+    geometry: dict,
+    gate,
+    stopped: str,
+    resolved_dream_volume: float,
+) -> dict:
+    """Shared dream keys so every exit path records the same contract."""
+    return {
+        'prompt': prompt,
+        'dream_steps': int(args.dream_steps),
+        'dream_clip_loss': float(dream_losses[-1]) if dream_losses else None,
+        'dream_clip_losses': [float(x) for x in dream_losses],
+        'dream_field_mean': float(np.mean(dream_coarse)),
+        'scaffold_threshold': (
+            None if threshold is None else float(threshold)),
+        'scaffold_mean': float(np.mean(scaffold)),
+        'scaffold_source': (
+            'passthrough' if args.project_in_loop else 'rank_cut'),
+        'project_in_loop': bool(args.project_in_loop),
+        'dream_volume': (
+            float(resolved_dream_volume) if args.project_in_loop else None),
+        'volume_weight': (
+            float(args.volume_weight) if args.project_in_loop else None),
+        'projection_sigma': (
+            float(args.projection_sigma) if args.project_in_loop else None),
+        'projection_beta_max': (
+            float(args.projection_beta_max) if args.project_in_loop else None),
+        'motif_scale_fracs': [],
+        'union_load_sites': config.union_load_sites,
+        'control_grid': [args.control_height, args.control_width],
+        'dream_geometry': geometry,
+        'gate': gate,
+        'stopped': stopped,
+    }
+
+
 def _save_field_png(path: Path, field: np.ndarray, *, rank: bool = False) -> Path:
     from PIL import Image
 
@@ -276,6 +392,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         '--target-allowed-mean', type=float,
         default=DEFAULT_SCAFFOLD_ALLOWED_MEAN)
     parser.add_argument(
+        '--project-in-loop', action='store_true',
+        help=(
+            'filter-then-project inside the dream (Gaussian + annealed '
+            'Heaviside) and skip the rank-cut scaffold. Off by default.'))
+    parser.add_argument(
+        '--projection-sigma', type=float, default=DEFAULT_PROJECTION_SIGMA,
+        help=(
+            'Gaussian sigma in model-grid cells for --project-in-loop '
+            f'(default {DEFAULT_PROJECTION_SIGMA:g}). Cell-space, not the '
+            'domain-fraction form of sigma_for_min_feature.'))
+    parser.add_argument(
+        '--projection-beta-max', type=float,
+        default=DEFAULT_PROJECTION_BETA_MAX,
+        help=(
+            'Heaviside beta at the last dream step, annealed from 1.0 '
+            f'(default {DEFAULT_PROJECTION_BETA_MAX:g})'))
+    parser.add_argument(
+        '--dream-volume', type=float, default=None,
+        help=(
+            'target mean of the projected field. Default is the model '
+            'volfrac. Only used with --project-in-loop.'))
+    parser.add_argument(
+        '--volume-weight', type=float, default=DEFAULT_VOLUME_WEIGHT,
+        help=(
+            'weight on (mean(rho) - dream_volume)^2 inside the dream '
+            f'(default {DEFAULT_VOLUME_WEIGHT:g}). Constraint-like.'))
+    parser.add_argument(
         '--min-mass-off', type=float, default=DEFAULT_TAUTOLOGY_MIN_MASS_OFF)
     parser.add_argument(
         '--baseline', type=Path, default=DEFAULT_PHYSICS_PROXY,
@@ -291,8 +434,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         help='run physics even if the tautology gate fails (debug only)')
     parser.add_argument('--output-dir', type=Path)
     args = parser.parse_args(argv)
+    if args.project_in_loop and _option_explicitly_passed(
+            argv, '--target-allowed-mean'):
+        raise ValueError(
+            '--target-allowed-mean cannot be combined with --project-in-loop: '
+            'the projected field is already at the dream volume and is not '
+            'rank-cut. Drop one of the two flags.')
 
-    golden = _load_golden()
+    golden = _load_golden_script()
     config = whole_building_dream_config(args.prompt, golden)
     output_dir = args.output_dir or dream_results_dir(config.prompt, golden=golden)
     if not output_dir.is_absolute():
@@ -311,30 +460,47 @@ def main(argv: Optional[list[str]] = None) -> int:
         f'{args.control_height}x{args.control_width} smooth control, '
         'no motif-scale crops, no load-site frames.')
     model = build_dream_model(config, golden)
-    dream_losses, dream_logits = run_clip_dream(
+    resolved_dream_volume = (
+        float(model.env.args['volfrac'])
+        if args.dream_volume is None else float(args.dream_volume))
+    dream_losses, dream_logits, dream_control = run_clip_dream(
         model,
         steps=args.dream_steps,
         lr=args.dream_lr,
         control_height=args.control_height,
         control_width=args.control_width,
+        project_in_loop=args.project_in_loop,
+        projection_sigma=args.projection_sigma,
+        projection_beta_max=args.projection_beta_max,
+        dream_volume=resolved_dream_volume,
+        volume_weight=args.volume_weight,
     )
 
     dream_coarse = np.asarray(
         dream_logits.cpu().numpy(), dtype=np.float32)
     while dream_coarse.ndim > 2:
         dream_coarse = dream_coarse[0]
+    control_field = np.asarray(
+        dream_control.detach().cpu().numpy(), dtype=np.float32)
+    while control_field.ndim > 2:
+        control_field = control_field[0]
     np.save(output_dir / 'dream_coarse.npy', dream_coarse)
-    _save_field_png(output_dir / 'dream_coarse.png', dream_coarse, rank=True)
+    np.save(output_dir / 'control.npy', control_field)
+    rank_preview = not args.project_in_loop
+    _save_field_png(
+        output_dir / 'dream_coarse.png', dream_coarse, rank=rank_preview)
 
     upsampled, threshold, scaffold = extract_dream_scaffold(
         dream_coarse,
         height=config.height,
         width=config.width,
         target_mean=args.target_allowed_mean,
+        passthrough=args.project_in_loop,
     )
     np.save(output_dir / 'dream_upsampled.npy', upsampled)
     np.save(output_dir / 'scaffold.npy', scaffold)
-    _save_field_png(output_dir / 'dream_upsampled.png', upsampled, rank=True)
+    _save_field_png(
+        output_dir / 'dream_upsampled.png', upsampled, rank=rank_preview)
     _save_field_png(output_dir / 'scaffold.png', scaffold)
     geometry = evaluate_dream_geometry(upsampled, scaffold)
     print(json.dumps({'dream_geometry': geometry}, indent=2))
@@ -363,19 +529,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             scaffold, baseline, sites, min_mass_off=args.min_mass_off)
         print(json.dumps({'gate': gate}, indent=2))
         if not gate['passed'] and not args.skip_gate:
-            summary = {
-                'prompt': config.prompt,
-                'dream_steps': args.dream_steps,
-                'dream_clip_loss': dream_losses[-1],
-                'scaffold_threshold': threshold,
-                'scaffold_mean': float(scaffold.mean()),
-                'motif_scale_fracs': [],
-                'union_load_sites': config.union_load_sites,
-                'control_grid': [args.control_height, args.control_width],
-                'dream_geometry': geometry,
-                'gate': gate,
-                'stopped': 'tautology_gate',
-            }
+            summary = _common_dream_summary(
+                prompt=config.prompt,
+                args=args,
+                dream_losses=dream_losses,
+                dream_coarse=dream_coarse,
+                threshold=threshold,
+                scaffold=scaffold,
+                config=config,
+                geometry=geometry,
+                gate=gate,
+                stopped='tautology_gate',
+                resolved_dream_volume=resolved_dream_volume,
+            )
             (output_dir / 'summary.json').write_text(
                 json.dumps(summary, indent=2) + '\n')
             print(
@@ -390,19 +556,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             'Pass --baseline or --skip-gate.')
 
     if args.dream_only:
-        summary = {
-            'prompt': config.prompt,
-            'dream_steps': args.dream_steps,
-            'dream_clip_loss': dream_losses[-1],
-            'scaffold_threshold': threshold,
-            'scaffold_mean': float(scaffold.mean()),
-            'motif_scale_fracs': [],
-            'union_load_sites': config.union_load_sites,
-            'control_grid': [args.control_height, args.control_width],
-            'dream_geometry': geometry,
-            'gate': gate,
-            'stopped': 'dream_only',
-        }
+        summary = _common_dream_summary(
+            prompt=config.prompt,
+            args=args,
+            dream_losses=dream_losses,
+            dream_coarse=dream_coarse,
+            threshold=threshold,
+            scaffold=scaffold,
+            config=config,
+            geometry=geometry,
+            gate=gate,
+            stopped='dream_only',
+            resolved_dream_volume=resolved_dream_volume,
+        )
         (output_dir / 'summary.json').write_text(
             json.dumps(summary, indent=2) + '\n')
         print(f'Dream-only complete. Artifacts in {output_dir}')
@@ -429,6 +595,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         json.dumps(golden.trajectory(ds), indent=2))
 
     density = np.asarray(ds['final_physical_density'].values, dtype=np.float32)
+    array_paths = save_design_arrays(
+        output_dir, density, raw=ds['final_design_raw'].values)
     replay_image, comparison_image = golden.save_motif_scale_look(
         ds,
         output_dir,
@@ -441,36 +609,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     nelx = int(physics_model.env.args['nelx'])
     sites = load_site_mask(
         physics_model.env.args['forces'], nely=nely, nelx=nelx)
-    summary = {
-        'prompt': config.prompt,
+    report = report_design_metrics(
+        density, sites, scaffold=scaffold, ds=ds)
+    summary = _common_dream_summary(
+        prompt=config.prompt,
+        args=args,
+        dream_losses=dream_losses,
+        dream_coarse=dream_coarse,
+        threshold=threshold,
+        scaffold=scaffold,
+        config=config,
+        geometry=geometry,
+        gate=gate,
+        stopped='physics',
+        resolved_dream_volume=resolved_dream_volume,
+    )
+    summary.update({
         'parameterization': 'adaptive_pixel',
-        'dream_steps': args.dream_steps,
-        'dream_clip_loss': dream_losses[-1],
-        'scaffold_threshold': threshold,
-        'scaffold_mean': float(scaffold.mean()),
-        'motif_scale_fracs': [],
-        'union_load_sites': config.union_load_sites,
-        'control_grid': [args.control_height, args.control_width],
-        'dream_geometry': geometry,
         'init_from_occupancy': True,
         'sketch_weight_start': 4000.0,
         'sketch_weight_end': 400.0,
-        'gate': gate,
         'steps': int(ds.sizes['step']),
         'compliance': float(ds['compliance'][-1]),
-        'clip_loss': float(ds['clip_loss'][-1]),
+        'clip_loss': report['clip_loss'],
+        'clip_loss_raw': report['clip_loss_raw'],
         'volume_actual': golden.venice_volume_ratio(
             ds['final_design_raw'].values),
-        'mean_physical_density': float(np.mean(density)),
-        'mass_on_scaffold': mass_fraction_on_occupancy(density, scaffold),
-        'spatial_mass_loss': scaffold_spatial_mass_loss(
-            density, scaffold, sites),
+        'mean_physical_density': report['mean_physical_density'],
+        'mass_on_scaffold': report['mass_on_scaffold'],
+        'spatial_mass_loss': report['spatial_mass_loss'],
+        'validity': report['validity'],
         'paths': {
             'replay': str(replay_image),
             'comparison': str(comparison_image),
             'scaffold': str(output_dir / 'scaffold.png'),
+            'density_npy': str(array_paths['physical_density']),
+            'raw_npy': str(array_paths['final_design_raw']),
         },
-    }
+    })
     (output_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))
     print(f'\nWrote comparison to {comparison_image}')

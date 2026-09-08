@@ -8,7 +8,8 @@ unless explicitly requested.
     PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --sketch 12
     PYTHONPATH="$PWD" python script/stage6_sketch_on_golden.py --corpus
 
-Writes labeled panels under ``script/resources/results/stage6_sketch<id>_init_anneal/``.
+Writes labeled panels under
+``script/resources/results/SUCCESS_sketch_to_structure/stage6_sketch<id>_init_anneal/``.
 
 Pass ``--motif-scale`` to keep that occupancy recipe and add the physical-scale
 CLIP path (building / storey / member elevation fractions). That writes under
@@ -21,7 +22,6 @@ the Stage 6 selected look.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -37,6 +37,10 @@ from neural_structural_optimization.experiment import (
     GOLDEN,
     SketchConfig,
     venice_250214_motif_scale,
+    _load_golden_script,
+)
+from neural_structural_optimization.models.loss_semantic_prior import (
+    save_design_arrays,
 )
 from neural_structural_optimization.models.loss_sketch import (
     SKETCH_CORPUS,
@@ -62,14 +66,6 @@ GOLDEN_FINAL_IMAGE_PATH = (
     / ('0_final-P_multistory_building-M_Ada-T_skeletons-W_128-H_256-V_0.30'
        '-LR_0.20-CW_10-ID_01-CompL_74.00-ClipL_0.38-VA_0.31'
        '-balanced_dynamic.jpg'))
-
-
-def _load_golden_script():
-    script = REPO_ROOT / 'script' / 'venice_golden_250214.py'
-    spec = importlib.util.spec_from_file_location('venice_golden_250214', script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _ink_black(field: np.ndarray, size: tuple[int, int]) -> Image.Image:
@@ -121,19 +117,16 @@ def _sketch_rel(name: str) -> Path:
 
 def _output_dir_for(name: str, *, motif_scale: bool = False) -> Path:
     stem = _sketch_stem(name)
-    folder = (
-        f'clip_motif_scale_sketch{stem}'
-        if motif_scale else
-        f'stage6_sketch{stem}_init_anneal')
-    return REPO_ROOT / 'script' / 'resources' / 'results' / folder
+    results = REPO_ROOT / 'script' / 'resources' / 'results'
+    if motif_scale:
+        return results / f'clip_motif_scale_sketch{stem}'
+    return (
+        results / 'SUCCESS_sketch_to_structure'
+        / f'stage6_sketch{stem}_init_anneal')
 
 
 def _stage6_baseline_run(name: str) -> Path:
-    return (
-        REPO_ROOT / 'script' / 'resources' / 'results'
-        / 'SUCCESS_sketch_to_structure'
-        / f'stage6_sketch{_sketch_stem(name)}_init_anneal'
-        / 'sketch_run.png')
+    return _output_dir_for(name) / 'sketch_run.png'
 
 
 def _clip_config(*, motif_scale: bool):
@@ -253,6 +246,9 @@ def run_sketch_on_golden(
     )
     allowed = np.maximum(occupancy, load_sites)
     raw = np.ascontiguousarray(ds['final_design_raw'].values, dtype=np.float32)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    array_paths = save_design_arrays(
+        output_dir, density, raw=ds['final_design_raw'].values)
     reference = Image.open(GOLDEN_FINAL_IMAGE_PATH).convert('L')
     size = reference.size
     occ_img = _ink_black(occupancy, size)
@@ -327,6 +323,8 @@ def run_sketch_on_golden(
         'paths': {
             'replay': str(replay_path),
             'density': str(density_path),
+            'density_npy': str(array_paths['physical_density']),
+            'raw_npy': str(array_paths['final_design_raw']),
             'allowed': str(allowed_path),
             'comparison': str(comparison),
             'density_strip': str(density_strip),
@@ -346,7 +344,8 @@ def save_corpus_strip(sketches: tuple[str, ...], output_dir: Path) -> Path:
         occ = _ink_black(_occupancy(name), size)
         run_path = _output_dir_for(name) / 'sketch_run.png'
         if not run_path.is_file():
-            continue
+            raise FileNotFoundError(
+                f'corpus strip missing {run_path}; cannot silently omit sketches')
         result = Image.open(run_path).convert('L').resize(
             size, Image.Resampling.NEAREST)
         panels.append((f'{stem} occupancy', occ))

@@ -8,7 +8,8 @@ Matched arms on a 32x64 (width x height) four-storey building:
 4. hierarchical (global -> storey -> member) CLIP prior
 5. hierarchical prior whose sculptural scale is scored on a
    filter-then-project view, so CLIP cannot draw with near-void gray
-6. frozen SDS prior through the same occupancy interface
+6. frozen SDS prior through the same occupancy interface (opt-in via
+   ``--arms sds_prior``; not in the default arm list)
 
 No generated reference image. Prior weights are set from the measured
 guidance-to-compliance gradient-norm ratio.
@@ -38,29 +39,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from neural_structural_optimization import configure_torch_threads
-from neural_structural_optimization.experiment import VeniceGoldenConfig
+from neural_structural_optimization.experiment import (
+    VeniceGoldenConfig,
+    _load_golden_script,
+)
 from neural_structural_optimization.models.loss_semantic_prior import (
     CLIPSemanticProvider,
     DiffusionSDSProvider,
     FrozenDenoiser,
     SemanticSpatialPrior,
-    connectivity_metrics,
+    physical_density_and_sites,
+    report_design_metrics,
+    save_design_arrays,
     scale_fracs_for_grid,
 )
-from neural_structural_optimization.models.loss_sketch import load_site_mask
 
-import importlib.util
-
-
-def _load_golden():
-    spec = importlib.util.spec_from_file_location(
-        'venice_golden_250214', REPO_ROOT / 'script' / 'venice_golden_250214.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-golden = _load_golden()
+golden = _load_golden_script()
 
 COARSE_WIDTH = 32
 COARSE_HEIGHT = 64
@@ -74,6 +68,14 @@ DEFAULT_PROJECTION_SIGMA = 2.0
 FULL_WIDTH = 128
 FULL_HEIGHT = 256
 FULL_INTERVAL = 64
+DEFAULT_ARMS = (
+    'compliance,scalar_clip,clip_prior,hierarchical,projected')
+FOLDED_ARM_NAMES = {
+    'venation': (
+        'use --prompt "butterfly wing venation" --arms clip_prior'),
+    'venation_projected': (
+        'use --prompt "butterfly wing venation" --arms projected'),
+}
 
 
 def coarse_config(prompt: str, **overrides) -> VeniceGoldenConfig:
@@ -106,31 +108,70 @@ def coarse_config(prompt: str, **overrides) -> VeniceGoldenConfig:
     return VeniceGoldenConfig(**values)
 
 
-def _save_field(path: Path, field: np.ndarray) -> Path:
+def full_grid_config(prompt: str) -> VeniceGoldenConfig:
+    """128x256 replay grid shared by projected_full and auto full_replay."""
+    return VeniceGoldenConfig(
+        width=FULL_WIDTH,
+        height=FULL_HEIGHT,
+        interval=FULL_INTERVAL,
+        density=0.3,
+        resize_num=2,
+        prompt=prompt,
+        num_augs=8,
+        clip_alpha=10.0,
+        lr=0.2,
+        max_iterations=80,
+        max_resize_iteration=30,
+        seed=12,
+        motif_scale_fracs=(),
+        neutral_init=True,
+    )
+
+
+def _squeeze2d(field: np.ndarray) -> np.ndarray:
     arr = np.asarray(field, dtype=np.float64)
     while arr.ndim > 2:
         arr = arr[0]
-    lo, hi = float(arr.min()), float(arr.max())
-    if hi > lo:
-        norm = (arr - lo) / (hi - lo)
+    return arr
+
+
+def _field_to_uint8(field: np.ndarray, *, scale: str) -> np.ndarray:
+    """Render a field as inverted 8-bit grayscale.
+
+    ``absolute`` maps physical [0, 1] onto the full gray ramp so two runs
+    are comparable. ``normalized`` min-max stretches the array; use it only
+    when the field has no meaningful absolute scale.
+    """
+    arr = _squeeze2d(field)
+    if scale == 'absolute':
+        norm = np.clip(arr, 0.0, 1.0)
+    elif scale == 'normalized':
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi > lo:
+            norm = (arr - lo) / (hi - lo)
+        else:
+            norm = np.zeros_like(arr)
     else:
-        norm = np.zeros_like(arr)
-    Image.fromarray((255.0 * (1.0 - norm)).clip(0, 255).astype(np.uint8), mode='L').save(path)
+        raise ValueError(
+            f'unknown field scale {scale!r}; expected absolute or normalized')
+    return (255.0 * (1.0 - norm)).clip(0, 255).astype(np.uint8)
+
+
+def _save_field(path: Path, field: np.ndarray, *, scale: str) -> Path:
+    Image.fromarray(_field_to_uint8(field, scale=scale), mode='L').save(path)
     return path
 
 
-def _stack_panels(path: Path, panels: list[tuple[str, np.ndarray]]) -> Path:
+def _stack_panels(
+    path: Path,
+    panels: list[tuple[str, np.ndarray, str]],
+) -> Path:
     from PIL import ImageDraw
 
-    images = []
-    for title, field in panels:
-        arr = np.asarray(field, dtype=np.float64)
-        while arr.ndim > 2:
-            arr = arr[0]
-        lo, hi = float(arr.min()), float(arr.max())
-        norm = (arr - lo) / (hi - lo) if hi > lo else np.zeros_like(arr)
-        images.append((title, Image.fromarray(
-            (255.0 * (1.0 - norm)).clip(0, 255).astype(np.uint8), mode='L')))
+    images = [
+        (title, Image.fromarray(_field_to_uint8(field, scale=scale), mode='L'))
+        for title, field, scale in panels
+    ]
     gap, label_h = 8, 18
     width, height = images[0][1].size
     canvas = Image.new('L', (width * len(images) + gap * (len(images) - 1), height + label_h), 255)
@@ -202,18 +243,6 @@ def _attach_prior(
     return prior
 
 
-def _validity(model) -> dict:
-    density = model.get_physical_density(model.z).detach().cpu().numpy()
-    while density.ndim > 2:
-        density = density[0]
-    nely = int(model.env.args['nely'])
-    nelx = int(model.env.args['nelx'])
-    sites = load_site_mask(model.env.args['forces'], nely=nely, nelx=nelx)
-    metrics = connectivity_metrics(density, sites, threshold=0.3)
-    metrics['mean_physical_density'] = float(density.mean())
-    return metrics, density, sites
-
-
 def _compliance_sensitivity(model) -> np.ndarray:
     logits = model.z
     model.zero_grad(set_to_none=True)
@@ -254,7 +283,7 @@ def run_arm(
             projection_scales=projection_scales)
     ds = golden.build_optimizer(model, config).optimize()
     ds = golden.attach_final_raw_design(ds, model)
-    validity, density, sites = _validity(model)
+    density, sites = physical_density_and_sites(model)
     sensitivity = _compliance_sensitivity(model)
     prior = model.semantic_prior
     occupancy = None
@@ -269,15 +298,22 @@ def run_arm(
             preference = preference.detach().cpu().numpy()
             while preference.ndim > 2:
                 preference = preference[0]
-    _save_field(out / 'physical_density.png', density)
-    _save_field(out / 'compliance_sensitivity.png', sensitivity)
-    panels = [('density', density), ('dC/dz', sensitivity)]
+    report = report_design_metrics(
+        density, sites, ds=ds, scaffold=occupancy)
+    array_paths = save_design_arrays(
+        out, density, raw=ds['final_design_raw'].values)
+    _save_field(out / 'physical_density.png', density, scale='absolute')
+    _save_field(out / 'compliance_sensitivity.png', sensitivity, scale='normalized')
+    panels = [
+        ('density', density, 'absolute'),
+        ('dC/dz', sensitivity, 'normalized'),
+    ]
     if occupancy is not None:
-        _save_field(out / 'semantic_occupancy.png', occupancy)
-        panels.append(('CLIP/SDS prior', occupancy))
+        _save_field(out / 'semantic_occupancy.png', occupancy, scale='absolute')
+        panels.append(('CLIP/SDS prior', occupancy, 'absolute'))
     if preference is not None:
-        _save_field(out / 'semantic_preference.png', preference)
-        panels.append(('preference', preference))
+        _save_field(out / 'semantic_preference.png', preference, scale='normalized')
+        panels.append(('preference', preference, 'normalized'))
     _stack_panels(out / 'comparison.png', panels)
 
     traj = golden.trajectory(ds)
@@ -290,9 +326,12 @@ def run_arm(
         'grid': [int(density.shape[0]), int(density.shape[1])],
         'steps': int(ds.sizes['step']),
         'compliance': float(ds['compliance'][-1]),
-        'clip_loss': float(ds['clip_loss'][-1]) if 'clip_loss' in ds else None,
-        'clip_loss_raw': float(ds['clip_loss_raw'][-1]) if 'clip_loss_raw' in ds else None,
+        'clip_loss': report['clip_loss'],
+        'clip_loss_raw': report['clip_loss_raw'],
         'volume_actual': golden.venice_volume_ratio(ds['final_design_raw'].values),
+        'mean_physical_density': report['mean_physical_density'],
+        'mass_on_scaffold': report['mass_on_scaffold'],
+        'spatial_mass_loss': report['spatial_mass_loss'],
         'prior_weight': None if prior is None else float(prior.weight),
         'projection': None if prior is None else {
             'beta': float(prior.projection_beta),
@@ -301,10 +340,12 @@ def run_arm(
             'scales': list(prior.projection_scales),
         },
         'semantic_metrics_final': None if prior is None else dict(prior.last_metrics),
-        'validity': validity,
+        'validity': report['validity'],
         'paths': {
             'comparison': str(out / 'comparison.png'),
             'density': str(out / 'physical_density.png'),
+            'density_npy': str(array_paths['physical_density']),
+            'raw_npy': str(array_paths['final_design_raw']),
         },
     }
     (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
@@ -329,10 +370,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument('--skip-full', action='store_true')
     parser.add_argument(
         '--arms',
-        default=(
-            'compliance,scalar_clip,clip_prior,hierarchical,projected,'
-            'venation,sds_prior'),
-        help='Comma-separated arm names to run.',
+        default=DEFAULT_ARMS,
+        help=(
+            'Comma-separated arm names. Default omits sds_prior (a '
+            'random-weight FrozenDenoiser control, not a diffusion prior); '
+            'pass --arms sds_prior to run it. Venation is --prompt, not an '
+            'arm name.'),
     )
     parser.add_argument(
         '--projection-beta', type=float, default=DEFAULT_PROJECTION_BETA,
@@ -350,6 +393,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     projection_scales = tuple(
         name.strip() for name in args.projection_scales.split(',') if name.strip())
     wanted = {name.strip() for name in args.arms.split(',') if name.strip()}
+    folded = wanted & FOLDED_ARM_NAMES.keys()
+    if folded:
+        hints = '; '.join(
+            f'{name}: {FOLDED_ARM_NAMES[name]}' for name in sorted(folded))
+        raise ValueError(f'folded arm names: {hints}')
     prompt = args.prompt
     config = coarse_config(prompt, max_iterations=args.steps)
     summaries = {}
@@ -391,49 +439,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             projection_scales=projection_scales,
             config=sculpt)
 
-    if 'venation' in wanted:
-        venation = coarse_config('butterfly wing venation', max_iterations=args.steps)
-        summaries['venation'] = run_arm(
-            'butterfly_wing_venation_clip_prior', 'butterfly wing venation',
-            with_clip=True, prior_kind='clip', curriculum='global_only',
-            config=venation)
-
-    if 'venation_projected' in wanted:
-        venation_sculpt = coarse_config(
-            'butterfly wing venation', max_iterations=args.steps,
-            resize_num=1, max_resize_iteration=max(args.steps // 3, 8))
-        summaries['venation_projected'] = run_arm(
-            'butterfly_wing_venation_projected', 'butterfly wing venation',
-            with_clip=True, prior_kind='clip', curriculum='hierarchical',
-            projection_beta=args.projection_beta,
-            projection_filter_sigma=args.projection_sigma,
-            projection_scales=projection_scales,
-            config=venation_sculpt)
+    if 'compliance_full' in wanted:
+        summaries['compliance_full'] = run_arm(
+            f'{golden.prompt_slug(prompt)}_compliance_full', prompt,
+            with_clip=False, prior_kind=None,
+            config=full_grid_config(prompt))
 
     if 'projected_full' in wanted:
-        full = VeniceGoldenConfig(
-            width=FULL_WIDTH,
-            height=FULL_HEIGHT,
-            interval=FULL_INTERVAL,
-            density=0.3,
-            resize_num=2,
-            prompt=prompt,
-            num_augs=8,
-            clip_alpha=10.0,
-            lr=0.2,
-            max_iterations=80,
-            max_resize_iteration=30,
-            seed=12,
-            motif_scale_fracs=(),
-            neutral_init=True,
-        )
         summaries['projected_full'] = run_arm(
             f'{golden.prompt_slug(prompt)}_projected_full', prompt,
             with_clip=True, prior_kind='clip', curriculum='hierarchical',
             projection_beta=args.projection_beta,
             projection_filter_sigma=args.projection_sigma,
             projection_scales=projection_scales,
-            config=full)
+            config=full_grid_config(prompt))
 
     if 'sds_prior' in wanted:
         summaries['sds_prior'] = run_arm(
@@ -447,26 +466,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         and 'scalar_clip' in summaries
         and _should_replay_full(summaries['clip_prior'], summaries['scalar_clip'])
     ):
-        full = VeniceGoldenConfig(
-            width=FULL_WIDTH,
-            height=FULL_HEIGHT,
-            interval=FULL_INTERVAL,
-            density=0.3,
-            resize_num=2,
-            prompt=prompt,
-            num_augs=8,
-            clip_alpha=10.0,
-            lr=0.2,
-            max_iterations=80,
-            max_resize_iteration=30,
-            seed=12,
-            motif_scale_fracs=(),
-            neutral_init=True,
-        )
         summaries['full_replay'] = run_arm(
             f'{golden.prompt_slug(prompt)}_full_replay', prompt,
             with_clip=True, prior_kind='clip', curriculum='hierarchical',
-            config=full)
+            config=full_grid_config(prompt))
 
     FAMILY_DIR.mkdir(parents=True, exist_ok=True)
     (FAMILY_DIR / 'index.json').write_text(json.dumps(summaries, indent=2) + '\n')

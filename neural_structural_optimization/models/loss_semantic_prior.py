@@ -16,7 +16,8 @@ Disabled / zero-weight is a no-op: no extra CLIP/SDS forwards, no extra
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Callable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -24,7 +25,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neural_structural_optimization.experiment import physical_motif_scale_fracs
-from neural_structural_optimization.models.loss_sketch import sketch_mass_prior_loss
+from neural_structural_optimization.models.loss_sketch import (
+    load_site_mask,
+    mass_fraction_on_occupancy,
+    scaffold_spatial_mass_loss,
+    sketch_mass_prior_loss,
+)
 
 SCALE_NAMES = ('global', 'storey', 'member')
 
@@ -215,6 +221,84 @@ def connectivity_metrics(
         'floating_mass_fraction': float(floating / max(mass, 1e-12)),
         'spanning_mass_fraction': float(spanning_mass / max(mass, 1e-12)),
     }
+
+
+def physical_density_and_sites(model) -> tuple[np.ndarray, np.ndarray]:
+    """Canonical physical density and load-site mask for a trained model.
+
+    Relocates the density extraction in ``clip_saliency_compliance._validity``.
+    """
+    density = model.get_physical_density(model.z).detach().cpu().numpy()
+    while density.ndim > 2:
+        density = density[0]
+    nely = int(model.env.args['nely'])
+    nelx = int(model.env.args['nelx'])
+    sites = load_site_mask(model.env.args['forces'], nely=nely, nelx=nelx)
+    return density, sites
+
+
+def report_design_metrics(
+    density: np.ndarray,
+    load_sites: np.ndarray,
+    *,
+    scaffold: Optional[np.ndarray] = None,
+    ds=None,
+    threshold: float = 0.3,
+) -> dict:
+    """Shared physics-summary keys for the CLIP layout pipelines.
+
+    Relocates ``clip_saliency_compliance._validity`` (connectivity plus mean
+    density) and the dream-layout scaffold mass scores. Scaffold keys are
+    always present (``None`` when no occupancy template is supplied) so both
+    pipelines emit the same table. Trajectory CLIP scalars are included when
+    ``ds`` is given; missing names stay ``None``.
+    """
+    dens = np.asarray(density)
+    while dens.ndim > 2:
+        dens = dens[0]
+    validity = connectivity_metrics(dens, load_sites, threshold=threshold)
+    validity['mean_physical_density'] = float(dens.mean())
+    clip_loss = None
+    clip_loss_raw = None
+    if ds is not None:
+        if 'clip_loss' in ds:
+            clip_loss = float(ds['clip_loss'][-1])
+        if 'clip_loss_raw' in ds:
+            clip_loss_raw = float(ds['clip_loss_raw'][-1])
+    mass_on_scaffold = None
+    spatial_mass_loss = None
+    if scaffold is not None:
+        mass_on_scaffold = mass_fraction_on_occupancy(dens, scaffold)
+        spatial_mass_loss = scaffold_spatial_mass_loss(dens, scaffold, load_sites)
+    return {
+        'validity': validity,
+        'mean_physical_density': validity['mean_physical_density'],
+        'clip_loss': clip_loss,
+        'clip_loss_raw': clip_loss_raw,
+        'mass_on_scaffold': mass_on_scaffold,
+        'spatial_mass_loss': spatial_mass_loss,
+    }
+
+
+def save_design_arrays(
+    directory: Union[str, Path],
+    density: np.ndarray,
+    raw: Optional[np.ndarray] = None,
+) -> dict[str, Path]:
+    """Write the physical density (and optional raw design) as ``.npy``.
+
+    Arrays are stored as given: no normalisation, clip, or dtype cast.
+    """
+    directory = Path(directory)
+    paths = {}
+    density_path = directory / 'physical_density.npy'
+    np.save(density_path, np.ascontiguousarray(density))
+    paths['physical_density'] = density_path
+    if raw is not None:
+        raw_path = directory / 'final_design_raw.npy'
+        np.save(raw_path, np.ascontiguousarray(raw))
+        paths['final_design_raw'] = raw_path
+    return paths
 
 
 class SemanticScoreProvider:
