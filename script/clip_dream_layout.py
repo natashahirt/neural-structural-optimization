@@ -225,6 +225,7 @@ def extract_dream_scaffold(
     width: int,
     target_mean: float = DEFAULT_SCAFFOLD_ALLOWED_MEAN,
     passthrough: bool = False,
+    soft_rank: bool = False,
 ):
     """Upsample the coarse dream and cut one elevation occupancy.
 
@@ -233,14 +234,23 @@ def extract_dream_scaffold(
     ``scale_fracs=(1.0,)`` is required by the extractor and unused at
     ``envelope_sigma_frac=0``.
 
+    ``soft_rank`` converts unbounded dream logits to their continuous
+    percentile ranks without cutting them. This preserves the grayscale
+    organization CLIP optimized while making the field a valid ``[0, 1]``
+    spatial preference map.
+
     ``passthrough`` skips the rank-cut: the in-loop projection already made a
     near-binary field at the dream volume, and recutting to
     ``target_allowed_mean`` would undo it. The upsample still runs so the
     scaffold matches the physics grid.
     """
+    if passthrough and soft_rank:
+        raise ValueError('passthrough and soft_rank are mutually exclusive')
     upsampled = resample_field(dream_field, height, width)
     if passthrough:
         return upsampled, None, np.asarray(upsampled)
+    if soft_rank:
+        return upsampled, None, rank_ink_from_raw(upsampled)
     threshold, scaffold = motif_layout_threshold_for_allowed_mean(
         upsampled,
         scale_fracs=(1.0,),
@@ -340,7 +350,9 @@ def _common_dream_summary(
             None if threshold is None else float(threshold)),
         'scaffold_mean': float(np.mean(scaffold)),
         'scaffold_source': (
-            'passthrough' if args.project_in_loop else 'rank_cut'),
+            'passthrough' if args.project_in_loop
+            else 'soft_rank' if args.soft_scaffold
+            else 'rank_cut'),
         'project_in_loop': bool(args.project_in_loop),
         'dream_volume': (
             float(resolved_dream_volume) if args.project_in_loop else None),
@@ -397,6 +409,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             'filter-then-project inside the dream (Gaussian + annealed '
             'Heaviside) and skip the rank-cut scaffold. Off by default.'))
     parser.add_argument(
+        '--soft-scaffold', action='store_true',
+        help=(
+            'preserve a continuous dream as a percentile-rank spatial '
+            'preference map instead of thresholding it. Incompatible with '
+            '--project-in-loop and explicit --target-allowed-mean.'))
+    parser.add_argument(
+        '--dream-field', type=Path,
+        help=(
+            'reuse an existing unbounded dream .npy instead of rerunning the '
+            'CLIP-only stage; intended for controlled physics ablations.'))
+    parser.add_argument(
         '--projection-sigma', type=float, default=DEFAULT_PROJECTION_SIGMA,
         help=(
             'Gaussian sigma in model-grid cells for --project-in-loop '
@@ -440,6 +463,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             '--target-allowed-mean cannot be combined with --project-in-loop: '
             'the projected field is already at the dream volume and is not '
             'rank-cut. Drop one of the two flags.')
+    if args.soft_scaffold and args.project_in_loop:
+        raise ValueError(
+            '--soft-scaffold cannot be combined with --project-in-loop')
+    if args.soft_scaffold and _option_explicitly_passed(
+            argv, '--target-allowed-mean'):
+        raise ValueError(
+            '--target-allowed-mean cannot be combined with --soft-scaffold: '
+            'the continuous rank field is not cut.')
 
     golden = _load_golden_script()
     config = whole_building_dream_config(args.prompt, golden)
@@ -454,38 +485,53 @@ def main(argv: Optional[list[str]] = None) -> int:
             f'{config.motif_scale_fracs}')
 
     configure_torch_threads()
-    print(
-        f'CLIP dream of the whole elevation, prompt={config.prompt!r}, '
-        f'{args.dream_steps} steps, lr={args.dream_lr:g}, no FEA, '
-        f'{args.control_height}x{args.control_width} smooth control, '
-        'no motif-scale crops, no load-site frames.')
     model = build_dream_model(config, golden)
     resolved_dream_volume = (
         float(model.env.args['volfrac'])
         if args.dream_volume is None else float(args.dream_volume))
-    dream_losses, dream_logits, dream_control = run_clip_dream(
-        model,
-        steps=args.dream_steps,
-        lr=args.dream_lr,
-        control_height=args.control_height,
-        control_width=args.control_width,
-        project_in_loop=args.project_in_loop,
-        projection_sigma=args.projection_sigma,
-        projection_beta_max=args.projection_beta_max,
-        dream_volume=resolved_dream_volume,
-        volume_weight=args.volume_weight,
-    )
-
-    dream_coarse = np.asarray(
-        dream_logits.cpu().numpy(), dtype=np.float32)
-    while dream_coarse.ndim > 2:
-        dream_coarse = dream_coarse[0]
-    control_field = np.asarray(
-        dream_control.detach().cpu().numpy(), dtype=np.float32)
-    while control_field.ndim > 2:
-        control_field = control_field[0]
+    if args.dream_field is not None:
+        dream_path = args.dream_field
+        if not dream_path.is_absolute():
+            dream_path = REPO_ROOT / dream_path
+        print(f'Reusing CLIP dream field from {dream_path}; no dream optimization.')
+        dream_coarse = np.asarray(np.load(dream_path), dtype=np.float32)
+        while dream_coarse.ndim > 2:
+            dream_coarse = dream_coarse[0]
+        if dream_coarse.ndim != 2:
+            raise ValueError(
+                f'--dream-field must resolve to a 2-D field, got '
+                f'{dream_coarse.shape}')
+        dream_losses = []
+        control_field = None
+    else:
+        print(
+            f'CLIP dream of the whole elevation, prompt={config.prompt!r}, '
+            f'{args.dream_steps} steps, lr={args.dream_lr:g}, no FEA, '
+            f'{args.control_height}x{args.control_width} smooth control, '
+            'no motif-scale crops, no load-site frames.')
+        dream_losses, dream_logits, dream_control = run_clip_dream(
+            model,
+            steps=args.dream_steps,
+            lr=args.dream_lr,
+            control_height=args.control_height,
+            control_width=args.control_width,
+            project_in_loop=args.project_in_loop,
+            projection_sigma=args.projection_sigma,
+            projection_beta_max=args.projection_beta_max,
+            dream_volume=resolved_dream_volume,
+            volume_weight=args.volume_weight,
+        )
+        dream_coarse = np.asarray(
+            dream_logits.cpu().numpy(), dtype=np.float32)
+        while dream_coarse.ndim > 2:
+            dream_coarse = dream_coarse[0]
+        control_field = np.asarray(
+            dream_control.detach().cpu().numpy(), dtype=np.float32)
+        while control_field.ndim > 2:
+            control_field = control_field[0]
     np.save(output_dir / 'dream_coarse.npy', dream_coarse)
-    np.save(output_dir / 'control.npy', control_field)
+    if control_field is not None:
+        np.save(output_dir / 'control.npy', control_field)
     rank_preview = not args.project_in_loop
     _save_field_png(
         output_dir / 'dream_coarse.png', dream_coarse, rank=rank_preview)
@@ -496,6 +542,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         width=config.width,
         target_mean=args.target_allowed_mean,
         passthrough=args.project_in_loop,
+        soft_rank=args.soft_scaffold,
     )
     np.save(output_dir / 'dream_upsampled.npy', upsampled)
     np.save(output_dir / 'scaffold.npy', scaffold)

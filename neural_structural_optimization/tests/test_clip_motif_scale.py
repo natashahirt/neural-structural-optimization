@@ -9,8 +9,10 @@ construct CLIPLoss.
 import dataclasses
 import importlib.util
 import os
+import types
 from pathlib import Path
 
+import numpy as np
 import torch
 from absl.testing import absltest
 
@@ -229,7 +231,22 @@ class ClipDreamLayoutDirTest(absltest.TestCase):
         golden_script = _load_golden_script()
         path = module.dream_results_dir(
             'butterfly wing venation', golden=golden_script)
-        self.assertEqual(path.name, 'clip_dream_layout_butterfly_wing_venation')
+        self.assertEqual(
+            path.name, 'clip_dream_layout_whole_butterfly_wing_venation')
+
+    def test_whole_building_config_drops_motif_crops_and_load_frames(self):
+        spec = importlib.util.spec_from_file_location(
+            'clip_dream_layout',
+            _REPO_ROOT / 'script' / 'clip_dream_layout.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        golden_script = _load_golden_script()
+        cfg = module.whole_building_dream_config(
+            'butterfly wing venation', golden_script)
+        self.assertEqual(cfg.motif_scale_fracs, ())
+        self.assertFalse(cfg.union_load_sites)
+        self.assertEqual(cfg.prompt, 'butterfly wing venation')
+        self.assertTrue(cfg.neutral_init)
 
     def test_gate_helper_agrees_with_the_mass_prior_loss(self):
         spec = importlib.util.spec_from_file_location(
@@ -245,6 +262,201 @@ class ClipDreamLayoutDirTest(absltest.TestCase):
             scaffold.numpy(), density.numpy())
         self.assertGreaterEqual(gate['spatial_mass_loss'], 0.99)
         self.assertTrue(gate['passed'])
+
+
+def _load_dream_layout():
+    spec = importlib.util.spec_from_file_location(
+        'clip_dream_layout',
+        _REPO_ROOT / 'script' / 'clip_dream_layout.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _legacy_default_clip_dream(
+    model, *, steps, lr, control_height, control_width,
+):
+    """Snapshot of the pre-projection dream loop. Must stay bit-identical."""
+    import torch.nn.functional as F
+
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(model.seed))
+    control = torch.full(
+        (1, 1, control_height, control_width),
+        float(model.env.args['volfrac']),
+        device=model.device,
+    )
+    noise = torch.rand(control.shape, generator=generator)
+    control = torch.nn.Parameter(
+        control + 0.01 * (2.0 * noise.to(model.device) - 1.0))
+    optimizer = torch.optim.Adam([control], lr=lr)
+    losses = []
+    for _ in range(int(steps)):
+        optimizer.zero_grad(set_to_none=True)
+        logits = F.interpolate(
+            control,
+            size=model.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
+        )
+        logits = F.avg_pool2d(logits, kernel_size=3, stride=1, padding=1)
+        logits = logits[:, 0]
+        loss = model.get_semantic_loss(logits)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach()))
+    return losses, logits.detach(), control.detach()
+
+
+class _StubDreamModel:
+    def __init__(self, seed=0, shape=(1, 12, 8), volfrac=0.3, clip_fn=None):
+        self.seed = seed
+        self.device = torch.device('cpu')
+        self.shape = shape
+        self.env = types.SimpleNamespace(args={'volfrac': volfrac})
+        self._clip_fn = clip_fn or (
+            lambda logits: (logits - 0.5).square().mean())
+
+    def get_semantic_loss(self, logits):
+        return self._clip_fn(logits)
+
+
+class ClipDreamInLoopProjectionTest(absltest.TestCase):
+    """Flag-gated filter-then-project: default path frozen, new path constrained."""
+
+    def test_helpers_are_the_shared_semantic_prior_ones(self):
+        from neural_structural_optimization.models.loss_semantic_prior import (
+            heaviside_projection,
+            projected_density_view,
+            sigma_for_min_feature,
+        )
+        module = _load_dream_layout()
+        self.assertIs(module.heaviside_projection, heaviside_projection)
+        self.assertIs(module.projected_density_view, projected_density_view)
+        self.assertIs(module.sigma_for_min_feature, sigma_for_min_feature)
+
+    def test_default_path_matches_legacy_loop_bit_for_bit(self):
+        module = _load_dream_layout()
+        kwargs = dict(
+            steps=4, lr=0.2, control_height=6, control_width=4)
+        model_new = _StubDreamModel(seed=7)
+        model_old = _StubDreamModel(seed=7)
+        losses_new, field_new, control_new = module.run_clip_dream(
+            model_new, **kwargs)
+        losses_old, field_old, control_old = _legacy_default_clip_dream(
+            model_old, **kwargs)
+        self.assertEqual(losses_new, losses_old)
+        torch.testing.assert_close(field_new, field_old, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            control_new, control_old, rtol=0.0, atol=0.0)
+
+    def test_default_path_ignores_volume_weight(self):
+        module = _load_dream_layout()
+        kwargs = dict(
+            steps=3, lr=0.2, control_height=6, control_width=4)
+        baseline_losses, baseline_field, _ = module.run_clip_dream(
+            _StubDreamModel(seed=3), **kwargs)
+        weighted_losses, weighted_field, _ = module.run_clip_dream(
+            _StubDreamModel(seed=3),
+            volume_weight=1.0e9,
+            dream_volume=0.9,
+            **kwargs)
+        self.assertEqual(baseline_losses, weighted_losses)
+        torch.testing.assert_close(
+            baseline_field, weighted_field, rtol=0.0, atol=0.0)
+
+    def test_volume_term_pins_projected_mean(self):
+        module = _load_dream_layout()
+        target = 0.55
+
+        def _zero_clip(logits):
+            return logits.new_zeros(())
+
+        kwargs = dict(
+            steps=60,
+            lr=0.2,
+            control_height=8,
+            control_width=6,
+            project_in_loop=True,
+            dream_volume=target,
+        )
+        _, free, _ = module.run_clip_dream(
+            _StubDreamModel(seed=1, volfrac=0.3, clip_fn=_zero_clip),
+            volume_weight=0.0,
+            **kwargs)
+        _, pinned, _ = module.run_clip_dream(
+            _StubDreamModel(seed=1, volfrac=0.3, clip_fn=_zero_clip),
+            volume_weight=module.DEFAULT_VOLUME_WEIGHT,
+            **kwargs)
+        free_mean = float(free.mean())
+        pinned_mean = float(pinned.mean())
+        self.assertGreaterEqual(float(pinned.min()), 0.0)
+        self.assertLessEqual(float(pinned.max()), 1.0)
+        self.assertLess(abs(pinned_mean - target), abs(free_mean - target))
+        self.assertAlmostEqual(pinned_mean, target, delta=0.10)
+
+    def test_scaffold_passthrough_does_not_rank_cut(self):
+        module = _load_dream_layout()
+        field = np.zeros((8, 4), dtype=np.float32)
+        field[:, :2] = 1.0
+        upsampled, threshold, scaffold = module.extract_dream_scaffold(
+            field, height=16, width=8, target_mean=0.75, passthrough=True)
+        self.assertIsNone(threshold)
+        np.testing.assert_allclose(scaffold, upsampled)
+        self.assertAlmostEqual(float(scaffold.mean()), 0.5, delta=0.02)
+        _, cut_threshold, cut = module.extract_dream_scaffold(
+            field, height=16, width=8, target_mean=0.75, passthrough=False)
+        self.assertIsNotNone(cut_threshold)
+        self.assertAlmostEqual(float(cut.mean()), 0.75, delta=0.03)
+        self.assertNotAlmostEqual(float(scaffold.mean()), float(cut.mean()), places=2)
+
+    def test_soft_scaffold_preserves_continuous_rank_order(self):
+        module = _load_dream_layout()
+        field = np.arange(32, dtype=np.float32).reshape(8, 4)
+        upsampled, threshold, scaffold = module.extract_dream_scaffold(
+            field,
+            height=16,
+            width=8,
+            target_mean=0.75,
+            soft_rank=True,
+        )
+        self.assertIsNone(threshold)
+        self.assertEqual(scaffold.shape, (16, 8))
+        self.assertGreaterEqual(float(scaffold.min()), 0.0)
+        self.assertLessEqual(float(scaffold.max()), 1.0)
+        self.assertGreater(len(np.unique(scaffold)), 2)
+        order = np.argsort(upsampled, axis=None, kind='stable')
+        ranked_in_dream_order = scaffold.reshape(-1)[order]
+        self.assertTrue(np.all(np.diff(ranked_in_dream_order) >= 0.0))
+
+    def test_soft_scaffold_rejects_binary_passthrough(self):
+        module = _load_dream_layout()
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            module.extract_dream_scaffold(
+                np.zeros((8, 4), dtype=np.float32),
+                height=16,
+                width=8,
+                passthrough=True,
+                soft_rank=True,
+            )
+
+    def test_target_allowed_mean_with_project_in_loop_is_an_error(self):
+        module = _load_dream_layout()
+        with self.assertRaisesRegex(ValueError, 'cannot be combined'):
+            module.main([
+                '--project-in-loop',
+                '--target-allowed-mean', '0.6',
+                '--dream-only',
+            ])
+
+    def test_beta_anneal_scales_with_step_count(self):
+        module = _load_dream_layout()
+        self.assertAlmostEqual(
+            module._annealed_projection_beta(0, 300, 8.0), 1.0)
+        self.assertAlmostEqual(
+            module._annealed_projection_beta(299, 300, 8.0), 8.0)
+        self.assertAlmostEqual(
+            module._annealed_projection_beta(5, 11, 8.0), 4.5)
 
 
 if __name__ == '__main__':
